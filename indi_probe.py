@@ -1,33 +1,32 @@
-"""Isolated, read-only Shinhan Indi ActiveX diagnostics (v0.3.3).
+"""Read-only Indi stock_mst connection probe, matching Shinhan PyQt example.
 
-This process NEVER creates an order-capable client, never accesses account
-passwords, and never submits trading orders. An actual HWND is created for
-QAxWidget and the request is posted only after the Qt event loop starts.
+No trading/credentials functions are instantiated or called. Run as a child process
+via the existing app.py --probe-indi arguments. Python 3.11 x86 / PyQt5 x86.
 """
+from pathlib import Path
 import faulthandler
 import json
 import os
-from pathlib import Path
 import struct
 import sys
 import time
 import traceback
 
-
 PROG_ID = 'GIEXPERTCONTROL.GiExpertControlCtrl.1'
 
 
 def append_step(path, stage):
-    with Path(path).open('a', encoding='utf-8') as out:
-        out.write(time.strftime('%Y-%m-%d %H:%M:%S') + ' | ' + str(stage) + '\n')
-        out.flush()
-        os.fsync(out.fileno())
+    with Path(path).open('a', encoding='utf-8') as f:
+        f.write(time.strftime('%Y-%m-%d %H:%M:%S') + ' | ' + str(stage) + '\n')
+        f.flush()
+        os.fsync(f.fileno())
 
 
-def write_result(path, status, **kwargs):
-    tmp = Path(str(path) + '.tmp')
-    tmp.write_text(json.dumps({'status': status, **kwargs}, ensure_ascii=False), encoding='utf-8')
-    os.replace(tmp, path)
+def write_result(path, status, **data):
+    dest = Path(path)
+    temp = Path(str(path)+'.tmp')
+    temp.write_text(json.dumps({'status':status, **data},ensure_ascii=False),encoding='utf-8')
+    os.replace(temp,dest)
 
 
 def probe_command(executable, app_path, log_path, result_path, frozen):
@@ -37,148 +36,120 @@ def probe_command(executable, app_path, log_path, result_path, frozen):
 
 
 def exit_detail(code):
-    if code is None:
-        return '진단 실행 중'
-    unsigned = code & 0xFFFFFFFF
-    if unsigned == 0xC0000005:
-        return '0xC0000005 (OCX/Windows 네이티브 접근 위반 의심)'
-    if unsigned == 0xC0000409:
-        return '0xC0000409 (Windows 네이티브 보호 예외)'
-    return '종료 코드 ' + str(code) + f' (0x{unsigned:08X})'
+    if code is None: return '진단 실행 중'
+    unsigned=code & 0xFFFFFFFF
+    if unsigned==0xC0000005: return '0xC0000005 (Windows/OCX 접근 위반 가능성)'
+    if unsigned==0xC0000409: return '0xC0000409 (Windows 네이티브 예외)'
+    return '종료 코드 '+str(code)+f' (0x{unsigned:08X})'
 
 
 def run_probe(log_path, result_path):
-    append_step(log_path, '01 CHILD_START bits=' + str(struct.calcsize('P') * 8) +
-                ' frozen=' + str(bool(getattr(sys, 'frozen', False))))
-    crashlog = open(log_path + '.fatal.txt', 'a', encoding='utf-8')
-    faulthandler.enable(file=crashlog, all_threads=True)
+    """Compare the minimum documented PyQt-QAxWidget flow to Indi Helper.
+
+    Key difference vs prior probe: create *unparented* QAxWidget in QMainWindow
+    just as in publicly documented Shinhan Indi PyQt reference example. The
+    ActiveX control is not embedded into QWidget/layout as in the old probe.
+    """
+    append_step(log_path, 'START bits='+str(struct.calcsize('P')*8))
+    fatal_log = open(log_path+'.fatal.txt','a',encoding='utf-8')
+    faulthandler.enable(file=fatal_log, all_threads=True)
     try:
-        append_step(log_path, '02 IMPORT_QT')
-        from PyQt5.QtCore import QTimer
-        from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel
-        from PyQt5.QAxContainer import QAxWidget
-        append_step(log_path, '03 IMPORT_QT_OK')
         if struct.calcsize('P') != 4:
-            raise RuntimeError('신한 OCX 진단에는 32비트 환경이 필요합니다.')
+            write_result(result_path,'ERROR',reason='32비트 Python/EXE가 아닙니다')
+            return 3
+        from PyQt5.QtCore import QTimer
+        from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel
+        from PyQt5.QAxContainer import QAxWidget
+
         app = QApplication.instance() or QApplication([])
-        state = {'finished': False, 'ocx': None, 'window': None,
-                 'request_id': None, 'query': None, 'round': 0}
+        state={'done':False,'rid':None,'requested':False}
 
-        def finish(status, **details):
-            if state['finished']:
-                return
-            state['finished'] = True
-            append_step(log_path, 'FINISH ' + status + ' reason=' +
-                        str(details.get('reason', ''))[:200])
-            write_result(result_path, status, **details)
-            QTimer.singleShot(100, app.quit)
+        def finish(status, **detail):
+            if state['done']: return
+            state['done']=True
+            append_step(log_path,'FINISH status='+status+' reason='+str(detail.get('reason',''))[:200])
+            write_result(result_path,status,**detail)
+            QTimer.singleShot(150, app.quit)
 
-        def on_receive(rid):
-            try:
-                append_step(log_path, '09 RECEIVE_DATA rid=' + str(rid) +
-                            ' expected=' + str(state['request_id']) +
-                            ' query=' + str(state['query']))
-                if state['request_id'] is not None and int(rid) != state['request_id']:
-                    append_step(log_path, '09A_UNEXPECTED_RID')
+        class ProbeWindow(QMainWindow):
+            def __init__(self):
+                super().__init__()
+                self.setWindowTitle('신한i indi 종목조회 - 읽기 전용 API 검사')
+                content=QWidget(self)
+                layout=QVBoxLayout(content)
+                layout.addWidget(QLabel('신한i indi stock_mst 종목조회 이벤트 검사 중\n매수·매도 주문은 보내지 않습니다.'))
+                self.setCentralWidget(content)
+                # Important: follow official Python sample: no parent argument.
+                self.IndiTR=QAxWidget(PROG_ID)
+                append_step(log_path,'QAX_CONSTRUCTED isNull='+str(self.IndiTR.isNull()))
+                if not self.IndiTR.isNull():
+                    self.IndiTR.ReceiveData.connect(self.ReceiveData)
+                    self.IndiTR.ReceiveSysMsg.connect(self.ReceiveSysMsg)
+                    append_step(log_path,'EVENTS_CONNECTED')
+                self.resize(455,120)
+
+            def RequestStocks(self):
+                if state['done'] or state['requested']:return
+                if self.IndiTR.isNull():
+                    finish('ERROR',reason='신한 ActiveX 컨트롤을 생성할 수 없습니다')
                     return
-                ocx = state['ocx']
-                append_step(log_path, '10 GET_MULTI_ROW_COUNT_ENTER')
-                n = ocx.dynamicCall('GetMultiRowCount()')
-                append_step(log_path, '11 GET_MULTI_ROW_COUNT_RETURN=' + repr(n))
-                count = int(n or 0)
-                if state['query'] == 'stock_mst':
-                    if count <= 0:
-                        finish('ERROR', reason='stock_mst 응답이 왔지만 종목수가 0건입니다')
+                state['requested']=True
+                try:
+                    append_step(log_path,'SET_QUERY_NAME_ENTER')
+                    ret=self.IndiTR.dynamicCall('SetQueryName(QString)', 'stock_mst')
+                    append_step(log_path,'SET_QUERY_NAME_RETURN='+repr(ret))
+                    rid=self.IndiTR.dynamicCall('RequestData()')
+                    append_step(log_path,'REQUEST_DATA_RETURN='+repr(rid))
+                    if rid is None:
+                        finish('ERROR',reason='RequestData 반환값 없음')
                         return
-                    sample = []
-                    for i in range(min(count, 3)):
-                        code = str(ocx.dynamicCall('GetMultiData(int, int)', i, 1) or '').strip()
-                        name = str(ocx.dynamicCall('GetMultiData(int, int)', i, 3) or '').strip()
-                        if code and name:
-                            sample.append({'code': code, 'name': name})
-                    append_step(log_path, '12 STOCK_SAMPLE_OK')
-                    finish('OK', count=count, samples=sample)
-                elif state['query'] == 'AccountList':
-                    # Never read or log account numbers or names. Just test that
-                    # the OCX callback and query path are functional.
-                    finish('PARTIAL', reason='AccountList 응답 수신, stock_mst 응답은 없음',
-                           account_row_count=count)
-                else:
-                    finish('ERROR', reason='예상하지 못한 조회 이벤트')
-            except BaseException as exc:
-                append_step(log_path, 'RECEIVE_EXCEPTION ' + traceback.format_exc()[-1200:])
-                finish('ERROR', reason=type(exc).__name__ + ': ' + str(exc))
+                    state['rid']=int(rid)
+                    if state['rid']<0:
+                        finish('ERROR',reason='RequestData 오류 ID '+str(rid))
+                except BaseException as exc:
+                    append_step(log_path,'REQUEST_EXCEPTION='+traceback.format_exc()[-1500:])
+                    finish('ERROR',reason=type(exc).__name__+': '+str(exc))
 
-        def on_system(msg):
-            append_step(log_path, 'SYS_MESSAGE=' + str(msg))
+            def ReceiveData(self,rqid):
+                append_step(log_path,'RECEIVE_DATA rid='+str(rqid)+' expected='+str(state['rid']))
+                if state['done']:return
+                try:
+                    if state['rid'] is not None and int(rqid)!=state['rid']:
+                        append_step(log_path,'IGNORE_DIFFERENT_ID')
+                        return
+                    n=int(self.IndiTR.dynamicCall('GetMultiRowCount()') or 0)
+                    append_step(log_path,'STOCK_ROW_COUNT='+str(n))
+                    if n<1:
+                        finish('ERROR',reason='ReceiveData 수신했으나 0건')
+                        return
+                    rows=[]
+                    for i in range(min(3,n)):
+                        code=str(self.IndiTR.dynamicCall('GetMultiData(int, int)',i,1) or '').strip()
+                        name=str(self.IndiTR.dynamicCall('GetMultiData(int, int)',i,3) or '').strip()
+                        rows.append({'code':code,'name':name})
+                    finish('OK',count=n,samples=rows)
+                except BaseException as exc:
+                    append_step(log_path,'RECEIVE_EXCEPTION='+traceback.format_exc()[-1500:])
+                    finish('ERROR',reason=type(exc).__name__+': '+str(exc))
 
-        def request_query(name):
-            if state['finished']:
-                return
-            try:
-                state['query'] = name
-                state['request_id'] = None
-                state['round'] += 1
-                append_step(log_path, '06 SET_QUERY_NAME_ENTER ' + name)
-                ret = state['ocx'].dynamicCall('SetQueryName(QString)', name)
-                append_step(log_path, '07 SET_QUERY_NAME_RETURN=' + repr(ret))
-                rid = state['ocx'].dynamicCall('RequestData()')
-                append_step(log_path, '08 REQUEST_DATA_RETURN rid=' + repr(rid) +
-                            ' query=' + name)
-                if rid is None:
-                    finish('ERROR', reason=name+' RequestData 반환값 없음')
-                    return
-                state['request_id'] = int(rid)
-                if state['request_id'] < 0:
-                    finish('ERROR', reason=name+' 요청 거부, 요청 ID='+str(rid))
-            except BaseException as exc:
-                append_step(log_path, 'REQUEST_EXCEPTION '+traceback.format_exc()[-1200:])
-                finish('ERROR', reason=type(exc).__name__ + ': ' + str(exc))
+            def ReceiveSysMsg(self,msg):
+                append_step(log_path,'RECEIVE_SYS_MSG='+str(msg))
 
-        def fallback():
-            if state['finished'] or state['query'] != 'stock_mst':
-                return
-            append_step(log_path, '13 STOCK_TIMEOUT; TRY_ACCOUNTLIST_METADATA_ONLY')
-            request_query('AccountList')
-
-        def start():
-            try:
-                append_step(log_path, '04 CREATE_OCX ' + PROG_ID)
-                win = QWidget()
-                win.setWindowTitle('신한i indi 읽기 전용 연결 진단 — 주문 없음')
-                layout = QVBoxLayout(win)
-                layout.addWidget(QLabel('신한i indi의 조회 응답을 확인 중입니다.\n'
-                                        '이 창에서는 실제 매수·매도 주문을 보내지 않습니다.'))
-                ocx = QAxWidget(PROG_ID, win)
-                layout.addWidget(ocx)
-                state['window'] = win
-                state['ocx'] = ocx
-                append_step(log_path, '05 CREATE_OCX_RETURN isNull=' + str(ocx.isNull()))
-                if ocx.isNull():
-                    finish('ERROR', reason='신한 OCX 생성 실패(등록, 권한, 비트수 확인)')
-                    return
-                ocx.ReceiveData.connect(on_receive)
-                ocx.ReceiveSysMsg.connect(on_system)
-                win.resize(390, 130)
-                win.show()
-                append_step(log_path, '05A WIDGET_VISIBLE=' + str(ocx.isVisible())+
-                            ' WINID='+str(int(ocx.winId())))
-                QTimer.singleShot(550, lambda: request_query('stock_mst'))
-            except BaseException as exc:
-                append_step(log_path, 'START_EXCEPTION '+traceback.format_exc()[-1200:])
-                finish('ERROR', reason=type(exc).__name__ + ': ' + str(exc))
-
-        QTimer.singleShot(0, start)
-        QTimer.singleShot(13500, fallback)
-        QTimer.singleShot(30000, lambda: finish('TIMEOUT', reason=
-            'stock_mst와 AccountList 모두 ReceiveData 이벤트가 오지 않음. '
-            'OCX 이벤트/로그인 세션/사용계약 확인 필요')
-            if not state['finished'] else None)
+        window=ProbeWindow()
+        if window.IndiTR.isNull():
+            finish('ERROR',reason='ActiveX 생성 실패')
+        else:
+            window.show()
+            append_step(log_path,'MAIN_WINDOW_VISIBLE')
+            QTimer.singleShot(800,window.RequestStocks)
+            QTimer.singleShot(25000,lambda:finish('TIMEOUT',reason=
+                '독립 PyQt ActiveX 객체에서 ReceiveData가 수신되지 않음. '
+                'Indi Helper는 정상이며 Windows/PyQt COM 이벤트 환경 추가 확인 필요'))
         app.exec_()
-        return 0 if state['finished'] else 2
+        return 0 if state['done'] else 2
     except BaseException as exc:
-        append_step(log_path, 'FATAL_PYTHON_EXCEPTION '+traceback.format_exc()[-1500:])
-        write_result(result_path, 'ERROR', reason=type(exc).__name__+': '+str(exc))
+        append_step(log_path,'FATAL_EXCEPTION='+traceback.format_exc()[-2000:])
+        write_result(result_path,'ERROR',reason=type(exc).__name__+': '+str(exc))
         return 3
     finally:
-        crashlog.close()
+        fatal_log.close()
