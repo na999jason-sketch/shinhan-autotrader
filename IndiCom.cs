@@ -69,7 +69,7 @@ namespace ShinhanNativeTrader {
     // Rather than trusting late-bound ComEventsHelper to connect an event,
     // explicitly advise the OCX's COM connection point with a typed IDispatch sink.
     [ComVisible(true)]
-    [Guid("F52E833F-F1D7-4184-BE0D-6B9F59DE7DAC")]
+    [Guid("F52E833F-1D17-4184-BE0D-6B9F59DE7DAC")]
     [InterfaceType(ComInterfaceType.InterfaceIsIDispatch)]
     public interface IIndiEventDispatch {
         [DispId(1)] void ReceiveData(int requestId);
