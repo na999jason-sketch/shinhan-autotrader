@@ -1,0 +1,19 @@
+Shinhan AutoTrader v0.3 test report
+Date: 2026-11-10
+
+Broker-independent tests: 14/14 PASSED (unittest)
+- Stock universe analysis: synthetic bar signal
+- No lookahead/current partial bar
+- Real-time quote freshness, regular session
+- Stock price breakout buy trigger
+- Stop, take profit, trailing stop
+- Cash unavailable => no buy
+- Max positions limit
+- Crash-safety: persisted unknown order blocks duplicate
+- Journal replay: confirmed fill survives relaunch
+- Full-sale holdings=0 reconciliation
+- Full paper buy/sell cycle from candidate through journal relaunch
+
+NOT TESTED: real Shinhan trading account; live order send, fill confirmation,
+market holiday handling; actual Windows 32-bit PyQt5/ActiveX setup; GitHub
+Actions EXE build; real cash purchasing power API; realized P/L.
