@@ -46,14 +46,14 @@ namespace ShinhanNativeTrader {
         readonly Queue<Stock> work=new Queue<Stock>();
         readonly Dictionary<string,PaperPosition> paper=new Dictionary<string,PaperPosition>();
         readonly Dictionary<string,Holding> brokerHoldings=new Dictionary<string,Holding>();
-        bool scanning=false, connected=false, accountOk=false;
+        bool scanning=false, connected=false;
         decimal availablePaper=1000000m;
         DateTime lastPaperQuote=DateTime.MinValue;
         int scanDone=0;
         readonly string journal=Path.Combine(Program.DataDir,"paper_trades.csv");
 
         public MainForm() {
-            Text="Shinhan Native Trader 1.0 | C# Win32 ActiveX (Python 없이 실행)";
+            Text="Shinhan Native Trader 1.1 (compile fix) | C# Win32 ActiveX (Python 없이 실행)";
             Size=new Size(1150,760);MinimumSize=new Size(1050,680);
             Font=new Font("Malgun Gothic",9);
             var root=new TableLayoutPanel{Dock=DockStyle.Fill,ColumnCount=1,RowCount=4,Padding=new Padding(10)};
@@ -83,7 +83,7 @@ namespace ShinhanNativeTrader {
             paperCash.SetBounds(717,49,138,25);paperCash.Minimum=10000;paperCash.Maximum=1000000000;paperCash.Increment=100000;paperCash.Value=1000000;paperCash.ThousandsSeparator=true;bar.Controls.Add(paperCash);
             state.Text="상태: 아직 OCX 미연결 | 주문 전송 기능 없음";state.Location=new Point(12,87);state.Size=new Size(1050,26);bar.Controls.Add(state);
             var tabs=new TabControl{Dock=DockStyle.Fill};root.Controls.Add(tabs,0,2);
-            var t1=new TabPage("실제 데이터 종목 후보"),t2=new TabPage("증권사 보유잔고(읽기만)"),t3=new TabPage("시스템 로그");
+            TabPage t1=new TabPage("실제 데이터 종목 후보"),t2=new TabPage("증권사 보유잔고(읽기만)"),t3=new TabPage("시스템 로그");
             tabs.TabPages.AddRange(new[]{t1,t2,t3});
             SetupGrid(grid,new[]{"종목코드","종목명","기준가","점수","선별 조건"});t1.Controls.Add(grid);
             SetupGrid(holdingsGrid,new[]{"종목코드","종목명","잔고수량","매도미체결","매수미체결","평균단가","현재가"});t2.Controls.Add(holdingsGrid);
@@ -156,7 +156,7 @@ namespace ShinhanNativeTrader {
                         brokerHoldings[h.Code]=h;
                         holdingsGrid.Rows.Add(h.Code,h.Name,h.Quantity,h.SellPending,h.BuyPending,h.AvgPrice.ToString("N0"),h.Price.ToString("N0"));
                     }
-                    accountOk=true;Log("신한 실제 잔고 조회 성공: "+r.Holdings.Count+"건 (주문하지 않음)");
+                    Log("신한 실제 잔고 조회 성공: "+r.Holdings.Count+"건 (주문하지 않음)");
                 }
             }catch(Exception e){Log("REPLY ERROR "+e);StopScan("응답 처리 실패");}
         }

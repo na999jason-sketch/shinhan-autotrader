@@ -4,12 +4,12 @@ using System.Globalization;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
-using System.Runtime.InteropServices.ComTypes;
+using ComTypes = System.Runtime.InteropServices.ComTypes;
 using System.Windows.Forms;
 
 namespace ShinhanNativeTrader {
     [ComImport, Guid("B196B283-BAB4-101A-B69C-00AA00341D07"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-    internal interface IProvideClassInfo { void GetClassInfo(out ITypeInfo typeInfo); }
+    internal interface IProvideClassInfo { void GetClassInfo(out ComTypes.ITypeInfo typeInfo); }
 
     // Unlike PyQt/QAxWidget, AxHost supplies a native Windows ActiveX site and STA message pump.
     public sealed class IndiHost : AxHost {
@@ -27,31 +27,31 @@ namespace ShinhanNativeTrader {
         public static ComEventInfo Discover(object com) {
             var provide=com as IProvideClassInfo;
             if(provide==null)throw new InvalidOperationException("OCX does not expose IProvideClassInfo; inspect installed typelib before binding events.");
-            ITypeInfo coclass;
+            ComTypes.ITypeInfo coclass;
             provide.GetClassInfo(out coclass);
             if(coclass==null)throw new InvalidOperationException("ActiveX class type information unavailable");
             try {
                 IntPtr attrptr=IntPtr.Zero;
                 coclass.GetTypeAttr(out attrptr);
-                TYPEATTR attr;
-                try {attr=(TYPEATTR)Marshal.PtrToStructure(attrptr, typeof(TYPEATTR));}
+                ComTypes.TYPEATTR attr;
+                try {attr=(ComTypes.TYPEATTR)Marshal.PtrToStructure(attrptr, typeof(ComTypes.TYPEATTR));}
                 finally {coclass.ReleaseTypeAttr(attrptr);}
                 for(int i=0;i<attr.cImplTypes;i++) {
-                    IMPLTYPEFLAGS flags;
+                    ComTypes.IMPLTYPEFLAGS flags;
                     coclass.GetImplTypeFlags(i,out flags);
-                    if((flags & IMPLTYPEFLAGS.IMPLTYPEFLAG_FSOURCE)==0)continue;
+                    if((flags & ComTypes.IMPLTYPEFLAGS.IMPLTYPEFLAG_FSOURCE)==0)continue;
                     int href;coclass.GetRefTypeOfImplType(i,out href);
-                    ITypeInfo source;coclass.GetRefTypeInfo(href,out source);
+                    ComTypes.ITypeInfo source;coclass.GetRefTypeInfo(href,out source);
                     try {
                         IntPtr ap=IntPtr.Zero;source.GetTypeAttr(out ap);
-                        TYPEATTR a;
-                        try {a=(TYPEATTR)Marshal.PtrToStructure(ap,typeof(TYPEATTR));}
+                        ComTypes.TYPEATTR a;
+                        try {a=(ComTypes.TYPEATTR)Marshal.PtrToStructure(ap,typeof(ComTypes.TYPEATTR));}
                         finally {source.ReleaseTypeAttr(ap);}
                         var e=new ComEventInfo{SourceInterface=a.guid};
                         for(int j=0;j<a.cFuncs;j++) {
                             IntPtr fp=IntPtr.Zero;source.GetFuncDesc(j,out fp);
-                            FUNCDESC f;
-                            try {f=(FUNCDESC)Marshal.PtrToStructure(fp,typeof(FUNCDESC));}
+                            ComTypes.FUNCDESC f;
+                            try {f=(ComTypes.FUNCDESC)Marshal.PtrToStructure(fp,typeof(ComTypes.FUNCDESC));}
                             finally {source.ReleaseFuncDesc(fp);}
                             string name,desc,helpfile;int helpContext;
                             source.GetDocumentation(f.memid,out name,out desc,out helpContext,out helpfile);
@@ -96,10 +96,10 @@ namespace ShinhanNativeTrader {
             _timeout.Tick += (s,e)=> { _timeout.Stop(); if(Busy)StopWithError("20초 동안 신한 응답이 없습니다. 추가 요청과 모든 자동주문을 중단합니다.");};
         }
         void Log(string line){if(Trace!=null)Trace(line);}
-        static object Call(object com, string name, params object[] args) {
+        static object CallCom(object com, string name, params object[] args) {
             return com.GetType().InvokeMember(name,BindingFlags.InvokeMethod,null,com,args);
         }
-        object Call(string name,params object[] args){return Call(_com,name,args);}
+        object Call(string name,params object[] args){return CallCom(_com,name,args);}
         int Int(string method,params object[] args){return Convert.ToInt32(Call(method,args),CultureInfo.InvariantCulture);}
         string Single(int col) {return Convert.ToString(Call("GetSingleData",col),CultureInfo.InvariantCulture)??"";}
         string Multi(int row,int col) {return Convert.ToString(Call("GetMultiData",row,col),CultureInfo.InvariantCulture)??"";}
