@@ -3,7 +3,8 @@
 Safety: live orders gated and crash-safe. Broker integration NOT validated with
 an actual 2026 Shinhan installation. See README before connecting a real account.
 """
-import os, sys, random, traceback, hashlib, subprocess, time, json
+import os, sys, random, traceback, hashlib, subprocess, json
+import time as clock_time
 from indi_probe import probe_command, exit_detail
 from pathlib import Path
 from datetime import datetime, timedelta, time
@@ -25,7 +26,7 @@ def fmt(v):return f'{v:,}'
 class Window(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('신한 자동매매 v0.3.1 — ActiveX 충돌 진단판')
+        self.setWindowTitle('신한 자동매매 v0.3.2 — ActiveX 충돌 진단판')
         self.resize(1030,790)
         self.cfg=Settings(); self.cfg.validate()
         self.mode='DEMO';self.broker=None
@@ -208,7 +209,7 @@ class Window(QWidget):
             self.probe_proc=subprocess.Popen(command,stdin=subprocess.DEVNULL,
                         stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
                         creationflags=flags,env=env)
-            self.probe_started=time.monotonic()
+            self.probe_started=clock_time.monotonic()
             self.log('신한 OCX 연결 진단 시작 (별도 프로세스 / 주문 전송 없음)')
             self.log('진단 로그: '+str(self.probe_log))
             self.set_status('신한 연결 진단 중')
@@ -226,7 +227,7 @@ class Window(QWidget):
                 if last and last!=self.probe_last_stage:
                     self.probe_last_stage=last
                     self.log('진단 단계: '+last[-160:])
-            if time.monotonic()-self.probe_started>35 and self.probe_proc.poll() is None:
+            if clock_time.monotonic()-self.probe_started>35 and self.probe_proc.poll() is None:
                 self.probe_proc.kill()
                 self.log('진단 프로세스 35초 초과. 강제 종료했습니다.')
             result=self.probe_proc.poll()
@@ -252,7 +253,7 @@ class Window(QWidget):
                 self.log('진단 프로세스 비정상 종료: '+exit_detail(result))
                 self.log('마지막 진단 단계: '+self.probe_last_stage[-180:])
                 self.set_status('ActiveX 충돌 추적 필요')
-            self.log('실계좌 자동주문은 v0.3.1에서 계속 잠겨 있습니다.')
+            self.log('실계좌 자동주문은 v0.3.2에서 계속 잠겨 있습니다.')
         except Exception as exc:
             self.log('진단 결과 읽기 실패: '+type(exc).__name__+': '+str(exc))
         finally:
@@ -272,7 +273,7 @@ class Window(QWidget):
     def arm(self):
         self.settings()
         if self.mode=='LIVE':
-            self.log('실계좌 자동주문 차단: v0.3.1은 OCX 충돌 진단 전용입니다.')
+            self.log('실계좌 자동주문 차단: v0.3.2는 OCX 충돌 진단 전용입니다.')
             return
         if self.mode=='LIVE':
             a=self.account.text().strip()
