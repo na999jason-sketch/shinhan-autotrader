@@ -65,6 +65,27 @@ namespace ShinhanNativeTrader {
         }
     }
 
+    // The vendor type library on the tested machine declares this source IID.
+    // Rather than trusting late-bound ComEventsHelper to connect an event,
+    // explicitly advise the OCX's COM connection point with a typed IDispatch sink.
+    [ComVisible(true)]
+    [Guid("F52E833F-F1D7-4184-BE0D-6B9F59DE7DAC")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIDispatch)]
+    public interface IIndiEventDispatch {
+        [DispId(1)] void ReceiveData(int requestId);
+        [DispId(3)] void ReceiveSysMsg(int messageId);
+    }
+    [ComVisible(true)]
+    [ClassInterface(ClassInterfaceType.None)]
+    public sealed class IndiEventSink : IIndiEventDispatch {
+        private readonly Action<int> _onData, _onSys;
+        public IndiEventSink(Action<int> onData,Action<int> onSys) {
+            _onData=onData;_onSys=onSys;
+        }
+        public void ReceiveData(int requestId){_onData(requestId);}
+        public void ReceiveSysMsg(int messageId){_onSys(messageId);}
+    }
+
     public sealed class IndiReply {
         public string Kind,Code;
         public int Count;
@@ -84,7 +105,9 @@ namespace ShinhanNativeTrader {
         string _pendingKind, _pendingCode;
         int? _requestId;
         readonly Timer _timeout;
-        readonly List<Tuple<int,Delegate>> _sinks=new List<Tuple<int,Delegate>>();
+        ComTypes.IConnectionPoint _connectionPoint;
+        IndiEventSink _eventSink;
+        int _adviseCookie;
         public event Action<string> Trace;
         public event Action<IndiReply> Done;
         public event Action<string> Fatal;
@@ -116,20 +139,25 @@ namespace ShinhanNativeTrader {
             Log("ActiveX site handle="+_host.Handle+"; event typelib resolving...");
             _source=ComTypeDiscovery.Discover(_com);
             Log("COM events source IID="+_source.SourceInterface+" names="+string.Join(",",_source.DispIds.Keys));
-            Bind("ReceiveData",new Action<object>(x=>OnReceiveData(x)));
-            Bind("ReceiveSysMsg",new Action<object>(x=>OnSystemMessage(x)));
+            int dataDispid, sysDispid;
+            if(!_source.DispIds.TryGetValue("ReceiveData",out dataDispid) || dataDispid!=1)
+                throw new InvalidOperationException("Installed Indi ReceiveData DISPID differs from this sink; refuse to request data.");
+            if(!_source.DispIds.TryGetValue("ReceiveSysMsg",out sysDispid) || sysDispid!=3)
+                throw new InvalidOperationException("Installed Indi ReceiveSysMsg DISPID differs from this sink; refuse to request data.");
+            var iid=typeof(IIndiEventDispatch).GUID;
+            if(_source.SourceInterface!=iid)
+                throw new InvalidOperationException("Installed Indi event IID differs from compiled sink: "+_source.SourceInterface);
+            var container=_com as ComTypes.IConnectionPointContainer;
+            if(container==null) throw new InvalidOperationException("ActiveX has no IConnectionPointContainer; vendor COM event registration unavailable.");
+            container.FindConnectionPoint(ref iid,out _connectionPoint);
+            if(_connectionPoint==null)throw new InvalidOperationException("Indi event connection point not found.");
+            _eventSink=new IndiEventSink(
+                rid=>OnReceiveData(rid),
+                msg=>OnSystemMessage(msg));
+            _connectionPoint.Advise(_eventSink,out _adviseCookie);
+            if(_adviseCookie==0)throw new InvalidOperationException("COM Advise returned an invalid zero cookie.");
+            Log("COM connection point Advise succeeded IID="+iid+" cookie="+_adviseCookie+" events=ReceiveData/ReceiveSysMsg");
             _connected=true;
-            Log("C# native AxHost COM event sink connected; waiting for first actual ReceiveData");
-        }
-        void Bind(string name,Delegate handler) {
-            int dispid;
-            if(!_source.DispIds.TryGetValue(name,out dispid)) {
-                if(name=="ReceiveData")throw new InvalidOperationException("ReceiveData event not listed in the installed typelib");
-                Log("Optional event not present: "+name);return;
-            }
-            ComEventsHelper.Combine(_com,_source.SourceInterface,dispid,handler);
-            _sinks.Add(Tuple.Create(dispid,handler));
-            Log("COM event bound "+name+" dispid="+dispid);
         }
         public bool Stocks(){return Request("STOCKS","stock_mst",null,"");}
         public bool Bars(string code){return Request("BARS","TR_SCHART",new Dictionary<int,string>{{0,code},{1,"D"},{2,"1"},{3,"00000000"},{4,"99999999"},{5,"45"}},code);}
@@ -196,14 +224,18 @@ namespace ShinhanNativeTrader {
                 if(Done!=null)Done(rep);
             } catch(Exception ex){StopWithError("Response parse failed: "+ex.GetBaseException().Message);}
         }
-        void OnSystemMessage(object raw){StopWithError("신한 시스템 이벤트: "+Convert.ToString(raw));}
+        void OnSystemMessage(object raw){Log("Indi ReceiveSysMsg="+Convert.ToString(raw)+" (connection status must be checked separately)");}
         public void Halt(string reason){StopWithError(reason);}
         void StopWithError(string reason){_timeout.Stop();_pendingKind=null;_failed=true;Log("HALT: "+reason);if(Fatal!=null)Fatal(reason);}
         public void Dispose(){
             _timeout.Stop();_timeout.Dispose();
-            if(_com!=null&&_source!=null)foreach(var s in _sinks) {
-                try{ComEventsHelper.Remove(_com,_source.SourceInterface,s.Item1,s.Item2);}catch{}
+            if(_connectionPoint!=null){
+                try{if(_adviseCookie!=0)_connectionPoint.Unadvise(_adviseCookie);}catch{}
+                try{Marshal.ReleaseComObject(_connectionPoint);}catch{}
+                _connectionPoint=null;
             }
+            _adviseCookie=0;
+            _eventSink=null;
             if(_host!=null){_host.Dispose();_host=null;}
             _com=null;
         }
