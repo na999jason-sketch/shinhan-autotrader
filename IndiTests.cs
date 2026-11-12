@@ -92,11 +92,11 @@ namespace ShinhanNativeTrader {
             Check(!BeginQuote(requests)&&requests.Failed,"negative request id halts");requests.Dispose();
             fake=new FakeIndi{Id=0};fake.Quote();requests=new IndiRequestCoordinator(fake);received=0;
             requests.Done+=value=>received++;
-            Check(BeginQuote(requests)&&requests.Busy&&!requests.Failed,"zero integer id remains pending without an explicit Indi error");
-            fake.Data(0);Check(received==1&&!requests.Busy,"zero request id can match an actual response");requests.Dispose();
+            Check(!BeginQuote(requests)&&!requests.Busy&&requests.Failed,"official OCX zero return is a failed submission, not a pending request");
+            fake.Data(0);Check(received==0&&!requests.Busy,"zero request rejection ignores a later unsolicited callback");requests.Dispose();
             fake=new FakeIndi{OverrideRequestReturn=true,RequestReturn=(short)0};fake.Quote();requests=new IndiRequestCoordinator(fake);received=0;
             requests.Done+=value=>received++;fake.DuringRequest=()=>fake.Data(0);
-            Check(BeginQuote(requests)&&received==1,"native Int16 zero id supports reentrant response");requests.Dispose();
+            Check(!BeginQuote(requests)&&received==0,"native Int16 zero return cannot complete a reentrant request");requests.Dispose();
             foreach(object invalid in new object[]{null,DBNull.Value,false,true,7.0,7.0m,"7"}) {
                 fake=new FakeIndi{OverrideRequestReturn=true,RequestReturn=invalid};requests=new IndiRequestCoordinator(fake);
                 Check(!BeginQuote(requests)&&requests.Failed&&!requests.Busy,"non-integer and null returns never become a request id");requests.Dispose();
