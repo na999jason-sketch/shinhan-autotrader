@@ -31,11 +31,17 @@
 
 GitHub Actions
 - Windows 2022: .NET Framework4.8 MSBuild /platform:x86 /warnaserror,
-  EXE PE32/32BITREQUIRED 검증, C# --selftest, Python regression을 설정했다.
-- 실행 결과 및 링크는 PR/최종 작업 보고에서 실제 Actions 결과를 기준으로 기록한다.
-- 이번 세션은 GitHub 연결 도구, git push, gh REST 브랜치 생성이 모두 HTTP403으로
-  거절되어 원격 브랜치/PR를 만들지 못했다. 따라서 수정 코드의 Windows Actions는
-  미실행이며 Windows 빌드 성공으로 보고하지 않는다. 저장소 쓰기/워크플로 권한 필요.
+  EXE PE32/32BITREQUIRED 검증, C# --selftest, Python regression 모두 성공.
+- 검증 코드: 1b6e76db27860350a78139db3f673b9c163f349f.
+  PR #1 merge ref: 8ce9332. 이후 보고서 갱신 커밋은 실행 코드를 변경하지 않는다.
+- Windows MSBuild17.14.60: 경고 0, 오류 0. PE32/I386/32BITREQUIRED 통과.
+  C#118 assertions 통과, Runtime4.0.30319.42000, pointerBytes=4.
+  Python17 tests 통과. Indi OCX/서버/실계좌 검증은 이 CI에 포함되지 않는다.
+- PR: https://github.com/na999jason-sketch/shinhan-autotrader/pull/1
+- 성공 실행: https://github.com/na999jason-sketch/shinhan-autotrader/actions/runs/43158832074
+- EXE: https://github.com/na999jason-sketch/shinhan-autotrader/actions/runs/43158832074/artifacts/13917067166
+- 보고서: https://github.com/na999jason-sketch/shinhan-autotrader/actions/runs/43158832074/artifacts/13916802416
+- 최초 HTTP403은 사용자의 GitHub 앱 설치 후 해소됐으며 브랜치 게시/PR 생성에 성공했다.
 - validation-reports 아티팩트에 빌드 로그와 테스트 보고서가 저장된다.
 - 성공한 실행만 ShinhanNativeTrader-Win32 EXE 아티팩트를 업로드한다.
 
