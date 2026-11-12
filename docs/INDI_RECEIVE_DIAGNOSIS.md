@@ -35,4 +35,4 @@
 
 [WPF 예제 README](https://github.com/yu4321/ShinhanIndi_Example_WPFVersion/blob/323a6b6203051b3605d0abe1fd4de2c0f7b6740a/README.md)는 공식 C# WinForms 예제를 포팅했다고 설명하고 `http://file.shinhaninvest.com/filedoc/indi/sample/indi_csharp.zip`를 출처로 든다. 이번 조사에서 해당 경로의 HTTPS 요청과 `file.shinhansec.com`의 같은 경로는 모두 HTTP 503이어서 공식 ZIP 원본을 확보하지 못했다.
 
-네이티브 COM fixture를 통한 테스트는 Windows COM 연결점·IDispatch·활성화 수명의 구현을 검증한다. 이는 신한 OCX와 서버를 사용한 실제 수신 검증을 대신하지 않는다. 새로운 EXE에서도 사용자 Windows Indi의 `ReceiveData`와 응답 행수가 확인되기 전에는 수신 문제 해결로 보고하지 않는다. 실주문은 계속 비활성화한다.
+네이티브 COM fixture를 통한 테스트는 Windows COM 연결점·IDispatch·구독 보관/해제를 검증한다. 신한 OCX의 AxHost 활성화와 서버를 사용한 실제 수신 검증을 대신하지 않는다. 새로운 EXE에서도 사용자 Windows Indi의 `ReceiveData`와 응답 행수가 확인되기 전에는 수신 문제 해결로 보고하지 않는다. 실주문은 계속 비활성화한다.

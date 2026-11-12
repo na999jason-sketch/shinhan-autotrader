@@ -1,6 +1,7 @@
 // Synthetic, registration-free COM event source. This is not an Indi implementation.
 #include <windows.h>
 #include <ocidl.h>
+#include <olectl.h>
 #include <oleauto.h>
 #include <cwchar>
 #include <new>

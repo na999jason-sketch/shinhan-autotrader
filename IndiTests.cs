@@ -115,6 +115,10 @@ namespace ShinhanNativeTrader {
             var privateLog="";requests.Trace+=value=>privateLog+=value;requests.Fatal+=value=>privateLog+=value;
             Check(!requests.Begin("HOLDINGS","SABA200QB",new Dictionary<int,string>{{0,"1234567890"},{1,"01"},{2,"4321"}},""),"holding provider error stops immediately");
             Check(!privateLog.Contains("1234567890")&&!privateLog.Contains("4321")&&privateLog.Contains("오류"),"actual provider diagnostics retain reason while redacting credentials");requests.Dispose();
+            fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);privateLog="";requests.Trace+=value=>privateLog+=value;
+            Check(requests.Begin("HOLDINGS","SABA200QB",new Dictionary<int,string>{{0,"1234567890"},{1,"01"},{2,"4321"}},""),"holding request can complete before a later unrelated query");
+            fake.Data(7);fake.Diagnostic.Message="이전 요청 암호4321";fake.Quote();
+            Check(BeginQuote(requests)&&!privateLog.Contains("4321"),"retained provider messages cannot leak a prior request password");requests.Dispose();
             fake=new FakeIndi{SetQueryAccepted=false};requests=new IndiRequestCoordinator(fake);
             Check(!BeginQuote(requests)&&requests.Failed&&fake.RequestCount==0,"SetQueryName failure prevents request");requests.Dispose();
             fake=new FakeIndi{SetFieldAccepted=false};requests=new IndiRequestCoordinator(fake);

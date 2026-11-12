@@ -297,6 +297,7 @@ namespace ShinhanNativeTrader {
             public string[] Sensitive=new string[0];
         }
         readonly IIndiTransport io;Pending pending;bool failed,disposed;
+        readonly HashSet<string> sessionSensitive=new HashSet<string>(StringComparer.Ordinal);
         public event Action<string> Trace;
         public event Action<string> Fatal;
         public event Action<IndiReply> Done;
@@ -311,7 +312,9 @@ namespace ShinhanNativeTrader {
             if(diagnostic==null){Log("INDI "+stage+": diagnostic getters unavailable.");return null;}
             try {
                 var snapshot=diagnostic.ReadDiagnostics();
-                Log("INDI "+stage+": "+IndiDiagnosticFormatter.Format(snapshot,current==null?new string[0]:current.Sensitive));
+                // Indi may retain the preceding request's error text. Redact credentials
+                // from this session even when the current query has no account inputs.
+                Log("INDI "+stage+": "+IndiDiagnosticFormatter.Format(snapshot,sessionSensitive));
                 return snapshot;
             } catch(Exception ex) {Log("INDI "+stage+": diagnostics unavailable ("+ex.GetBaseException().GetType().Name+").");return null;}
         }
@@ -331,7 +334,10 @@ namespace ShinhanNativeTrader {
             if(failed)throw new InvalidOperationException("Indi requests halted after an earlier error; reconnect required.");
             if(Busy){Log("Rejected request while another TR is pending.");return false;}
             var current=new Pending{Kind=kind,Code=code};pending=current;
-            if(kind=="HOLDINGS"&&input!=null)current.Sensitive=input.Where(x=>x.Key==0||x.Key==2).Select(x=>x.Value).ToArray();
+            if(kind=="HOLDINGS"&&input!=null) {
+                current.Sensitive=input.Where(x=>x.Key==0||x.Key==2).Select(x=>x.Value).ToArray();
+                foreach(var value in current.Sensitive)if(!string.IsNullOrWhiteSpace(value))sessionSensitive.Add(value);
+            }
             var stage="SetQueryName";
             try {
                 Diagnose(current,"before "+query);
@@ -381,7 +387,7 @@ namespace ShinhanNativeTrader {
             if(disposed||failed)return;
             pending=null;failed=true;Log("HALT: "+reason);if(Fatal!=null)Fatal(reason);
         }
-        public void Dispose(){if(disposed)return;disposed=true;pending=null;io.ReceiveData-=OnData;io.Error-=Halt;}
+        public void Dispose(){if(disposed)return;disposed=true;pending=null;sessionSensitive.Clear();io.ReceiveData-=OnData;io.Error-=Halt;}
     }
 
     public sealed class IndiApi : IDisposable {
