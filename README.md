@@ -1,54 +1,52 @@
-# Shinhan Native Trader 1.0 – 신한 인디 ActiveX 새 구현
+# Shinhan Native Trader
 
-## 먼저 읽어주세요
+신한투자증권 Indi ActiveX를 사용하는 **C# .NET Framework 4.8 / x86 Windows 프로그램**입니다. 종목·일봉·현재가·잔고 조회와 실제 시세 기반 모의 자동매매를 제공합니다. **실주문은 C# 및 기존 Python API 모두 차단됩니다.** 현재 공식 주문 명세와 실제 Windows Indi 서버 검증이 확보되지 않았으므로 실계좌 자동매매 완성판으로 배포하지 않습니다.
 
-이 프로그램은 이전 v0.3.x Python/PyQt/PyInstaller 패치가 아닙니다. **Windows C# .NET Framework 4.8 / x86 / WinForms AxHost / COM connection-point** 로 처음부터 구현한 별도 프로젝트입니다.
+## 실행과 빌드
 
-**실계좌로 매수·매도 주문을 전송하는 기능은 이 1.0 빌드에 없습니다.** 이전 v0.3.x에서 접수·체결 추적이 검증되지 않았으므로, 주식 실주문 경로를 잠갔습니다. 이 제품을 완성된 실전 자동매매 프로그램이라고 부르지 않습니다.
+1. GitHub Actions의 성공한 `Build and test Shinhan Native Win32` 실행에서 `ShinhanNativeTrader-Win32` 아티팩트를 내려받습니다. 검증 기록은 `validation-reports`에 있습니다.
+2. Windows에서 공식 신한 Indi 국내주식 ActiveX를 설치하고 로그인합니다. 설치/로그인 방법은 신한 공식 안내를 따릅니다. 이 프로그램은 자격증명을 보관하거나 자동 로그인하지 않습니다.
+3. EXE를 실행하고 `Indi 연결·종목 조회`로 실제 `stock_mst` 응답을 확인합니다. 일봉/현재가/실제 잔고 조회는 각각 별도로 실행합니다. 계좌 암호는 잔고 요청 직후 화면에서 지웁니다.
+4. `전략·투자원금` 탭에서 설정을 저장한 뒤 `전체 스캔·모의매매 시작`을 누릅니다. 보유 감시는 스캔 완료 이후에도 계속됩니다. 중단 후에는 `모의 보유 감시 재개`로 감시만 재개할 수 있습니다.
 
-이 빌드의 목적은 한 번의 실행파일에서 ① 신한 종목조회 ② 실제 일봉 ③ 실제 현재가 ④ 실제 잔고 조회 ⑤ 실제 가격 기반 전략 후보 선별 및 가상매수/매도까지 검증하는 것입니다. **신한i indi/Indi Helper가 정상인 Windows PC에서 실제 이벤트 수신은 아직 테스트하지 못했습니다.** 현재 GitHub 빌드도 실행 검증되지 않았습니다.
+Visual Studio Build Tools와 .NET Framework 4.8 targeting pack이 있는 Windows 개발자 명령 프롬프트:
 
-## 왜 바꾸었나
+```bat
+msbuild ShinhanNativeTrader.csproj /t:Rebuild /p:Configuration=Release /p:Platform=x86 /p:PlatformTarget=x86 /warnaserror
+```
 
-기존 진단 로그에서 `RequestData() -> rid=0` 호출까지만 진행하고 `ReceiveData`가 타임아웃되었습니다. 사용자 PC의 Indi Helper에서는 같은 `stock_mst`가 정상 조회됐습니다. Python QAxWidget 대신 **Windows 네이티브 ActiveX 호스트 AxHost**와 .NET Framework COM 이벤트 수신 연결점(ComEventsHelper)을 사용하는 구조입니다. 이 방식의 실제 동작도 PC에서 확인해야 합니다.
+PowerShell에서 COM 없이 C# 테스트 실행:
 
-## 설치 / EXE 생성 (사용자 PC 파이썬 설치 필요 없음)
+```powershell
+$p = Start-Process .\bin\Release\ShinhanNativeTrader.exe -ArgumentList '--selftest --selftest-report reports\native-tests.txt' -Wait -PassThru
+Get-Content reports\native-tests.txt
+if ($p.ExitCode -ne 0) { throw 'Native tests failed' }
+python scripts/verify_x86.py bin/Release/ShinhanNativeTrader.exe
+python -m unittest discover -s tests -v
+```
 
-1. 이 ZIP을 압축 해제합니다.
-2. GitHub에서 새 **Private** 저장소를 만들거나 기존 `shinhan-autotrader` 저장소에 **새 폴더가 아니라 루트의 소스파일** `Program.cs`, `IndiCom.cs`, `Strategy.cs`, `SelfTests.cs`, `ShinhanNativeTrader.csproj`와 `.github/workflows/build-win32.yml`을 업로드합니다. 기존 Python `app.py`가 있어도 새 C# 빌드에는 사용하지 않습니다.
-3. GitHub **Actions → Build Shinhan Native Win32 → Run workflow**를 실행합니다. 기존 `Build Shinhan AutoTrader Win32` 액션과 **다른 워크플로**입니다.
-4. 성공하면 **Artifacts → ShinhanNativeTrader-Win32**에서 EXE를 다운로드합니다.
-5. Windows PC에 Indi 설치와 로그인 세션이 있는 상태에서 `ShinhanNativeTrader.exe`를 실행합니다. Windows .NET Framework 4.8 실행환경이 필요하며 Python은 필요 없습니다.
+기존 `app.py`, `build_exe_win32.bat`는 레거시 Python 프로그램입니다. 위 C# EXE 빌드와 구분하십시오. Python 주문 어댑터를 직접 호출해도 요청 전에 예외를 발생시킵니다.
 
-## 버튼 설명
+## 변경된 구조
 
-- **① 신한 종목조회 연결**: `stock_mst` 요청. 성공하면 실제 종목 건수 표시. 연결이 실패하면 여기서 멈춥니다.
-- **② 일봉 분석**: 6자리 종목코드의 `TR_SCHART` 일봉 조회 후 신호 계산.
-- **현재가 조회**: 해당 코드의 `SC` 조회.
-- **③ 전체종목 순차스캔**: 전종목 일봉을 950ms 간격으로 순차 조회해 전략 후보 탐색. 전략은 직전 5/20일 평균 추세, 20일 고점 돌파, 거래량 조건.
-- **④ 실제 잔고 조회**: `SABA200QB` 조회 전용. 계좌번호와 비밀번호는 화면에만 입력하며 저장하지 않습니다. **계좌잔고와 거래 기록을 절대로 가상잔고에 합치지 않습니다.**
-- **즉시 스캔 중단**: 추후 요청 중단 (진행 중인 신한 조회 취소 명령은 보내지 않음).
+- `IndiCom.cs`: 설치된 typelib의 outgoing IID/DISPID/인자형을 탐색하여 이벤트를 연결합니다. 고정 IID와 DISPID를 제거하고 동일 STA, ActiveX 수명, delegate 보관과 해제를 관리합니다. COM 실행부·요청 상태기계·응답 파서를 분리했습니다.
+- `IndiRequestCoordinator`: 요청번호 대조, 요청 반환 전 재진입 콜백 버퍼 복사, 중복/다른 요청 응답 무시, 오류·20초 타임아웃 차단을 담당합니다. 잘못된 숫자·필드·중복 종목은 성공 응답으로 취급하지 않습니다. COM 실행부는 조회 TR 네 개만 허용합니다.
+- `Strategy.cs`: 이동평균·고점돌파·거래량 조건, 손절·익절·고점 추적손절, 원금 배분과 비용률, 한국시간 장 운영시간을 제공합니다. 전략 기간에 맞는 일봉 수를 요청합니다.
+- `TradingEngine.cs`: 모의 주문·체결번호, 부분체결, 거절·취소·만료, 현금 예약, 매도가능수량, 최대 보유수, 중복 방지와 상태 검증을 담당합니다. 주문 요청을 체결로 추정하지 않습니다.
+- `Program.cs`: 전략/원금 편집, 실제 조회와 모의 잔고/주문 화면, 전체 종목 순차 스캔, 보유종목 우선 조회를 연결합니다. 매수는 당일 일봉 신호와 별도 최신 현재가, 신호 기준가 대비 3% 이내 조건을 요구합니다. UI 모의체결은 즉시 전량 체결이며 부분체결·미체결 경로는 엔진 테스트로 검증합니다.
 
-로그는 `%LOCALAPPDATA%\ShinhanNativeTrader\diagnostics.log`, 가상거래 기록은 `%LOCALAPPDATA%\ShinhanNativeTrader\paper_trades.csv`에 저장됩니다. 비밀번호나 계좌번호는 로그하지 않습니다.
+모의 매수금액은 모의 가용현금과 예약금을 기준으로 검증합니다. **투자원금·모의현금·증권사 잔고/예수금은 실제 주문가능금액이 아닙니다.** 실제 체결/미체결 조회, 주문가능금액 TR, `AA/AB/AD/AE` 실시간 계좌 이벤트는 구현·실서버 검증이 남아 있습니다.
 
-## 실제 매매 이전에 해결해야 할 기능
+## 저장과 재시작
 
-- C# 프로그램에서 실제 `ReceiveData` 수신 검증
-- 주문가능현금 조회의 **현재 신한 TR 및 출력 필드** 공식 사양 확보. 단순 예수금이나 사용자가 입력한 자금을 주문가능현금으로 취급하면 안 됩니다.
-- 계좌별 체결/미체결 실시간 이벤트 `AA, AB, AD, AE` 검증과 주문번호별 체결·취소·정정 및 재시작 복구
-- 주문 금액을 주문가능금액에 제한하고, 미수/신용 전면 차단
-- 실제 자동매도 타이밍·슬리피지·전략 유효성 검증과 장애 복구
+`%LOCALAPPDATA%\ShinhanNativeTrader\paper-v2.xml`에 모의 원금·현금·전략·주문·체결·보유고점을 저장합니다. 임시 파일 flush 후 원자적으로 교체하며, 다른 실행 프로세스의 동시 쓰기를 차단합니다. 저장 실패·손상된 파일은 자동 거래를 막습니다. 파일을 무시하거나 초기화해 계속 매매하지 않습니다.
 
-신한 공식 FAQ는 최초 잔고/주문체결 TR 이후 **실시간 주문체결 AA/AB 및 잔고 AD/AE**를 이용하도록 안내합니다. `ReceiveData`가 성공한 것만으로 실거래 자동매매가 완성되는 것은 아닙니다.
+재시작 시 미완료 모의 주문은 `NeedsReconciliation`이 되고 예약금/수량을 유지합니다. 화면의 `재시작 모의 미체결 취소·예약금 해제`로 **모의 주문만** 취소한 뒤 다시 시작하십시오. 실제 증권사 주문을 취소하거나 대사하는 기능이 아닙니다. 이전 버전 `paper_trades.csv`는 고점/미체결 증거가 부족해 자동 변환하지 않으며 그대로 보존합니다.
 
-## 자료
+## 검증 범위
 
-- 신한투자증권 신한i indi 공식 서비스: https://www.shinhansec.com/siw/customer-center/channel/channel_homeTrading-indi/contents.do
-- 신한i indi 공식 FAQ: https://www.shinhansec.com/siw/customer-center/channel/channel_homeTrading-indi_faq/contents.do
-- stock_mst TR 사용법: https://wikidocs.net/22664
-- TR_SCHART 일봉 필드: https://wikidocs.net/78514
-- SABA200QB 잔고 필드: https://wikidocs.net/22715
+CI는 Windows 2022에서 .NET 4.8 x86 빌드, PE32/CLR 32BITREQUIRED 확인, C# 단위·모의매매 테스트, Python 회귀 테스트를 실행합니다. 설치된 Indi OCX나 로그인 계좌는 사용하지 않습니다.
 
-## 전략과 돈의 위험
+실제 Windows Indi COM 이벤트 수신·조회값의 HTS 일치·연결 복구·공식 주문 필드·체결/미체결/주문가능액 대사는 미검증입니다. 시세 시각 `HHMMSS`는 날짜를 포함하지 않으므로 당일 시세임을 독립적으로 증명하지 못합니다. 휴장일 달력, 호가/유동성, 지연/슬리피지 및 전략 수익성도 검증되지 않았습니다. 전략은 예시이며 투자 성과를 보장하지 않습니다.
 
-이 전략은 예시 규칙이며, 수익성·안정성은 백테스트나 실거래에서 입증되지 않았습니다. 국내주식은 시세 급변·미체결·거래중단 등이 발생할 수 있습니다. 신한 실계좌에서 주문가능액 조회와 체결확인이 검증되기 전에는 실제 주문 기능을 제공하지 않습니다.
+공식/비공식 자료 구분과 실제 서버 확인 항목은 [Indi 인터페이스 확인 기록](docs/INDI_API_VERIFICATION.md), 변경 원인과 검증 방법은 [검증 보고서](TEST_REPORT.txt)를 참조하십시오. **사용자 승인만으로 실주문 잠금을 푸는 설정은 제공하지 않습니다.** 실제 돈을 쓰는 검증은 별도 승인과 후속 구현/검증이 필요합니다.

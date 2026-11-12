@@ -11,259 +11,197 @@ namespace ShinhanNativeTrader {
     internal static class Program {
         [STAThread]
         static int Main(string[] args) {
-            if(args.Contains("--selftest")) {
-                try{SelfTests.Run();return 0;}catch{return 1;}
+            if (args.Contains("--selftest")) {
+                int exit = 0; string report;
+                try { report = "PASS: " + SelfTests.Run() + " assertions; fake transport and paper trading only."; }
+                catch (Exception ex) { exit = 1; report = "FAIL: " + ex; }
+                report += Environment.NewLine + "Runtime=" + Environment.Version + "; pointerBytes=" + IntPtr.Size
+                    + Environment.NewLine + "Windows Indi COM/server/live validation: NOT RUN. Live orders: DISABLED.";
+                Console.WriteLine(report);
+                int index = Array.IndexOf(args, "--selftest-report");
+                if (index >= 0) {
+                    if (index + 1 >= args.Length) return 2;
+                    try {
+                        string path = Path.GetFullPath(args[index + 1]);
+                        Directory.CreateDirectory(Path.GetDirectoryName(path));
+                        File.WriteAllText(path, report + Environment.NewLine, Encoding.UTF8);
+                    } catch (Exception ex) { Console.Error.WriteLine(ex); return 2; }
+                }
+                return exit;
             }
-            Application.EnableVisualStyles();Application.SetCompatibleTextRenderingDefault(false);
-            Application.ThreadException+=(s,e)=>{
-                DiagnosticFile("GUI ERROR: "+e.Exception);
-                MessageBox.Show("예외 발생: "+e.Exception.GetBaseException().Message+"\n실주문은 지원되지 않습니다.","Shinhan Native Trader");
+            Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
+            Application.ThreadException += (s, e) => {
+                DiagnosticFile("GUI ERROR: " + e.Exception.GetType().Name);
+                foreach (MainForm form in Application.OpenForms.OfType<MainForm>()) form.Halt();
+                MessageBox.Show("화면 오류로 작업을 중단했습니다. 실주문은 잠겨 있습니다.");
             };
-            AppDomain.CurrentDomain.UnhandledException+=(s,e)=>DiagnosticFile("UNHANDLED: "+e.ExceptionObject);
-            Application.Run(new MainForm());return 0;
+            Application.Run(new MainForm()); return 0;
         }
         internal static string DataDir {
-            get {
-                string p=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"ShinhanNativeTrader");
-                Directory.CreateDirectory(p);return p;
-            }
+            get { string p = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ShinhanNativeTrader"); Directory.CreateDirectory(p); return p; }
         }
-        internal static void DiagnosticFile(string msg){
-            try{File.AppendAllText(Path.Combine(DataDir,"diagnostics.log"),DateTime.Now.ToString("s")+" "+msg+Environment.NewLine,Encoding.UTF8);}catch{}
+        internal static void DiagnosticFile(string message) {
+            try { File.AppendAllText(Path.Combine(DataDir, "diagnostics.log"), DateTime.UtcNow.ToString("s") + "Z " + message + Environment.NewLine, Encoding.UTF8); }
+            catch { }
         }
     }
+
     public sealed class MainForm : Form {
-        readonly Panel nativeArea=new Panel();
-        readonly TextBox logs=new TextBox(), account=new TextBox(), password=new TextBox(), code=new TextBox();
-        readonly NumericUpDown paperCash=new NumericUpDown();
-        readonly Button connect=new Button(), lookBar=new Button(), lookAccount=new Button(), scan=new Button(), stop=new Button(), quote=new Button();
-        readonly Label state=new Label();
-        readonly DataGridView grid=new DataGridView(), holdingsGrid=new DataGridView();
-        readonly Timer pacing=new Timer(), paperMonitoring=new Timer();
-        IndiApi api;
-        readonly List<Stock> symbols=new List<Stock>();
-        readonly List<Candidate> candidates=new List<Candidate>();
-        readonly Queue<Stock> work=new Queue<Stock>();
-        readonly Dictionary<string,PaperPosition> paper=new Dictionary<string,PaperPosition>();
-        readonly Dictionary<string,Holding> brokerHoldings=new Dictionary<string,Holding>();
-        bool scanning=false, connected=false;
-        decimal availablePaper=1000000m;
-        DateTime lastPaperQuote=DateTime.MinValue;
-        int scanDone=0;
-        readonly string journal=Path.Combine(Program.DataDir,"paper_trades.csv");
+        readonly Panel nativeArea = new Panel();
+        readonly TextBox logs = new TextBox(), account = new TextBox(), password = new TextBox(), code = new TextBox { Text = "005930", Width = 85 };
+        readonly NumericUpDown capital = Number(10000, 1000000000, 1000000, 0);
+        readonly Label state = new Label { AutoSize = true }, portfolio = new Label { AutoSize = true };
+        readonly DataGridView candidatesGrid = Grid("코드", "종목명", "신호 기준가", "점수", "조건"),
+            holdingsGrid = Grid("코드", "종목명", "잔고", "매도미체결", "매수미체결", "평균단가", "현재가"),
+            paperGrid = Grid("코드", "종목명", "수량", "평균단가", "추적고점"),
+            ordersGrid = Grid("주문ID", "방향", "코드", "수량", "체결수량", "지정가", "예약금", "상태");
+        readonly Dictionary<string, NumericUpDown> options = new Dictionary<string, NumericUpDown>();
+        readonly Timer scheduler = new Timer { Interval = 1000 };
+        readonly List<Stock> symbols = new List<Stock>();
+        readonly Queue<Stock> scans = new Queue<Stock>();
+        readonly Queue<Candidate> buyQuotes = new Queue<Candidate>();
+        readonly Dictionary<string, DateTime> quoteDue = new Dictionary<string, DateTime>();
+        IndiApi api; PaperTradingEngine engine; Candidate requestedBuy;
+        bool scanning, trading, halted, requestedScan; int scanned, holdingRequests;
 
         public MainForm() {
-            Text="Shinhan Native Trader 1.1 (compile fix) | C# Win32 ActiveX (Python 없이 실행)";
-            Size=new Size(1150,760);MinimumSize=new Size(1050,680);
-            Font=new Font("Malgun Gothic",9);
-            var root=new TableLayoutPanel{Dock=DockStyle.Fill,ColumnCount=1,RowCount=4,Padding=new Padding(10)};
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute,39));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute,120));
-            root.RowStyles.Add(new RowStyle(SizeType.Percent,100));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute,95));
-            Controls.Add(root);
-            var top=new Label{Text="국내주식 실데이터 연결·전략 시험 | 실제 주문은 잠금 (미검증 API에 돈을 보내지 않습니다)",
-                Dock=DockStyle.Fill,ForeColor=Color.DarkRed,Font=new Font("Malgun Gothic",11,FontStyle.Bold)};
-            root.Controls.Add(top,0,0);
-            var bar=new Panel{Dock=DockStyle.Fill};root.Controls.Add(bar,0,1);
-            connect.Text="① 신한 종목조회 연결";connect.SetBounds(8,4,166,33);
-            lookBar.Text="② 일봉 분석";lookBar.SetBounds(179,4,126,33);
-            quote.Text="현재가 조회";quote.SetBounds(310,4,117,33);
-            scan.Text="③ 전체종목 순차스캔";scan.SetBounds(432,4,165,33);
-            stop.Text="즉시 스캔 중단";stop.SetBounds(602,4,141,33);
-            lookAccount.Text="④ 실제 잔고 조회 (주문 없음)";lookAccount.SetBounds(748,4,218,33);
-            foreach(var b in new[]{connect,lookBar,quote,scan,stop,lookAccount})bar.Controls.Add(b);
-            var lblCode=new Label{Text="종목코드",Location=new Point(12,52),AutoSize=true};bar.Controls.Add(lblCode);
-            code.SetBounds(74,49,92,25);code.Text="005930";bar.Controls.Add(code);
-            var lblAccount=new Label{Text="계좌번호",Location=new Point(193,52),AutoSize=true};bar.Controls.Add(lblAccount);
-            account.SetBounds(260,49,148,25);bar.Controls.Add(account);
-            var lblPwd=new Label{Text="계좌암호",Location=new Point(427,52),AutoSize=true};bar.Controls.Add(lblPwd);
-            password.SetBounds(493,49,116,25);password.UseSystemPasswordChar=true;bar.Controls.Add(password);
-            var lblPaper=new Label{Text="가상현금(원)",Location=new Point(628,52),AutoSize=true};bar.Controls.Add(lblPaper);
-            paperCash.SetBounds(717,49,138,25);paperCash.Minimum=10000;paperCash.Maximum=1000000000;paperCash.Increment=100000;paperCash.Value=1000000;paperCash.ThousandsSeparator=true;bar.Controls.Add(paperCash);
-            state.Text="상태: 아직 OCX 미연결 | 주문 전송 기능 없음";state.Location=new Point(12,87);state.Size=new Size(1050,26);bar.Controls.Add(state);
-            var tabs=new TabControl{Dock=DockStyle.Fill};root.Controls.Add(tabs,0,2);
-            TabPage t1=new TabPage("실제 데이터 종목 후보"),t2=new TabPage("증권사 보유잔고(읽기만)"),t3=new TabPage("시스템 로그");
-            tabs.TabPages.AddRange(new[]{t1,t2,t3});
-            SetupGrid(grid,new[]{"종목코드","종목명","기준가","점수","선별 조건"});t1.Controls.Add(grid);
-            SetupGrid(holdingsGrid,new[]{"종목코드","종목명","잔고수량","매도미체결","매수미체결","평균단가","현재가"});t2.Controls.Add(holdingsGrid);
-            logs.Dock=DockStyle.Fill;logs.Multiline=true;logs.ReadOnly=true;logs.ScrollBars=ScrollBars.Vertical;
-            logs.Font=new Font("Consolas",9);t3.Controls.Add(logs);
-            var footer=new Panel{Dock=DockStyle.Fill};root.Controls.Add(footer,0,3);
-            var footerText=new Label{Text="이 버전은 Indi Helper에서 성공한 stock_mst 조회를 C# ActiveX 이벤트로 재구현합니다.\n"+
-                "전체 종목을 순차 분석하여 가상 매수·매도를 시험합니다. 실계좌 주문·현금주문가능액 조회·체결복구는 확인 전까지 사용 불가입니다.",
-                Dock=DockStyle.Fill,ForeColor=Color.DarkSlateGray};footer.Controls.Add(footerText);
-            nativeArea.SetBounds(0,68,12,12);nativeArea.BackColor=Color.Transparent;footer.Controls.Add(nativeArea);
-            nativeArea.BringToFront();
-            pacing.Interval=950;pacing.Tick+=OnPace;
-            paperMonitoring.Interval=15000;paperMonitoring.Tick+=OnPaperMonitor;
-            connect.Click+=(s,e)=>Safe(ConnectAndLoad);
-            lookBar.Click+=(s,e)=>Safe(()=>AskBars(code.Text.Trim()));
-            quote.Click+=(s,e)=>Safe(()=>AskQuote(code.Text.Trim()));
-            scan.Click+=(s,e)=>Safe(StartScan);
-            stop.Click+=(s,e)=>StopScan("사용자 중단");
-            lookAccount.Click+=(s,e)=>Safe(AskHoldings);
-            FormClosing+=(s,e)=> {StopScan("프로그램 종료");if(api!=null)api.Dispose();password.Clear();};
-            PaperRestore();
-            Log("신규 네이티브 C# x86 버전 실행; PyQt/PyInstaller 미사용. 실주문 경로는 UI에 연결하지 않았습니다.");
+            Text = "Shinhan Native Trader | .NET 4.8 x86 | 실주문 잠금";
+            Size = new Size(1240, 830); MinimumSize = new Size(1050, 700); Font = new Font("Malgun Gothic", 9);
+            var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5, Padding = new Padding(10) };
+            foreach (var height in new[] {35, 90, 35}) root.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100)); root.RowStyles.Add(new RowStyle(SizeType.Absolute, 55)); Controls.Add(root);
+            root.Controls.Add(new Label { Text = "실제 시세·종목·잔고 조회 / 자동매수·매도는 모의매매 전용 / 실주문 영구 잠금", AutoSize = true, ForeColor = Color.DarkRed }, 0, 0);
+            var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = true }; root.Controls.Add(buttons, 0, 1);
+            AddButton(buttons, "Indi 연결·종목 조회", Connect); buttons.Controls.Add(code);
+            AddButton(buttons, "일봉 분석", () => { RequireIdle(); requestedScan = false; api.Bars(ValidCode(), BarCount()); });
+            AddButton(buttons, "현재가 조회", () => { RequireIdle(); requestedBuy = null; api.Quote(ValidCode()); });
+            AddButton(buttons, "전체 스캔·모의매매 시작", StartScan);
+            AddButton(buttons, "모의 보유 감시 재개", () => { RequireIdle(); RequireEngine(); trading = true; Log("모의 보유종목 감시 시작"); });
+            AddButton(buttons, "자동 처리 중단", Halt);
+            buttons.Controls.Add(new Label { Text = "계좌", AutoSize = true }); account.Width = 120; buttons.Controls.Add(account);
+            buttons.Controls.Add(new Label { Text = "계좌암호", AutoSize = true }); password.Width = 100; password.UseSystemPasswordChar = true; buttons.Controls.Add(password);
+            AddButton(buttons, "실제 잔고 조회", () => { RequireIdle(); requestedBuy = null; try { api.Holdings(account.Text, password.Text); } finally { password.Clear(); } });
+            state.Text = "연결 전. 실제 주문 API는 차단되어 있습니다."; root.Controls.Add(state, 0, 2);
+            var tabs = new TabControl { Dock = DockStyle.Fill }; root.Controls.Add(tabs, 0, 3);
+            AddTab(tabs, "발굴 후보", candidatesGrid); AddTab(tabs, "증권사 잔고 (조회)", holdingsGrid);
+            var paperPanel = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1 };
+            paperPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 30)); paperPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            paperPanel.Controls.Add(portfolio, 0, 0); paperPanel.Controls.Add(paperGrid, 0, 1); AddTab(tabs, "모의 잔고", paperPanel); AddTab(tabs, "모의 주문·체결", ordersGrid);
+            var settings = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoScroll = true, FlowDirection = FlowDirection.TopDown, WrapContents = false }; AddTab(tabs, "전략·투자원금", settings);
+            AddSetting(settings, "투자원금 (모의 원화)", capital);
+            Setting(settings, "FastPeriod", "단기 이동평균 기간", 1, 199, 5);
+            Setting(settings, "SlowPeriod", "장기 이동평균 기간", 2, 200, 20);
+            Setting(settings, "BreakoutPeriod", "돌파 고점 기간", 1, 200, 20);
+            Setting(settings, "VolumeMultiplier", "평균 거래량 배수", 1, 20, 1.3m, 2);
+            Setting(settings, "MinPrice", "최저 종목 가격", 1, 10000000, 2000);
+            Setting(settings, "MaxPrice", "최고 종목 가격", 1, 10000000, 400000);
+            Setting(settings, "AllocationFraction", "종목당 가용현금 비율 (%)", 1, 100, 20, 2);
+            Setting(settings, "MaxPositions", "최대 보유 종목 수", 1, 100, 3);
+            Setting(settings, "StopLossPercent", "손절 (%)", 0.1m, 90, 6, 2);
+            Setting(settings, "TakeProfitPercent", "익절 (%)", 0.1m, 500, 12, 2);
+            Setting(settings, "TrailingActivationPercent", "추적손절 활성 수익률 (%)", 0.1m, 500, 4, 2);
+            Setting(settings, "TrailingDrawdownPercent", "고점 대비 추적손절 (%)", 0.1m, 90, 7, 2);
+            Setting(settings, "FeeRate", "모의 체결 비용·슬리피지 (%)", 0, 10, 0.3m, 3);
+            AddButton(settings, "설정·원금 저장", SaveSettings);
+            AddButton(settings, "재시작 모의 미체결 취소·예약금 해제", () => { RequireEngine(); Halt(); engine.RecoverPaperOrders(); RefreshPaper(); Log("모의 미체결 취소 완료. 증권사 주문 복구와 별도입니다."); });
+            settings.Controls.Add(new Label { AutoSize = true, MaximumSize = new Size(850, 0), Text = "설정은 모의 계정에 저장됩니다. 원금 변경 시 기존 거래·고점·손익을 유지합니다.\n새 계정 파일은 paper-v2.xml입니다. 기존 CSV 기록은 자동 변환하지 않습니다.\n장 운영시간은 한국시간 평일 09:00~15:20입니다. 휴장일 달력은 미연동입니다.\n모의체결은 조회 가격에 비용을 반영하며 실제 유동성·호가·체결을 보장하지 않습니다." });
+            logs.Multiline = true; logs.ReadOnly = true; logs.ScrollBars = ScrollBars.Vertical; logs.Dock = DockStyle.Fill; AddTab(tabs, "진단 로그", logs);
+            var footer = new FlowLayoutPanel { Dock = DockStyle.Fill };
+            footer.Controls.Add(new Label { AutoSize = true, Text = "스캔 완료 후에도 모의 보유 감시는 계속됩니다. 수신 오류·응답 지연 시 자동 처리를 중단합니다.\nWindows Indi COM·서버 검증과 공식 주문 명세 확인이 필요합니다. 계좌 암호는 저장하지 않습니다." });
+            nativeArea.Size = new Size(12, 12); footer.Controls.Add(nativeArea); root.Controls.Add(footer, 0, 4);
+            try { engine = new PaperTradingEngine(Path.Combine(Program.DataDir, "paper-v2.xml"), 1000000m); LoadSettings(); RefreshPaper(); Log("모의 상태 복원. 미체결은 복구 전 거래 차단. 실주문 DISABLED."); }
+            catch (Exception ex) { halted = true; Log("모의 상태 열기 실패. 파일을 보존하고 거래를 차단합니다: " + ex.GetType().Name); }
+            scheduler.Tick += (s, e) => Safe(Schedule); scheduler.Start();
+            FormClosing += (s, e) => { Halt(); scheduler.Stop(); scheduler.Dispose(); if (api != null) api.Dispose(); if (engine != null) engine.Dispose(); password.Clear(); };
         }
-        static void SetupGrid(DataGridView view,string[] cols){
-            view.Dock=DockStyle.Fill;view.ReadOnly=true;view.AllowUserToAddRows=false;
-            view.RowHeadersVisible=false;view.AutoSizeColumnsMode=DataGridViewAutoSizeColumnsMode.Fill;
-            view.SelectionMode=DataGridViewSelectionMode.FullRowSelect;
-            foreach(var c in cols)view.Columns.Add(c,c);
-        }
-        void Safe(Action fn){try{fn();}catch(Exception e){Log("ERROR "+e.GetBaseException().Message);StopScan("오류");MessageBox.Show(e.GetBaseException().Message,"연결/조회 오류");}}
-        void Log(string msg){
-            var line=DateTime.Now.ToString("HH:mm:ss")+" "+msg;
-            logs.AppendText(line+Environment.NewLine);Program.DiagnosticFile(line);
-            if(logs.TextLength>65000)logs.Text=logs.Text.Substring(logs.TextLength-45000);
-        }
-        void ConnectAndLoad() {
-            if(api==null){
-                api=new IndiApi(nativeArea);api.Trace+=Log;api.Done+=OnReply;
-                api.Fatal+= msg=> {connected=false;StopScan("연결 오류");state.Text="상태: API 중단 — "+msg;};
+        static NumericUpDown Number(decimal min, decimal max, decimal value, int decimals) { return new NumericUpDown { Minimum = min, Maximum = max, Value = value, DecimalPlaces = decimals, ThousandsSeparator = true, Width = 155, Increment = decimals == 0 ? 1 : 0.1m }; }
+        static DataGridView Grid(params string[] columns) { var view = new DataGridView { Dock = DockStyle.Fill, ReadOnly = true, AllowUserToAddRows = false, RowHeadersVisible = false, AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill }; foreach (var column in columns) view.Columns.Add(column, column); return view; }
+        static void AddTab(TabControl tabs, string title, Control content) { var tab = new TabPage(title); tab.Controls.Add(content); tabs.TabPages.Add(tab); }
+        void AddButton(Control parent, string text, Action action) { var b = new Button { Text = text, AutoSize = true }; b.Click += (s, e) => Safe(action); parent.Controls.Add(b); }
+        static void AddSetting(Control parent, string label, Control input) { var row = new FlowLayoutPanel { Width = 620, Height = 34 }; row.Controls.Add(new Label { Text = label, Width = 300 }); row.Controls.Add(input); parent.Controls.Add(row); }
+        void Setting(Control parent, string name, string label, decimal min, decimal max, decimal value, int decimals = 0) { var n = Number(min, max, value, decimals); options.Add(name, n); AddSetting(parent, label, n); }
+        void Safe(Action action) {
+            try { action(); } catch (Exception ex) {
+                Halt(); Log("작업 중단: " + ex.GetType().Name);
+                // Vendor exceptions can echo request fields; never persist their text.
+                state.Text = "작업 오류로 자동 처리 중단. 입력·상태 확인 (" + ex.GetType().Name + ")";
             }
-            if(!api.Connected)api.Connect();
-            connected=true;
-            state.Text="상태: OCX 연결 / stock_mst 실제 응답 대기";
-            if(!api.Stocks())throw new InvalidOperationException("이전 TR이 완료되지 않았습니다");
         }
-        void OnReply(IndiReply r){
-            try {
-                if(r.Kind=="STOCKS"){
-                    symbols.Clear();symbols.AddRange(r.Stocks);
-                    state.Text="실제 종목조회 성공: 원본 "+r.Count+"개 / 코스피·코스닥 일반주식 "+symbols.Count+"개";
-                    Log("INDI stock_mst returned "+r.Count+" raw records, "+symbols.Count+" eligible common stocks");
-                } else if(r.Kind=="BARS"){
-                    var s=symbols.FirstOrDefault(x=>x.Code==r.Code);
-                    var name=s==null?r.Code:s.Name;
-                    var result=Rules.Entry(r.Code,name,r.Bars);
-                    if(result!=null){
-                        candidates.Add(result);
-                        if(grid.Rows.Count<200)grid.Rows.Add(result.Code,result.Name,result.Price.ToString("N0"),result.Score,result.Reason);
-                        Log("후보 "+result.Code+" "+name+" "+result.Score);
-                        if(scanning && Rules.ValidTime(DateTime.Now))PaperBuy(result);
-                    }
-                    scanDone++;
-                    state.Text="스캔 "+scanDone+"/"+(scanDone+work.Count)+" | 후보 "+candidates.Count+" | 가상보유 "+paper.Count;
-                } else if(r.Kind=="QUOTE"){
-                    Log("실제 현재가 "+r.Code+" "+r.Price.ToString("N0")+"원 체결시각="+r.Clock);
-                    PaperExit(r.Code,r.Price,r.Clock);
-                } else if(r.Kind=="HOLDINGS"){
-                    brokerHoldings.Clear();holdingsGrid.Rows.Clear();
-                    foreach(var h in r.Holdings){
-                        brokerHoldings[h.Code]=h;
-                        holdingsGrid.Rows.Add(h.Code,h.Name,h.Quantity,h.SellPending,h.BuyPending,h.AvgPrice.ToString("N0"),h.Price.ToString("N0"));
-                    }
-                    Log("신한 실제 잔고 조회 성공: "+r.Holdings.Count+"건 (주문하지 않음)");
-                }
-            }catch(Exception e){Log("REPLY ERROR "+e);StopScan("응답 처리 실패");}
+        void Log(string message) { logs.AppendText(MarketTime.NowKorea.ToString("HH:mm:ss") + " " + message + Environment.NewLine); if (logs.TextLength > 65000) logs.Text = logs.Text.Substring(logs.TextLength - 45000); Program.DiagnosticFile(message); }
+        void RequireEngine() { if (engine == null || halted) throw new InvalidOperationException("모의 원장 사용 불가"); }
+        void RequireConnected() { if (api == null || !api.Connected) throw new InvalidOperationException("Indi 연결 필요"); }
+        void RequireIdle() { RequireConnected(); if (api.Busy) throw new InvalidOperationException("조회 대기 중"); }
+        string ValidCode() { var value = Rules.Code(code.Text); if (value == "") throw new ArgumentException("6자리 종목코드 필요"); return value; }
+        void Connect() {
+            if (api == null) { api = new IndiApi(nativeArea); api.Trace += Log; api.Done += reply => Safe(() => Reply(reply)); api.Fatal += message => { Halt(); state.Text = "Indi 연결 오류. 자동 처리 중단"; Log(message); }; }
+            api.Connect(); RequireIdle(); api.Stocks(); state.Text = "stock_mst 실제 응답 대기";
         }
-        void AskBars(string c){
-            if(!connected || symbols.Count==0)throw new InvalidOperationException("먼저 ① 종목조회 연결을 성공시켜야 합니다.");
-            if(Rules.Code(c)=="")throw new InvalidOperationException("6자리 종목코드를 입력하십시오.");
-            if(api.Busy){Log("기존 TR 응답 대기 중");return;}
-            api.Bars(c);
+        void StartScan() {
+            RequireIdle(); RequireEngine(); if (symbols.Count == 0) throw new InvalidOperationException("종목조회 필요"); if (scanning) return;
+            scans.Clear(); buyQuotes.Clear(); candidatesGrid.Rows.Clear(); scanned = 0;
+            foreach (var s in symbols.OrderBy(x => x.Code)) scans.Enqueue(s);
+            scanning = true; trading = true; Log("전체 스캔 시작. 최신 현재가 조회 후에만 모의매수합니다.");
         }
-        void AskQuote(string c){
-            if(!connected)throw new InvalidOperationException("먼저 ① 신한 연결을 하십시오.");
-            if(Rules.Code(c)=="")throw new InvalidOperationException("6자리 종목코드 필요");
-            if(!api.Busy)api.Quote(c);
-        }
-        void AskHoldings(){
-            if(!connected)throw new InvalidOperationException("먼저 ① 연결을 확인하십시오.");
-            if(api.Busy)throw new InvalidOperationException("기존 조회 응답 대기 중");
-            if(!api.Holdings(account.Text.Trim(),password.Text))throw new InvalidOperationException("잔고 조회가 실행되지 않았습니다");
-            password.Clear();
-        }
-        void StartScan(){
-            if(!connected || symbols.Count==0)throw new InvalidOperationException("먼저 전체 종목조회에 성공해야 합니다.");
-            if(scanning)return;
-            candidates.Clear();grid.Rows.Clear();work.Clear();scanDone=0;
-            foreach(var s in symbols.OrderBy(x=>x.Code))work.Enqueue(s);
-            scanning=true;RecalculatePaperCash();
-            pacing.Start();paperMonitoring.Start();Log("시작: "+work.Count+"개 실제 종목 순차 일봉 조회; 950ms 간격. 실주문 0건");
-        }
-        void StopScan(string why){
-            if(scanning){scanning=false;pacing.Stop();paperMonitoring.Stop();Log("스캔 중단 "+why);}
-        }
-        void OnPace(object sender,EventArgs args){
-            if(!scanning)return;
-            if(api==null || !api.Connected){StopScan("OCX 연결 없음");return;}
-            if(api.Busy)return;
-            if(work.Count==0){StopScan("모든 종목 스캔 완료");return;}
-            var s=work.Dequeue();api.Bars(s.Code);
-        }
-        void OnPaperMonitor(object sender,EventArgs args){
-            if(!scanning||paper.Count==0||api.Busy)return;
-            if((DateTime.Now-lastPaperQuote).TotalSeconds<30)return;
-            lastPaperQuote=DateTime.Now;
-            var codes=paper.Keys.ToArray();
-            if(codes.Length>0)api.Quote(codes[(DateTime.Now.Second/10)%codes.Length]);
-        }
-        void PaperBuy(Candidate c){
-            if(paper.ContainsKey(c.Code)||paper.Count>=3)return;
-            var qty=Rules.PaperQty(availablePaper,c.Price);
-            if(qty<=0)return;
-            var cost=c.Price*qty*1.003m;
-            if(availablePaper<cost)return;
-            availablePaper-=cost;
-            paper[c.Code]=new PaperPosition{Code=c.Code,Name=c.Name,Qty=qty,Entry=c.Price,High=c.Price};
-            WritePaper("BUY",c.Code,qty,c.Price,"signal");
-            Log("가상매수 (실제 주문 아님) "+c.Code+" "+qty+"주 "+c.Price.ToString("N0"));
-        }
-        void PaperExit(string c,decimal price,string clock){
-            PaperPosition p;if(!paper.TryGetValue(c,out p))return;
-            if(!Rules.ValidTime(DateTime.Now))return;
-            // Only accept today's regular-session quotes; stale and after-hours do not trigger even simulated sells.
-            var text=(clock??"").Trim();
-            if(text.Length<6||!text.Take(6).All(char.IsDigit))return;
-            int hh,mm,ss;
-            if(!int.TryParse(text.Substring(0,2),out hh)||!int.TryParse(text.Substring(2,2),out mm)||!int.TryParse(text.Substring(4,2),out ss))return;
-            if(hh>23||mm>59||ss>59)return;
-            var stamp=DateTime.Today.AddHours(hh).AddMinutes(mm).AddSeconds(ss);
-            if(Math.Abs((DateTime.Now-stamp).TotalSeconds)>45)return;
-            if(price>p.High)p.High=price;
-            var reason=Rules.Exit(p,price);
-            if(reason=="")return;
-            availablePaper += price*p.Qty*0.997m;
-            WritePaper("SELL",c,p.Qty,price,reason);
-            paper.Remove(c);
-            Log("가상자동매도 (실제 주문 아님) "+c+" "+reason+" "+price.ToString("N0"));
-        }
-        void RecalculatePaperCash(){
-            availablePaper=paperCash.Value;
-            if(!File.Exists(journal))return;
-            foreach(var line in File.ReadAllLines(journal,Encoding.UTF8).Skip(1)){
-                var v=line.Split(',');if(v.Length<6)continue;
-                int qty;decimal price;
-                if(!int.TryParse(v[3],out qty)||!decimal.TryParse(v[4],NumberStyles.Any,CultureInfo.InvariantCulture,out price))continue;
-                if(v[1]=="BUY")availablePaper-=qty*price*1.003m;
-                else if(v[1]=="SELL")availablePaper+=qty*price*0.997m;
+        public void Halt() { scanning = false; trading = false; requestedScan = false; scans.Clear(); buyQuotes.Clear(); requestedBuy = null; state.Text = "자동 처리 중단 / 실주문 잠금"; }
+        void Schedule() {
+            if (!trading || api == null || !api.Connected || api.Busy) return; RequireEngine();
+            var due = engine.Snapshot.Positions.Where(p => !quoteDue.ContainsKey(p.Code) || quoteDue[p.Code] <= DateTime.UtcNow)
+                .OrderBy(p => quoteDue.ContainsKey(p.Code) ? quoteDue[p.Code] : DateTime.MinValue).FirstOrDefault();
+            bool researchWaiting = buyQuotes.Count > 0 || (scanning && scans.Count > 0);
+            if (due != null && (holdingRequests < 3 || !researchWaiting)) {
+                holdingRequests = Math.Min(3, holdingRequests + 1);
+                quoteDue[due.Code] = DateTime.UtcNow.AddSeconds(15); requestedBuy = null; api.Quote(due.Code); return;
             }
-            availablePaper=Math.Max(0,availablePaper);
-            Log("가상현금 보유분/거래기록 반영: "+availablePaper.ToString("N0")+"원 (실계좌 무관)");
+            holdingRequests = 0;
+            if (buyQuotes.Count > 0) { requestedBuy = buyQuotes.Dequeue(); api.Quote(requestedBuy.Code); return; }
+            if (scanning && scans.Count > 0) { requestedScan = true; api.Bars(scans.Dequeue().Code, BarCount()); return; }
+            if (scanning) { scanning = false; state.Text = "스캔 완료 / 모의 보유 감시 계속"; Log("스캔 완료. 보유종목 매도 감시는 계속합니다."); }
         }
-        void PaperRestore(){
-            if(!File.Exists(journal))return;
-            try{
-                foreach(var line in File.ReadAllLines(journal,Encoding.UTF8).Skip(1)){
-                    var v=line.Split(',');
-                    if(v.Length<6)continue;
-                    var c=v[2];int qty;decimal price;
-                    if(!int.TryParse(v[3],out qty) || !decimal.TryParse(v[4],NumberStyles.Any,CultureInfo.InvariantCulture,out price))continue;
-                    if(v[1]=="BUY")paper[c]=new PaperPosition{Code=c,Name=c,Qty=qty,Entry=price,High=price};
-                    else if(v[1]=="SELL")paper.Remove(c);
+        void Reply(IndiReply r) {
+            if (r.Kind == "STOCKS") { symbols.Clear(); symbols.AddRange(r.Stocks); state.Text = "종목 응답 " + r.Count + "건 / 일반주식 " + symbols.Count + "개"; }
+            else if (r.Kind == "HOLDINGS") { holdingsGrid.Rows.Clear(); foreach (var h in r.Holdings) holdingsGrid.Rows.Add(h.Code, h.Name, h.Quantity, h.SellPending, h.BuyPending, h.AvgPrice, h.Price); state.Text = "실제 잔고 응답 " + r.Holdings.Count + "건 (모의 원장과 별도)"; }
+            else if (r.Kind == "BARS") {
+                bool fromScan = requestedScan; requestedScan = false;
+                var s = symbols.FirstOrDefault(x => x.Code == r.Code);
+                var c = Rules.Entry(r.Code, s == null ? r.Code : s.Name, r.Bars, engine == null ? new StrategySettings() : engine.Settings); scanned++;
+                if (c != null) { candidatesGrid.Rows.Add(c.Code, c.Name, c.Price, c.Score, c.Reason); if (fromScan && trading && scanning) buyQuotes.Enqueue(c); }
+                state.Text = "일봉 분석 " + scanned + " / 대기 " + scans.Count + " / 후보 " + candidatesGrid.Rows.Count;
+            } else if (r.Kind == "QUOTE") {
+                var intent = requestedBuy; requestedBuy = null; Log("현재가 " + r.Code + " " + r.Price.ToString("N0") + " 시각=" + r.Clock);
+                if (!trading || engine == null || !Rules.ValidTime(MarketTime.NowKorea) || !MarketTime.IsFreshQuote(r.Clock, DateTime.UtcNow) || r.Price <= 0) return;
+                var p = engine.Snapshot.Positions.FirstOrDefault(x => x.Code == r.Code);
+                if (p != null) {
+                    var reason = engine.UpdateQuote(r.Code, r.Price);
+                    if (!string.IsNullOrEmpty(reason)) { var o = engine.SubmitSell(r.Code, p.Qty, r.Price, "exit-" + Guid.NewGuid().ToString("N"), DateTime.UtcNow); engine.ApplyFill(o.Id, o.Id + "-paper", p.Qty, r.Price, DateTime.UtcNow); Log("모의매도 " + r.Code + " " + reason); }
+                } else if (intent != null && intent.Code == r.Code && engine.Snapshot.Positions.Count < engine.Settings.MaxPositions) {
+                    if (intent.SignalDate != MarketTime.NowKorea.ToString("yyyyMMdd", CultureInfo.InvariantCulture)) { Log("모의매수 제외: 당일 일봉 신호가 아닙니다"); return; }
+                    if (r.Price < engine.Settings.MinPrice || r.Price > engine.Settings.MaxPrice) { Log("모의매수 제외: 설정 가격 범위 밖의 현재가"); return; }
+                    if (r.Price > intent.Price * 1.03m || r.Price < intent.Price * 0.97m) { Log("모의매수 제외: 신호 기준가 대비 3% 초과 변동"); return; }
+                    string key = "entry-" + MarketTime.NowKorea.ToString("yyyyMMdd") + "-" + r.Code;
+                    if (engine.Snapshot.Orders.Any(o => o.ClientKey == key)) return;
+                    int qty = Rules.PaperQty(engine.AvailableCash, r.Price, engine.Settings.AllocationFraction, engine.Settings.FeeRate);
+                    if (qty > 0) { var o = engine.SubmitBuy(r.Code, intent.Name, qty, r.Price, key, DateTime.UtcNow); engine.ApplyFill(o.Id, o.Id + "-paper", qty, r.Price, DateTime.UtcNow); Log("모의매수 " + r.Code + " " + qty + "주 (실제 체결 아님)"); }
                 }
-                if(paper.Count>0)Log("이전 가상보유 "+paper.Count+"종목 복원. 실제 잔고와 무관합니다.");
-            }catch(Exception e){Log("가상기록 복원 오류 "+e.Message);}
+                RefreshPaper();
+            }
         }
-        void WritePaper(string side,string c,int qty,decimal price,string reason){
-            if(!File.Exists(journal))File.WriteAllText(journal,"time,side,code,qty,price,reason"+Environment.NewLine,Encoding.UTF8);
-            var safeReason=(reason??"").Replace(","," ").Replace("\n"," ");
-            File.AppendAllText(journal,string.Join(",",DateTime.Now.ToString("s"),side,c,qty,
-                price.ToString(CultureInfo.InvariantCulture),safeReason)+Environment.NewLine,Encoding.UTF8);
+        void RefreshPaper() {
+            if (engine == null) return; var snapshot = engine.Snapshot; paperGrid.Rows.Clear(); ordersGrid.Rows.Clear();
+            foreach (var p in snapshot.Positions) paperGrid.Rows.Add(p.Code, p.Name, p.Qty, p.Entry, p.High);
+            foreach (var o in snapshot.Orders) ordersGrid.Rows.Add(o.Id, o.Side, o.Code, o.Quantity, o.FilledQuantity, o.LimitPrice, o.ReservedCash, o.Status);
+            portfolio.Text = "모의 가용현금 " + engine.AvailableCash.ToString("N0") + "원 / 보유 " + snapshot.Positions.Count + "개 / 실제 주문 0건";
+        }
+        int BarCount() { var s = engine == null ? new StrategySettings() : engine.Settings; return Math.Max(45, Math.Max(s.SlowPeriod, s.BreakoutPeriod) + 2); }
+        static bool IsRatio(string key) { return key == "AllocationFraction" || key == "FeeRate"; }
+        void LoadSettings() {
+            var settings = engine.Settings;
+            foreach (var pair in options) { var field = typeof(StrategySettings).GetField(pair.Key); decimal v = Convert.ToDecimal(field.GetValue(settings), CultureInfo.InvariantCulture); if (IsRatio(pair.Key)) v *= 100; pair.Value.Value = Math.Min(pair.Value.Maximum, Math.Max(pair.Value.Minimum, v)); }
+            capital.Value = Math.Min(capital.Maximum, Math.Max(capital.Minimum, engine.Snapshot.Capital));
+        }
+        void SaveSettings() {
+            RequireEngine(); Halt(); var settings = engine.Settings;
+            foreach (var pair in options) { var field = typeof(StrategySettings).GetField(pair.Key); decimal v = pair.Value.Value; if (IsRatio(pair.Key)) v /= 100; field.SetValue(settings, Convert.ChangeType(v, field.FieldType, CultureInfo.InvariantCulture)); }
+            settings.Validate(); engine.SetCapital(capital.Value); engine.UpdateSettings(settings); RefreshPaper(); Log("설정·원금 저장 완료. 시작 버튼으로 자동 처리를 재개하십시오.");
         }
     }
 }

@@ -1,19 +1,45 @@
-Shinhan AutoTrader v0.3 test report
-Date: 2026-11-10
+검증 기록 — 2026-11-12 UTC
 
-Broker-independent tests: 14/14 PASSED (unittest)
-- Stock universe analysis: synthetic bar signal
-- No lookahead/current partial bar
-- Real-time quote freshness, regular session
-- Stock price breakout buy trigger
-- Stop, take profit, trailing stop
-- Cash unavailable => no buy
-- Max positions limit
-- Crash-safety: persisted unknown order blocks duplicate
-- Journal replay: confirmed fill survives relaunch
-- Full-sale holdings=0 reconciliation
-- Full paper buy/sell cycle from candidate through journal relaunch
+기준: na999jason-sketch/shinhan-autotrader main e0dc0ad
+변경: codex/indi-safe-autotrader
 
-NOT TESTED: real Shinhan trading account; live order send, fill confirmation,
-market holiday handling; actual Windows 32-bit PyQt5/ActiveX setup; GitHub
-Actions EXE build; real cash purchasing power API; realized P/L.
+원인과 수정
+- COM outgoing IID/DISPID/인자형을 고정값 대신 설치 typelib에서 확인한다.
+  동일 UI STA에서 AxHost와 이벤트 delegate 수명을 유지하며 재연결 시 재생성한다.
+  실제 설치 OCX에서 고정값이 문제 원인이었는지는 실서버 미검증이다.
+- RequestData 반환 전 ReceiveData 재진입을 처리하고 콜백 중 버퍼를 복사한다.
+  요청번호 대조·중복·불일치·타임아웃·파싱 오류를 독립 상태기계로 검증한다.
+- 일봉 신호 가격으로 즉시 가상매수하지 않고 당일 신호+별도 최신 현재가를 요구한다.
+- 스캔 완료 후 보유 감시를 유지한다. 보유는 가장 오래 대기한 종목부터 조회하고
+  스캔/후보 조회에도 주기적으로 순서를 배정한다. 수신 오류 시 자동 처리를 중단한다.
+- 가상현금 CSV 대신 원자적 XML 상태에 주문/체결/예약금/고점을 저장한다.
+  재시작 미체결은 불명 상태로 차단하며 명시적 모의 취소만 허용한다.
+- C# read-only COM allowlist 및 영구 LiveOrderPolicy, Python order/request guard로
+  기존 UI 밖 직접 발주도 차단한다. 주문 필드는 추측해서 추가하지 않는다.
+
+로컬 자동 검증
+- Debian Mono 6.12 mcs, C# 7.2: 모든 C# 소스 /warnaserror /platform:x86 컴파일 성공.
+  Windows targeting pack을 이용한 정식 .NET4.8 빌드의 대체 결과는 아니다.
+- C# 118 assertions 통과: 기존 전략 11 + 수신/파서 38 + 모의 엔진/전략 69.
+- Python unittest 17 tests 통과: 기존 엔진/전체 사이클 14 + 실주문 잠금 3.
+- PE 검증: I386 PE32 + CLR 32BITREQUIRED 확인.
+- 로컬 Mono 실행 pointerBytes=8: Linux 런타임은 x86 프로세스 실행 증거가 아니다.
+- git diff --check 통과.
+
+GitHub Actions
+- Windows 2022: .NET Framework4.8 MSBuild /platform:x86 /warnaserror,
+  EXE PE32/32BITREQUIRED 검증, C# --selftest, Python regression을 설정했다.
+- 실행 결과 및 링크는 PR/최종 작업 보고에서 실제 Actions 결과를 기준으로 기록한다.
+- validation-reports 아티팩트에 빌드 로그와 테스트 보고서가 저장된다.
+- 성공한 실행만 ShinhanNativeTrader-Win32 EXE 아티팩트를 업로드한다.
+
+실제 Windows Indi 서버에서 미검증/미완료
+- 설치 OCX 버전/typelib, native Advise/ReceiveData 전달, 실제 요청 및 재연결.
+- stock_mst/SC/TR_SCHART/SABA200QB 현재 필드 정의와 HTS 대조.
+- 현재 공식 현물 신규/정정/취소 주문, 체결/미체결, 주문가능금액 TR 명세.
+- 실제 AA/AB 체결, AD/AE 잔고 이벤트, 부분/중복/역순/누락, 서버 상태 대사.
+- 실제 접수/체결/취소확정/정정/장애 후 복구 및 외부 수동거래 감지.
+- 휴장일 달력·시세 날짜 증명(HHMMSS만 수신)·호가/유동성·전략 수익성.
+
+실제 주문: 비활성화. 실제 계좌/암호/Indi 서버/금전 주문을 사용한 검증 없음.
+상세 공식 자료 확인 경계: docs/INDI_API_VERIFICATION.md
