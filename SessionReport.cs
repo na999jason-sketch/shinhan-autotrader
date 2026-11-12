@@ -60,8 +60,9 @@ namespace ShinhanNativeTrader {
             return Enum.IsDefined(typeof(T),value)?value.ToString():Unknown;
         }
         static string GateStatus(string requested) {
-            // The UI passes the compiled gate message, never arbitrary provider
-            // text. Refuse other strings instead of risking credential echo.
+            // Accept only finite UI-owned states, never arbitrary provider text
+            // or a detailed error that could accidentally contain credentials.
+            if(requested=="실주문 운영 시작됨"||requested=="실주문 미시작")return requested;
             return string.Equals(requested,LiveOrderSafety.BlockReason,StringComparison.Ordinal)
                 ?LiveOrderSafety.BlockReason:"실주문 상태 미확인";
         }
@@ -69,7 +70,7 @@ namespace ShinhanNativeTrader {
         public static string Write(string directory,DateTime koreaDate,DateTime writtenUtc,
             IEnumerable<Holding> holdings,DateTime? holdingsReceivedUtc,AccountCashSnapshot cash,
             BrokerOrdersSnapshot orders,IEnumerable<LiveOrderRecord> journalOrders,string orderGateStatus,
-            IDictionary<string,DateTime> priceReceivedUtc=null) {
+            IDictionary<string,DateTime> priceReceivedUtc=null,BrokerHoldingsSnapshot tradeHoldings=null) {
             if(string.IsNullOrWhiteSpace(directory))throw new ArgumentException("A report directory is required.");
             if(koreaDate.Kind!=DateTimeKind.Unspecified||koreaDate.TimeOfDay!=TimeSpan.Zero)
                 throw new ArgumentException("An unspecified KST calendar date is required.");
@@ -77,6 +78,13 @@ namespace ShinhanNativeTrader {
             if(holdingsReceivedUtc.HasValue)RequireUtc(holdingsReceivedUtc.Value);
             if(cash!=null)RequireUtc(cash.ReceivedUtc);
             if(orders!=null)RequireUtc(orders.ReceivedUtc);
+            DateTime? tradeRequestUtc=null;
+            if(tradeHoldings!=null) {
+                RequireUtc(tradeHoldings.ReceivedUtc);
+                if(tradeHoldings.RequestStartedUtc!=default(DateTime)) {
+                    RequireUtc(tradeHoldings.RequestStartedUtc);tradeRequestUtc=tradeHoldings.RequestStartedUtc;
+                }
+            }
 
             // Materialize and validate before opening any output file. A failed
             // valuation must leave the preceding complete report untouched.
@@ -85,20 +93,30 @@ namespace ShinhanNativeTrader {
             var evidence=journalOrders==null?null:journalOrders.ToList();
             bool holdingsKnown=values!=null&&holdingsReceivedUtc.HasValue;
             var total=holdingsKnown?AccountValuation.From(positions):null;
+            // A journal fill price or sale proceeds do not establish realized
+            // profit. Use only the broker field for the report's validated day.
+            decimal? realized=tradeHoldings!=null&&tradeHoldings.RealizedProfit.HasValue&&tradeHoldings.BrokerDateValidated
+                &&string.Equals(tradeHoldings.BrokerDate,koreaDate.ToString("yyyyMMdd",CultureInfo.InvariantCulture),StringComparison.Ordinal)
+                ?tradeHoldings.RealizedProfit:null;
             var report=new StringBuilder();
             Row(report,"실계좌 운영 보고서",koreaDate.ToString("yyyy-MM-dd",CultureInfo.InvariantCulture));
             Row(report,"보고서 생성시각",Stamp(writtenUtc));
             Row(report,"잔고 응답시각",Stamp(holdingsReceivedUtc));
             Row(report,"예수금 응답시각",cash==null?Unknown:Stamp(cash.ReceivedUtc));
             Row(report,"주문 조회 응답시각",orders==null?Unknown:Stamp(orders.ReceivedUtc));
+            Row(report,"실현손익 조회 요청시각",Stamp(tradeRequestUtc));
+            Row(report,"실현손익 조회 응답시각",tradeHoldings==null?Unknown:Stamp(tradeHoldings.ReceivedUtc));
+            Row(report,"실현손익 기준일(증권사)",tradeHoldings!=null&&tradeHoldings.BrokerDateValidated?TradingDate(tradeHoldings.BrokerDate):Unknown);
             Row(report,"실주문 상태",GateStatus(orderGateStatus));
             Row(report,"평가 기준","평가손익·수익률은 수수료·세금 제외. 실현손익을 추정하지 않음.");
+            Row(report,"실현손익 기준","증권사 응답값을 기록하며 날짜 미검증·불일치는 미확인으로 표시.");
             Row(report,"잔고 조회상태",holdingsKnown?"응답 수신":Unknown);
             Row(report,"보유 종목 수",holdingsKnown?(object)values.Count:null);
             Row(report,"총 매입금액",total==null?null:(object)total.CostBasis);
             Row(report,"총 평가금액",total==null?null:(object)total.MarketValue);
             Row(report,"평가손익(비용제외)",total==null?null:(object)total.UnrealizedProfit);
             Row(report,"평가수익률(%)",total==null?null:(object)total.ReturnPercent);
+            Row(report,"실현손익(증권사 조회)",realized);
             Row(report,"예수금",cash==null?null:(object)cash.DepositCash);
             Row(report,"주문가능현금",cash==null?null:(object)cash.CashOrderable);
             Row(report,"현금100% 주문가능금액",cash==null?null:(object)cash.Cash100Orderable);

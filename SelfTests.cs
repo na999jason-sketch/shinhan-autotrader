@@ -29,7 +29,8 @@ namespace ShinhanNativeTrader {
             Check(!typeof(SelfTests).Assembly.GetTypes().Any(type=>type.Name=="PaperTradingEngine"||type.Name=="PaperTradingState"),"actual account EXE excludes the archived simulation engine");
             return 12 + IndiTests.Run() + IndiDiagnosticTests.Run() + IndiInstallationTests.Run()
                 + AccountQueriesTests.Run() + UnattendedSessionTests.Run() + LiveOrdersTests.Run() + SessionReportTests.Run()
-                + AccountAppSettingsTests.Run();
+                + AccountAppSettingsTests.Run() + RealtimeIndiTests.Run() + CashMarketRulesTests.Run()
+                + BrokerReadinessTests.Run() + BrokerAccountEventRouterTests.Run();
         }
     }
 }

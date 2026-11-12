@@ -35,6 +35,16 @@ namespace ShinhanNativeTrader {
             // Keep the exact adapted delegate so Remove detaches what Combine actually advised.
             subscriptions.Add(new Subscription { DispId = dispId, Handler = handler });
         }
+        public void AddVariantCallback(int dispId, VarEnum argumentType, Action<object> callback) {
+            if(disposed) throw new ObjectDisposedException("ComEventSubscriptions");
+            if(callback==null) throw new ArgumentNullException("callback");
+            // ReceiveRTData is VTS_VARIANT in the official OCX. A contained BSTR
+            // is still passed through the VARIANT ABI, not a BSTR-only delegate.
+            if(argumentType!=VarEnum.VT_VARIANT)throw new ArgumentException("A scalar VT_VARIANT callback is required.","argumentType");
+            Delegate handler=new Action<object>(callback);
+            ComEventsHelper.Combine(source,outgoingInterface,dispId,handler);
+            subscriptions.Add(new Subscription{DispId=dispId,Handler=handler});
+        }
         public void Dispose() {
             if(disposed) return;
             disposed = true;

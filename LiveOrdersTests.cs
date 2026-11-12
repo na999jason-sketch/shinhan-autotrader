@@ -9,7 +9,19 @@ namespace ShinhanNativeTrader {
         sealed class FakeWire : ILiveOrderWire {
             public event Action<LiveOrderAcknowledgement> Acknowledged;
             public int Sends;public bool Disposed;
-            public int Send(LiveOrderIntent intent,LiveAccountCredentials credentials,LiveOrderPreflight checks,DateTime utc){Sends++;return 7;}
+            public int ReturnId=7;public bool ThrowOnSend;
+            public Action BeforeSend,DuringSend;
+            public int Send(LiveOrderIntent intent,LiveAccountCredentials credentials,LiveOrderPreflight checks,DateTime utc){
+                bool entered=false;
+                try {
+                    LiveOrderSafety.EnsureAllowed(checks,credentials,utc);
+                    LiveOrderSafety.ValidatePreflight(intent,checks,utc,DateTime.SpecifyKind(DateTime.MinValue,DateTimeKind.Utc));
+                    if(BeforeSend!=null)BeforeSend();
+                    LiveOrderSafety.EnsureAllowed(checks,credentials,utc);
+                    LiveOrderSafety.ValidatePreflight(intent,checks,utc,DateTime.SpecifyKind(DateTime.MinValue,DateTimeKind.Utc));
+                    entered=true;Sends++;if(DuringSend!=null)DuringSend();if(ThrowOnSend)throw new InvalidOperationException("account-password-SECRET");return ReturnId;
+                }catch{if(!entered)throw new LiveOrderNotSentException();throw new InvalidOperationException("unknown transport response");}
+            }
             public void Emit(LiveOrderAcknowledgement value){if(Acknowledged!=null)Acknowledged(value);}
             public void Dispose(){Disposed=true;}
         }
@@ -19,7 +31,10 @@ namespace ShinhanNativeTrader {
         static DateTime Utc(int seconds=0){return new DateTime(2026,11,12,1,0,0,DateTimeKind.Utc).AddSeconds(seconds);}
         static LiveOrderIntent Buy(string key="buy-a",string code="005930",int quantity=10,decimal price=10000){return new LiveOrderIntent{Kind=LiveOrderKind.Buy,ClientKey=key,Code=code,Quantity=quantity,LimitPrice=price};}
         static LiveOrderIntent Modify(LiveOrderKind kind,string key,string original,int qty=10,decimal price=10000){return new LiveOrderIntent{Kind=kind,ClientKey=key,Code="005930",OriginalBrokerOrderNumber=original,Quantity=qty,LimitPrice=price};}
-        static LiveOrderPreflight Ready(DateTime utc){return new LiveOrderPreflight{AccountAuthorized=true,OrderableAmountVerified=true,SellableQuantityVerified=true,OrdersReconciled=true,FillsReconciled=true,RecoveryVerified=true,PriceRuleVerified=true,QuoteVerified=true,Cash100Orderable=1000000,CapacityAmount=1000000,OperatingLimit=1000000,CapacityQuantity=100,SellableQuantity=100,SnapshotUtc=utc,QuoteUtc=utc};}
+        static LiveOrderPreflight Ready(DateTime utc){return new LiveOrderPreflight{EvidenceStillCurrent=()=>true,AccountAuthorized=true,OrderableAmountVerified=true,SellableQuantityVerified=true,OrdersReconciled=true,FillsReconciled=true,RecoveryVerified=true,PriceRuleVerified=true,QuoteVerified=true,Cash100Orderable=1000000,CapacityAmount=1000000,OperatingLimit=1000000,CapacityQuantity=100,SellableQuantity=100,SnapshotUtc=utc,QuoteUtc=utc};}
+        static LiveOrderPreflight Authorized(DateTime utc,LiveAccountCredentials credentials) {
+            var ready=Ready(utc);ready.Authorization=new LiveTradingSession();ready.Authorization.Authorize(credentials.Account,utc);return ready;
+        }
         static LiveOrderRecord Accepted(LiveOrderJournal journal,LiveOrderIntent intent,string number,DateTime utc,int rid=7) {
             var order=journal.Prepare(intent,utc);journal.MarkDispatching(order.Id,utc);journal.MarkRequestAccepted(order.Id,rid,utc);journal.RecordAcknowledgement(order.Id,rid,number,false,utc);return journal.Snapshot.Orders.Single(o=>o.Id==order.Id);
         }
@@ -46,9 +61,10 @@ namespace ShinhanNativeTrader {
                 Reject(()=>new LiveAccountCredentials("123-456","SECRET"),"malformed account is rejected without exposing its value");
                 Check(!LiveOrderProtocol.ValidBrokerNumber("0")&&!LiveOrderProtocol.ValidBrokerNumber("000000")&&!LiveOrderProtocol.ValidBrokerNumber("")&&!LiveOrderProtocol.ValidBrokerNumber("A123"),"blank, zero and nonnumeric acknowledgements are not accepted order identifiers");
                 Check(LiveOrderProtocol.ValidBrokerNumber("00000123"),"positive broker identifier remains a string");
+                Check(LiveOrderProtocol.BrokerNumberKey("00000123")=="123"&&LiveOrderProtocol.BrokerNumberKey("0000")==null&&LiveOrderProtocol.BrokerNumbersEqual("123","000123"),"numeric broker identity ignores padding while invalid zero identifiers remain invalid");
 
                 intent=Buy();var ready=Ready(Utc());
-                LiveOrderSafety.ValidatePreflight(intent,ready,Utc(),Utc(-1));Check(true,"fresh authoritative preflight values validate independently of the closed production gate");
+                LiveOrderSafety.ValidatePreflight(intent,ready,Utc(),Utc(-1));Check(true,"fresh authoritative preflight values validate independently of account authorization");
                 ready.Cash100Orderable=1;Reject(()=>LiveOrderSafety.ValidatePreflight(intent,ready,Utc(),Utc(-1)),"insufficient actual cash100 orderable amount blocks buy");
                 ready=Ready(Utc());ready.CapacityQuantity=9;Reject(()=>LiveOrderSafety.ValidatePreflight(intent,ready,Utc(),Utc(-1)),"broker orderable quantity blocks oversized buy");
                 ready=Ready(Utc());ready.OperatingLimit=99999;Reject(()=>LiveOrderSafety.ValidatePreflight(intent,ready,Utc(),Utc(-1)),"configured operating limit does not substitute for actual cash");
@@ -62,6 +78,11 @@ namespace ShinhanNativeTrader {
                 ready=Ready(Utc());ready.QuoteUtc=Utc(1);Reject(()=>LiveOrderSafety.ValidatePreflight(intent,ready,Utc(),Utc(-1)),"future quote timestamp is rejected");
                 ready=Ready(Utc());ready.QuoteVerified=false;Reject(()=>LiveOrderSafety.ValidatePreflight(intent,ready,Utc(),Utc(-1)),"price-only snapshots cannot be used for order submission");
                 ready=Ready(Utc());ready.FillsReconciled=false;Reject(()=>LiveOrderSafety.ValidatePreflight(intent,ready,Utc(),Utc(-1)),"order aggregates without execution identifiers do not establish fill reconciliation");
+                ready=Ready(Utc());ready.EvidenceStillCurrent=null;Reject(()=>LiveOrderSafety.ValidatePreflight(intent,ready,Utc(),Utc(-1)),"orders require a live evidence epoch callback rather than detached booleans");
+                ready=Ready(Utc());ready.EvidenceStillCurrent=()=>false;Reject(()=>LiveOrderSafety.ValidatePreflight(intent,ready,Utc(),Utc(-1)),"an invalidated account-evidence epoch blocks dispatch");
+                ready=Ready(Utc());ready.EvidenceStillCurrent=()=>{throw new InvalidOperationException("PRIVATE-DATA");};
+                string callbackError="";try{LiveOrderSafety.ValidatePreflight(intent,ready,Utc(),Utc(-1));}catch(Exception error){callbackError=error.Message;}
+                Check(callbackError!=""&&!callbackError.Contains("PRIVATE-DATA"),"failed evidence callbacks fail closed without leaking provider/runtime text");
                 intent.Kind=LiveOrderKind.Sell;ready=Ready(Utc());ready.SellableQuantity=9;Reject(()=>LiveOrderSafety.ValidatePreflight(intent,ready,Utc(),Utc(-1)),"sellable stock quantity is checked separately from holdings");
                 intent=Modify(LiveOrderKind.Amend,"amend-check","00000123");ready=Ready(Utc());
                 Reject(()=>LiveOrderSafety.ValidatePreflight(intent,ready,Utc(),Utc(-1)),"amendment cannot bypass the original-side verification");
@@ -69,8 +90,26 @@ namespace ShinhanNativeTrader {
                 Reject(()=>LiveOrderSafety.ValidatePreflight(intent,ready,Utc(),Utc(-1)),"buy-side amendment still checks fresh orderable cash");
                 ready=Ready(Utc());ready.OriginalOrderVerified=true;ready.OriginalTradeKind=LiveOrderKind.Sell;ready.SellableQuantity=1;
                 Reject(()=>LiveOrderSafety.ValidatePreflight(intent,ready,Utc(),Utc(-1)),"sell-side amendment still checks sellable quantity");
-                Check(!LiveOrderSafety.ProductionContractVerified,"production integration cannot be enabled with a config/UI flag");
-                Reject(LiveOrderSafety.EnsureAllowed,"unverified actual-money transport is locked by default");
+                var authorization=new LiveTradingSession();
+                Check(!authorization.Active&&!authorization.MatchesAccount(credentials.Account),"each process starts without account trading authorization");
+                Reject(()=>LiveOrderSafety.EnsureAllowed(Ready(Utc()),credentials,Utc()),"missing explicit account authorization blocks order dispatch");
+                authorization.Authorize(credentials.Account,Utc());
+                Check(authorization.Active&&authorization.MatchesAccount(credentials.Account)&&!authorization.MatchesAccount("10987654321"),"explicit authorization is bound to one account");
+                ready=Ready(Utc());ready.Authorization=authorization;LiveOrderSafety.EnsureAllowed(ready,credentials,Utc());Check(true,"authorized account can pass the authorization gate without falsely changing broker evidence");
+                ready.OrdersReconciled=false;Reject(()=>LiveOrderSafety.ValidatePreflight(Buy(),ready,Utc(),Utc(-1)),"authorization cannot replace missing broker reconciliation");
+                authorization.Revoke();Check(!authorization.Active&&!authorization.MatchesAccount(credentials.Account),"stop revokes memory-only authorization");
+                Reject(()=>LiveOrderSafety.EnsureAllowed(ready,credentials,Utc()),"revoked authorization cannot be reused by cached preflight");
+                authorization.Authorize(credentials.Account,Utc(10));
+                Reject(()=>LiveOrderSafety.EnsureAllowed(ready,credentials,Utc()),"future-dated approval does not authorize an earlier dispatch");
+                Reject(()=>authorization.Authorize(credentials.Account,DateTime.SpecifyKind(Utc(),DateTimeKind.Unspecified)),"authorization requires an explicit UTC timestamp");
+                authorization.Authorize(credentials.Account,Utc());ready=Ready(Utc());ready.Authorization=authorization;
+                Reject(()=>LiveOrderSafety.EnsureAllowed(ready,credentials,Utc().AddDays(1)),"missed UI close or overnight suspend cannot carry authorization into a second trading day");
+                var evening=new DateTime(2026,11,12,11,0,0,DateTimeKind.Utc);authorization.Authorize(credentials.Account,evening);
+                Check(authorization.TradingDateKorea==new DateTime(2026,11,13)&&authorization.ValidUntilUtc==new DateTime(2026,11,13,6,20,0,DateTimeKind.Utc),"evening approval targets the next weekday session for unattended operation");
+                Reject(()=>LiveOrderSafety.EnsureAllowed(ready,credentials,evening),"next-day approval cannot submit on the preceding evening");
+                LiveOrderSafety.EnsureAllowed(ready,credentials,new DateTime(2026,11,13,0,0,0,DateTimeKind.Utc));Check(true,"an explicit evening approval is valid during its intended next session");
+                Reject(()=>LiveOrderSafety.EnsureAllowed(ready,credentials,new DateTime(2026,11,13,6,20,0,DateTimeKind.Utc)),"authorization expires at the exact session cutoff independently of UI timers");
+                authorization.Authorize(credentials.Account,new DateTime(2026,11,13,11,0,0,DateTimeKind.Utc));Check(authorization.TradingDateKorea==new DateTime(2026,11,16),"Friday evening approval skips weekend sessions without pretending to know exchange holidays");
                 Reject(()=>new ComLiveOrderWire(new object()),"COM order wire requires an actual hosted native control");
 
                 string path=Path.Combine(directory,"actual-orders.xml");string firstId;
@@ -78,8 +117,8 @@ namespace ShinhanNativeTrader {
                     journal.BindAccount(credentials.Account);
                     Reject(()=>journal.BindAccount("10987654321"),"journal cannot be silently reused for another actual account");
                     using(var wire=new FakeWire())using(var gateway=new LiveOrderGateway(journal,wire)) {
-                        Reject(()=>gateway.Submit(Buy(),credentials,Ready(Utc()),Utc()),"actual-order gateway checks the production gate before preparing/sending");
-                        Check(wire.Sends==0&&journal.Snapshot.Orders.Count==0,"closed production gate cannot create fake orders or contact a transport");
+                        Reject(()=>gateway.Submit(Buy(),credentials,Ready(Utc()),Utc()),"actual-order gateway requires explicit account authorization before preparing/sending");
+                        Check(wire.Sends==0&&journal.Snapshot.Orders.Count==0,"missing authorization cannot create an order or contact a transport");
                         wire.Emit(new LiveOrderAcknowledgement{RequestId=7,BrokerOrderNumber="123"});Check(journal.Snapshot.Orders.Count==0,"unsolicited ack does not create a broker order");
                         gateway.Timeout(Utc());Check(!gateway.Busy,"idle timeout has no order side effects");
                     }
@@ -158,6 +197,173 @@ namespace ShinhanNativeTrader {
                     var next=Utc().AddDays(1);Accepted(journal,Buy("day2"),"001",next,7);journal.RecordExecution("001","F1",10,10000,next.AddSeconds(1));
                     Check(journal.Snapshot.Orders.Count==2&&journal.Snapshot.Executions.Count==2,"daily broker order and execution identifiers can be reused without cross-day attachment");
                     Check(journal.Snapshot.Executions.Select(f=>f.TradingDate).Distinct().Count()==2,"execution identity carries the originating trading date");
+                    journal.MarkBrokerEvidenceUnknown(journal.Snapshot.Orders[1].Id,next.AddSeconds(2));
+                    Check(journal.RecoveryRequired&&journal.Snapshot.Orders[1].Status==LiveOrderStatus.Unknown,"contradictory broker evidence can reopen a terminal order as unknown for recovery");
+                }
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"canonical-identity.xml"))) {
+                    var original=Accepted(journal,Buy(),"0000123",Utc());
+                    Check(journal.RecordExecution("123","00001",1,9900,Utc(1))&&journal.Snapshot.Executions[0].BrokerOrderNumber=="0000123","execution lookup accepts broker padding differences while preserving captured raw order and execution IDs");
+                    var duplicate=journal.Prepare(Buy("alias-other-stock","000660"),Utc(2));journal.MarkDispatching(duplicate.Id,Utc(2));journal.MarkRequestAccepted(duplicate.Id,8,Utc(2));
+                    Reject(()=>journal.RecordAcknowledgement(duplicate.Id,8,"123",false,Utc(2)),"same-day canonical broker duplicate cannot attach another stock's order");
+                    journal.MarkUnknown(duplicate.Id,Utc(3));
+                    Check(journal.Snapshot.Orders.Single(o=>o.Id==original.Id).BrokerOrderNumber=="0000123","canonical comparison never rewrites the original raw broker identifier");
+                }
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"authorized-reentrant.xml")))using(var wire=new FakeWire()) {
+                    var now=Utc();var preflight=Authorized(now,credentials);int notifications=0;
+                    using(var gateway=new LiveOrderGateway(journal,wire,()=>now)) {
+                        gateway.OrderChanged+=order=>{notifications++;Check(!gateway.Busy&&order.BrokerOrderNumber=="0000701","ack event publishes known broker identity after clearing in-flight state");journal.RecordExecution(order.BrokerOrderNumber,"BUFFERED-AA-F1",3,9900,now);};
+                        wire.DuringSend=()=>wire.Emit(new LiveOrderAcknowledgement{RequestId=7,BrokerOrderNumber="0000701"});
+                        Check(wire.Sends==0&&journal.Snapshot.Orders.Count==0,"authorizing a session alone never submits an order");
+                        var sent=gateway.Submit(Buy(),credentials,preflight,now);
+                        Check(wire.Sends==1&&notifications==1&&sent.Status==LiveOrderStatus.PartiallyFilled&&sent.FilledQuantity==3,"authorized fake transport exercises reentrant ack and buffered unique execution without generating a synthetic fill");
+                        Reject(()=>gateway.Submit(Buy(),credentials,preflight,now),"duplicate authorized client key is blocked before a second wire call");
+                        Check(wire.Sends==1,"duplicate request cannot produce a second transport side effect");
+                    }
+                }
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"authorized-async.xml")))using(var wire=new FakeWire()) {
+                    var now=Utc();var preflight=Authorized(now,credentials);int notifications=0;
+                    using(var gateway=new LiveOrderGateway(journal,wire,()=>now)) {
+                        gateway.OrderChanged+=order=>notifications++;
+                        var sent=gateway.Submit(Buy(),credentials,preflight,now);
+                        Check(gateway.Busy&&sent.Status==LiveOrderStatus.AwaitingAcknowledgement&&sent.FilledQuantity==0,"authorized send remains pending without treating request acceptance as fill");
+                        wire.Emit(new LiveOrderAcknowledgement{RequestId=99,BrokerOrderNumber="0000801"});
+                        Check(gateway.Busy&&notifications==0,"unrelated asynchronous request ID is ignored");
+                        now=Utc(1);wire.Emit(new LiveOrderAcknowledgement{RequestId=7,BrokerOrderNumber="0000801"});
+                        Check(!gateway.Busy&&notifications==1&&journal.Snapshot.Orders[0].Status==LiveOrderStatus.Working,"matching asynchronous ack produces exactly one order-change notification");
+                        wire.Emit(new LiveOrderAcknowledgement{RequestId=7,BrokerOrderNumber="0000801"});Check(notifications==1,"duplicate async ack cannot republish a broker order");
+                        now=Utc(2);journal.RecordExecution("0000801","ACTUAL-F1",1,9900,now);
+                        Reject(()=>gateway.Submit(Buy("stale-second","000660"),credentials,preflight,now),"broker mutation invalidates even a recently fetched snapshot before another send");
+                        Check(wire.Sends==1,"stale broker state cannot reach the order wire");
+                    }
+                }
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"authorized-timeout.xml")))using(var wire=new FakeWire()) {
+                    var now=Utc();var preflight=Authorized(now,credentials);int notifications=0;
+                    using(var gateway=new LiveOrderGateway(journal,wire,()=>now)) {
+                        gateway.OrderChanged+=order=>notifications++;
+                        gateway.Submit(Buy(),credentials,preflight,now);now=Utc(19);gateway.Timeout(now);
+                        Check(gateway.Busy&&notifications==0,"ack timeout does not expire before twenty seconds");
+                        now=Utc(20);gateway.Timeout(now);
+                        Check(!gateway.Busy&&journal.RecoveryRequired&&notifications==1,"expired accepted submission becomes unknown and notifies observers");
+                        wire.Emit(new LiveOrderAcknowledgement{RequestId=7,BrokerOrderNumber="0000901"});
+                        Check(journal.Snapshot.Orders[0].Status==LiveOrderStatus.Unknown&&notifications==1,"late ack cannot clear timed-out broker uncertainty");
+                        var next=Ready(now);next.Authorization=preflight.Authorization;
+                        Reject(()=>gateway.Submit(Buy("new-after-timeout","000660"),credentials,next,now),"a fresh authorized preflight cannot bypass an unresolved submission");
+                        Check(wire.Sends==1,"unknown submission is never automatically retried");
+                    }
+                }
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"revoked-session.xml")))using(var wire=new FakeWire())using(var gateway=new LiveOrderGateway(journal,wire,()=>Utc())) {
+                    var preflight=Authorized(Utc(),credentials);preflight.Authorization.Revoke();
+                    Reject(()=>gateway.Submit(Buy(),credentials,preflight,Utc()),"user stop blocks cached account authorization before any journal mutation");
+                    preflight.Authorization.Authorize("10987654321",Utc());
+                    Reject(()=>gateway.Submit(Buy(),credentials,preflight,Utc()),"re-authorizing a different account does not grant old credentials permission");
+                    Check(wire.Sends==0&&journal.Snapshot.Orders.Count==0,"revoked or wrong-account authorization has zero order side effects");
+                }
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"gateway-reserve.xml")))using(var wire=new FakeWire()) {
+                    var now=Utc();var preflight=Authorized(now,credentials);preflight.OperatingLimit=150000;
+                    using(var gateway=new LiveOrderGateway(journal,wire,()=>now)) {
+                        wire.DuringSend=()=>wire.Emit(new LiveOrderAcknowledgement{RequestId=7,BrokerOrderNumber="0001001"});
+                        gateway.Submit(Buy(),credentials,preflight,now);
+                        var second=Ready(now);second.Authorization=preflight.Authorization;second.OperatingLimit=150000;
+                        Reject(()=>gateway.Submit(Buy("second-stock","000660"),credentials,second,now),"gateway centrally enforces cross-stock reserve against configured operating funds");
+                        Check(wire.Sends==1&&journal.Snapshot.Orders.Count==1,"reserve failure occurs before preparing or sending the second stock");
+                    }
+                }
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"wire-failure.xml")))using(var wire=new FakeWire{ThrowOnSend=true}) {
+                    var now=Utc();int notifications=0;var preflight=Authorized(now,credentials);
+                    using(var gateway=new LiveOrderGateway(journal,wire,()=>now)) {
+                        gateway.OrderChanged+=order=>notifications++;
+                        string message="";try{gateway.Submit(Buy(),credentials,preflight,now);}catch(Exception error){message=error.Message;}
+                        Check(wire.Sends==1&&journal.RecoveryRequired&&notifications==1,"transport failure after durable dispatch becomes unknown with notification");
+                        Check(!message.Contains("SECRET")&&!message.Contains("password"),"provider transport exception contents are not exposed to UI/logging");
+                    }
+                }
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"unreadable-ack.xml")))using(var wire=new FakeWire()) {
+                    var now=Utc();var preflight=Authorized(now,credentials);
+                    using(var gateway=new LiveOrderGateway(journal,wire,()=>now)) {
+                        wire.DuringSend=()=>wire.Emit(new LiveOrderAcknowledgement{RequestId=7,ParseFailed=true});
+                        var sent=gateway.Submit(Buy(),credentials,preflight,now);
+                        Check(sent.Status==LiveOrderStatus.Unknown&&journal.RecoveryRequired,"getter failure in reentrant ack cannot be turned into broker rejection");
+                    }
+                }
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"zero-request.xml")))using(var wire=new FakeWire{ReturnId=0})using(var gateway=new LiveOrderGateway(journal,wire,()=>Utc())) {
+                    Reject(()=>gateway.Submit(Buy(),credentials,Authorized(Utc(),credentials),Utc()),"nonaccepted request return cannot be treated as a working order");
+                    Check(wire.Sends==1&&journal.RecoveryRequired,"failed request-return classification retains uncertainty after possible external side effect");
+                    Check(journal.Snapshot.Orders[0].Status==LiveOrderStatus.Unknown&&journal.Snapshot.Orders[0].ClientKey=="buy-a"&&string.IsNullOrEmpty(journal.Snapshot.Orders[0].OriginalClientKey),"request return zero never frees the strategy key as proven unsent");
+                    Reject(()=>gateway.Submit(Buy(),credentials,Authorized(Utc(),credentials),Utc()),"unknown request return cannot be automatically retried with the same strategy key");
+                    Check(wire.Sends==1,"unknown request return has at most one external side effect");
+                    Reject(()=>journal.RecordNotSent(journal.Snapshot.Orders[0].Id,Utc()),"an unknown post-entry request cannot be manually relabeled as proven not sent");
+                }
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"typed-error-after-wire-return.xml")))using(var wire=new FakeWire()) {
+                    int clockReads=0;
+                    using(var gateway=new LiveOrderGateway(journal,wire,()=>{if(clockReads++==0)throw new LiveOrderNotSentException();return Utc();})) {
+                        bool typed=false;try{gateway.Submit(Buy(),credentials,Authorized(Utc(),credentials),Utc());}catch(LiveOrderNotSentException){typed=true;}catch(InvalidOperationException){}
+                        Check(!typed&&wire.Sends==1&&journal.RecoveryRequired&&journal.Snapshot.Orders[0].Status==LiveOrderStatus.Unknown,"a typed error after wire return cannot misclassify a possibly submitted request as not sent");
+                    }
+                }
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"consumer-failure.xml")))using(var wire=new FakeWire())using(var gateway=new LiveOrderGateway(journal,wire,()=>Utc())) {
+                    gateway.OrderChanged+=order=>{throw new InvalidOperationException("buffered AA validation failed");};
+                    wire.DuringSend=()=>wire.Emit(new LiveOrderAcknowledgement{RequestId=7,BrokerOrderNumber="0001101"});
+                    var sent=gateway.Submit(Buy(),credentials,Authorized(Utc(),credentials),Utc());
+                    Check(sent.Status==LiveOrderStatus.Unknown&&journal.RecoveryRequired,"failed account-event consumer invalidates reconciliation instead of silently continuing");
+                }
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"revoke-before-wire.xml")))using(var wire=new FakeWire())using(var gateway=new LiveOrderGateway(journal,wire,()=>Utc())) {
+                    var preflight=Authorized(Utc(),credentials);wire.BeforeSend=()=>preflight.Authorization.Revoke();
+                    bool notSent=false;try{gateway.Submit(Buy(),credentials,preflight,Utc());}catch(LiveOrderNotSentException){notSent=true;}
+                    Check(notSent,"wire revocation before entering RequestData has an explicit not-sent result");
+                    Check(wire.Sends==0&&!journal.RecoveryRequired&&journal.ReservedBuyAmount==0,"proven pre-entry revocation releases only the local reservation without inventing broker uncertainty");
+                    var audit=journal.Snapshot.Orders[0];
+                    Check(audit.Status==LiveOrderStatus.NotSent&&audit.OriginalClientKey=="buy-a"&&audit.ClientKey=="not-sent/"+audit.Id&&!audit.RequestId.HasValue&&string.IsNullOrEmpty(audit.BrokerOrderNumber),"not-sent audit preserves original strategy identity without fake broker identifiers");
+                    Check(!gateway.Busy&&journal.Snapshot.Executions.Count==0,"known unsent outcome clears in-flight state and never creates an execution");
+                    wire.BeforeSend=null;var retry=Authorized(Utc(),credentials);wire.DuringSend=()=>wire.Emit(new LiveOrderAcknowledgement{RequestId=7,BrokerOrderNumber="0011801"});
+                    var accepted=gateway.Submit(Buy(),credentials,retry,Utc());
+                    Check(wire.Sends==1&&accepted.Status==LiveOrderStatus.Working&&accepted.ClientKey=="buy-a"&&journal.Snapshot.Orders.Count==2,"freshly authorized retry can reuse only a proven-unsent strategy key while retaining the audit record");
+                }
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"evidence-changed-during-input.xml")))using(var wire=new FakeWire())using(var gateway=new LiveOrderGateway(journal,wire,()=>Utc())) {
+                    bool current=true;var preflight=Authorized(Utc(),credentials);preflight.EvidenceStillCurrent=()=>current;wire.BeforeSend=()=>current=false;
+                    bool notSent=false;try{gateway.Submit(Buy(),credentials,preflight,Utc());}catch(LiveOrderNotSentException){notSent=true;}
+                    Check(notSent&&wire.Sends==0&&!journal.RecoveryRequired,"account-event proof invalidation before RequestData is proven not sent rather than an ambiguous broker submission");
+                    Check(journal.Snapshot.Orders[0].Status==LiveOrderStatus.NotSent&&journal.ReservedBuyAmount==0,"pre-entry data changes retain a terminal no-send audit and release the local reservation");
+                }
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"broker-zero-no-retry.xml")))using(var wire=new FakeWire())using(var gateway=new LiveOrderGateway(journal,wire,()=>Utc())) {
+                    wire.DuringSend=()=>wire.Emit(new LiveOrderAcknowledgement{RequestId=7,BrokerOrderNumber="0000"});
+                    var rejected=gateway.Submit(Buy(),credentials,Authorized(Utc(),credentials),Utc());
+                    Check(rejected.Status==LiveOrderStatus.Rejected&&rejected.ClientKey=="buy-a"&&string.IsNullOrEmpty(rejected.OriginalClientKey),"actual broker order-number-zero rejection is never relabeled as a local not-sent audit");
+                    Reject(()=>gateway.Submit(Buy(),credentials,Authorized(Utc(),credentials),Utc()),"explicit broker rejection retains the original strategy key to prevent automatic retry");
+                    Check(wire.Sends==1,"broker-zero rejection cannot create a second transport call with the same key");
+                    Reject(()=>journal.RecordNotSent(rejected.Id,Utc()),"broker rejection with an accepted request cannot be rewritten to free the original key");
+                }
+                var notSentPath=Path.Combine(directory,"not-sent-persisted.xml");
+                using(var journal=new LiveOrderJournal(notSentPath))using(var wire=new FakeWire())using(var gateway=new LiveOrderGateway(journal,wire,()=>Utc())) {
+                    int notifications=0;gateway.OrderChanged+=order=>{if(order.Status==LiveOrderStatus.NotSent)notifications++;};
+                    wire.BeforeSend=()=>{throw new InvalidOperationException("SECRET-before-request");};
+                    string message="";try{gateway.Submit(Buy(),credentials,Authorized(Utc(),credentials),Utc());}catch(LiveOrderNotSentException error){message=error.Message;}
+                    Check(wire.Sends==0&&notifications==1&&!message.Contains("SECRET"),"pre-entry preparation errors publish one safe not-sent change without provider text");
+                    Check(!journal.RecoveryRequired&&journal.Snapshot.Orders[0].ClientKey.Length<=128,"generated audit key stays bounded and cannot require broker recovery");
+                }
+                using(var journal=new LiveOrderJournal(notSentPath))using(var wire=new FakeWire())using(var gateway=new LiveOrderGateway(journal,wire,()=>Utc())) {
+                    Check(!journal.RecoveryRequired&&journal.Snapshot.Orders[0].Status==LiveOrderStatus.NotSent&&journal.Snapshot.Orders[0].OriginalClientKey=="buy-a","proven-unsent audit remains terminal and retains its original strategy key after restart");
+                    wire.DuringSend=()=>wire.Emit(new LiveOrderAcknowledgement{RequestId=7,BrokerOrderNumber="0011810"});
+                    Check(gateway.Submit(Buy(),credentials,Authorized(Utc(),credentials),Utc()).Status==LiveOrderStatus.Working&&wire.Sends==1,"a new explicit authorization can retry the audited unsent strategy key after restart");
+                }
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"invalidate-reentry.xml")))using(var wire=new FakeWire())using(var gateway=new LiveOrderGateway(journal,wire,()=>Utc())) {
+                    int notifications=0;wire.DuringSend=()=>wire.Emit(new LiveOrderAcknowledgement{RequestId=7,BrokerOrderNumber="0011901"});
+                    gateway.Submit(Buy(),credentials,Authorized(Utc(),credentials),Utc());
+                    gateway.OrderChanged+=order=>{notifications++;if(order.Status==LiveOrderStatus.Unknown)gateway.Invalidate(Utc());};
+                    gateway.Invalidate(Utc());gateway.Invalidate(Utc());
+                    Check(journal.RecoveryRequired&&notifications==1,"unknown-state notification cannot recursively invalidate itself or publish duplicate unknown transitions");
+                }
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"rejection-events.xml"))) {
+                    var original=Accepted(journal,Buy(),"001201",Utc());
+                    var cancellation=Accepted(journal,Modify(LiveOrderKind.Cancel,"cancel-rejected","001201"),"001202",Utc(1),8);
+                    journal.RecordBrokerRejection("001202","20261112","99",Utc(2));
+                    Check(journal.Snapshot.Orders.Single(o=>o.Id==cancellation.Id).Status==LiveOrderStatus.Rejected&&journal.ReservedBuyAmount==100000,"explicit cancel rejection closes only the cancellation and preserves the original reserve");
+                    journal.RecordBrokerRejection("001201","20261112","09",Utc(3));
+                    Check(journal.Snapshot.Orders.Single(o=>o.Id==original.Id).Status==LiveOrderStatus.Rejected&&journal.ReservedBuyAmount==0,"explicit new-order rejection is distinct from an execution or cancellation");
+                    Reject(()=>journal.RecordBrokerRejection("001201","20261112","03",Utc(4)),"execution event cannot be relabeled as an order rejection");
+                }
+                using(var text=new StringWriter()) {
+                    var token=new LiveTradingSession();token.Authorize(credentials.Account,Utc());var serializer=new System.Xml.Serialization.XmlSerializer(typeof(LiveTradingSession));serializer.Serialize(text,token);
+                    using(var reader=new StringReader(text.ToString()))Check(!((LiveTradingSession)serializer.Deserialize(reader)).Active&&!text.ToString().Contains(credentials.Account),"serializing an approval token cannot persist activation or account credentials");
                 }
                 string corrupt=Path.Combine(directory,"corrupt.xml");
                 using(var journal=new LiveOrderJournal(corrupt)){Accepted(journal,Buy(),"1",Utc());}

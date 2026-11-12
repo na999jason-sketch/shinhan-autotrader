@@ -111,6 +111,24 @@ internal static class NativeComTests {
                 catch(ArgumentException) { unsupported=true; }
                 Check(unsupported && invalid.Count == 0 && Number(source,"GetSinkCount") == 0,"unsupported argument type is rejected before native Advise");
             }
+            object variantValue=null;
+            using(var variant=new ComEventSubscriptions(source,EventInterface)) {
+                variant.AddVariantCallback(31,VarEnum.VT_VARIANT,value=>variantValue=value);
+                Invoke(source,"EmitVariant","SC");
+                Check(variantValue is string&&(string)variantValue=="SC","native VARIANT containing BSTR reaches the exact object event delegate");
+                GC.Collect();GC.WaitForPendingFinalizers();GC.Collect();
+                Invoke(source,"EmitVariant","AA");
+                Check(variantValue is string&&(string)variantValue=="AA","VARIANT event subscription survives forced collection");
+                Invoke(source,"EmitVariant",42);
+                Check(variantValue is int&&(int)variantValue==42,"VARIANT delegate preserves scalar type for processor validation");
+                variant.Dispose();Invoke(source,"EmitVariant","AD");
+                Check(variantValue is int&&(int)variantValue==42&&Number(source,"GetSinkCount")==0,"exact VARIANT callback detach prevents later events");
+            }
+            bool wrongVariant=false;
+            using(var invalidVariant=new ComEventSubscriptions(source,EventInterface)) {
+                try{invalidVariant.AddVariantCallback(31,VarEnum.VT_BSTR,value=>{});}catch(ArgumentException){wrongVariant=true;}
+                Check(wrongVariant&&invalidVariant.Count==0&&Number(source,"GetSinkCount")==0,"BSTR-only declaration is refused for formal VARIANT events");
+            }
         } finally {
             subscriptions.Dispose();
             Marshal.FinalReleaseComObject(source);
@@ -155,7 +173,7 @@ internal static class NativeComTests {
             Check((string)adapter.Invoke("GetSingleData",24)=="70000"&&Number(source,"GetLastIndex")==24&&Number(source,"GetFirstArgType")==2,"manual snapshot price reads native field24 with a VT_I2 index");
             Check((string)adapter.Invoke("GetSingleData",1)=="","manual snapshot fixture does not invent the SC symbol echo");
             Check((bool)adapter.Invoke("SetQueryName","SC")&&(string)adapter.Invoke("GetQueryName")=="SC","SC quote polling remains admitted separately from manual snapshots");
-            foreach(var accountQuery in new[]{"SABA602Q1","SABA415Q1","SABA231Q1"})
+            foreach(var accountQuery in new[]{"SABA602Q1","SABA415Q1","SABA231Q1","SABA609Q1"})
                 Check((bool)adapter.Invoke("SetQueryName",accountQuery)&&(string)adapter.Invoke("GetQueryName")==accountQuery,
                     "actual account cash, capacity and order snapshots pass only the explicit read-only adapter: "+accountQuery);
             Check((string)adapter.Invoke("GetMultiData",2,5)=="70000","typed multi data returns a VARIANT value");

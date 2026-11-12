@@ -39,6 +39,7 @@ namespace ShinhanNativeTrader {
                 Check(text.Contains("\"현금100% 주문가능금액\",350000"),"cash100 value remains separate from deposit and general capacity");
                 Check(text.Contains("2026-11-13 06:19:55 UTC")&&text.Contains("2026-11-13 06:19:59 UTC"),"holdings and per-symbol price response timestamps remain distinct");
                 Check(text.Contains("수수료·세금 제외")&&text.Contains("실현손익을 추정하지 않음"),"unrealized valuation excludes fees and does not invent realized profit");
+                Check(text.Contains("\"실현손익(증권사 조회)\",\"미확인\""),"missing broker realized-profit response never becomes zero or sale proceeds");
                 Check(text.Contains("\"'123\",\"미확인\",\"'005930\",\"매수\",3,65000,1,65000,2"),"broker cumulative fill snapshot is reported independently");
                 Check(text.Contains("\"'123\",\"미확인\",\"'005930\",\"Buy\",3,0,0,65000,\"Working\""),"acknowledged working journal order is not changed to broker aggregate fill");
                 Check(!text.Contains("SECRET")&&!text.Contains("PASSWORD")&&!text.Contains("12345678901")&&!text.Contains("4321"),"provider names, reject text and internal arbitrary identifiers are omitted");
@@ -63,6 +64,41 @@ namespace ShinhanNativeTrader {
                 var missingPath=SessionReport.Write(directory,day.AddDays(2),utc,missing,utc,null,null,null,LiveOrderSafety.BlockReason);
                 Check(File.ReadAllText(missingPath).Contains("\"'005930\",2,\"미확인\",65000,\"미확인\",130000,\"미확인\""),"missing average cost never becomes a fictitious gain");
 
+                var tradeHoldings=new BrokerHoldingsSnapshot{BrokerDate="20261113",BrokerDateValidated=true,
+                    RealizedProfit=-12345.67m,UnrealizedProfit=999999m,RequestStartedUtc=utc.AddSeconds(-8),ReceivedUtc=utc.AddSeconds(-4)};
+                var realizedPath=SessionReport.Write(directory,day,utc,positions,utc,cash,orders,journal,"실주문 운영 시작됨",null,tradeHoldings);
+                var realizedText=File.ReadAllText(realizedPath);
+                Check(realizedText.Contains("\"실현손익(증권사 조회)\",-12345.67\r\n"),"validated same-day negative broker realized profit remains numeric");
+                Check(realizedText.Contains("\"실현손익 조회 요청시각\",\"2026-11-13 06:19:52 UTC\"")
+                    &&realizedText.Contains("\"실현손익 조회 응답시각\",\"2026-11-13 06:19:56 UTC\""),"realized-profit request and response UTC metadata remain distinct");
+                Check(realizedText.Contains("\"실현손익 기준일(증권사)\",\"2026-11-13\"")
+                    &&realizedText.Contains("\"실주문 상태\",\"실주문 운영 시작됨\""),"finite authorized UI state and validated broker date can be reported");
+                Check(tradeHoldings.RealizedProfit==-12345.67m&&tradeHoldings.UnrealizedProfit==999999m,"realized reporting neither mutates nor substitutes other broker profit fields");
+                tradeHoldings.RealizedProfit=5555.5m;
+                SessionReport.Write(directory,day,utc,positions,utc,cash,orders,journal,"실주문 미시작",null,tradeHoldings);
+                realizedText=File.ReadAllText(realizedPath);
+                Check(realizedText.Contains("\"실현손익(증권사 조회)\",5555.5\r\n")
+                    &&realizedText.Contains("\"실주문 상태\",\"실주문 미시작\""),"positive broker realized profit is independent from order authorization state");
+                tradeHoldings.RealizedProfit=0;
+                SessionReport.Write(directory,day,utc,positions,utc,cash,orders,journal,"실주문 미시작",null,tradeHoldings);
+                Check(File.ReadAllText(realizedPath).Contains("\"실현손익(증권사 조회)\",0\r\n"),"verified broker zero is distinct from an unknown profit");
+                tradeHoldings.RealizedProfit=null;
+                SessionReport.Write(directory,day,utc,positions,utc,cash,orders,journal,"실주문 미시작",null,tradeHoldings);
+                Check(File.ReadAllText(realizedPath).Contains("\"실현손익(증권사 조회)\",\"미확인\""),"nullable broker realized profit remains unknown despite a valid date");
+                tradeHoldings.RealizedProfit=987654321m;tradeHoldings.BrokerDate="20261112";
+                SessionReport.Write(directory,day,utc,positions,utc,cash,orders,journal,"실주문 미시작",null,tradeHoldings);
+                realizedText=File.ReadAllText(realizedPath);
+                Check(realizedText.Contains("\"실현손익(증권사 조회)\",\"미확인\"")&&!realizedText.Contains("987654321"),"a validated profit for another day is not assigned to the requested report day");
+                tradeHoldings.BrokerDate="20261113";tradeHoldings.BrokerDateValidated=false;
+                SessionReport.Write(directory,day,utc,positions,utc,cash,orders,journal,"실주문 미시작",null,tradeHoldings);
+                Check(File.ReadAllText(realizedPath).Contains("\"실현손익(증권사 조회)\",\"미확인\""),"an unvalidated same-day broker date cannot establish realized profit");
+                tradeHoldings.BrokerDate="PASSWORD_4321";tradeHoldings.BrokerDateValidated=true;
+                SessionReport.Write(directory,day,utc,positions,utc,cash,orders,journal,"실주문 미시작",null,tradeHoldings);
+                Check(!File.ReadAllText(realizedPath).Contains("PASSWORD")&&!File.ReadAllText(realizedPath).Contains("4321"),"invalid broker date text cannot disclose credentials");
+                tradeHoldings.BrokerDate="20261113";tradeHoldings.RequestStartedUtc=default(DateTime);
+                SessionReport.Write(directory,day,utc,positions,utc,cash,orders,journal,"실주문 미시작",null,tradeHoldings);
+                Check(File.ReadAllText(realizedPath).Contains("\"실현손익 조회 요청시각\",\"미확인\""),"missing request timestamp is explicit rather than a fabricated epoch");
+
                 Check(SessionReport.EscapeText(" =SUM(A1)").StartsWith("\"' =SUM",StringComparison.Ordinal),"leading whitespace cannot bypass CSV formula protection");
                 Check(SessionReport.EscapeText("+SUM(A1)").StartsWith("\"'+",StringComparison.Ordinal)&&SessionReport.EscapeText("-CMD()").StartsWith("\"'-",StringComparison.Ordinal),"plus and minus text prefixes cannot become formulas");
                 Check(SessionReport.EscapeText("@SUM(A1)").StartsWith("\"'@",StringComparison.Ordinal)&&SessionReport.EscapeText("\t=CMD()").StartsWith("\"'\t",StringComparison.Ordinal),"at-sign and initial controls cannot become formulas");
@@ -73,6 +109,10 @@ namespace ShinhanNativeTrader {
                 Reject(()=>SessionReport.Write(directory,DateTime.SpecifyKind(day,DateTimeKind.Local),utc,null,null,null,null,null,""),"report calendar date cannot depend on PC local timezone");
                 Reject(()=>SessionReport.Write(directory,day,DateTime.SpecifyKind(utc,DateTimeKind.Unspecified),null,null,null,null,null,""),"report timestamp requires UTC");
                 Reject(()=>SessionReport.Write(directory,day,utc,null,day,null,null,null,""),"holdings timestamp requires UTC when present");
+                tradeHoldings.RequestStartedUtc=day;
+                Reject(()=>SessionReport.Write(directory,day,utc,null,null,null,null,null,"",null,tradeHoldings),"realized-profit request timestamp requires UTC when provided");
+                tradeHoldings.RequestStartedUtc=default(DateTime);tradeHoldings.ReceivedUtc=day;
+                Reject(()=>SessionReport.Write(directory,day,utc,null,null,null,null,null,"",null,tradeHoldings),"realized-profit response timestamp requires UTC");
             }finally{if(Directory.Exists(directory))Directory.Delete(directory,true);}
             return checks;
         }

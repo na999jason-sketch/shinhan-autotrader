@@ -2,8 +2,9 @@ using System;
 
 namespace ShinhanNativeTrader {
     public static class LiveOrderPolicy {
-        public static bool Enabled { get { return LiveOrderSafety.ProductionContractVerified; } }
         public const string BlockReason=LiveOrderSafety.BlockReason;
-        public static void EnsureAllowed(){LiveOrderSafety.EnsureAllowed();}
+        // Compatibility name only. There is no process-wide on/off switch.
+        public static bool IsEnabled(LiveTradingSession authorization,string account){return authorization!=null&&authorization.Allows(account,DateTime.UtcNow);}
+        public static void EnsureAllowed(LiveOrderPreflight checks,LiveAccountCredentials credentials,DateTime utc){LiveOrderSafety.EnsureAllowed(checks,credentials,utc);}
     }
 }

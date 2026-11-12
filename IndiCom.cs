@@ -189,7 +189,7 @@ namespace ShinhanNativeTrader {
             if(method!="SetQueryName"&&method!="GetQueryName"&&method!="SetSingleData"&&method!="RequestData"&&method!="GetSingleData"&&
                 method!="GetMultiData"&&method!="GetMultiRowCount"&&!DiagnosticMethod(method))throw new InvalidOperationException("Read-only Indi method not allowed: "+method);
             if(DiagnosticMethod(method)&&(!SupportsDiagnostic(method)||args.Length!=0))throw new InvalidOperationException("Installed Indi diagnostic signature is unavailable.");
-            if(method=="SetQueryName"&&(args.Length!=1||!new[]{"stock_mst","TR_SCHART","SC","TR_1110_11","SABA200QB","SABA602Q1","SABA415Q1","SABA231Q1"}.Contains(Convert.ToString(args[0]))))
+            if(method=="SetQueryName"&&(args.Length!=1||!new[]{"stock_mst","TR_SCHART","SC","TR_1110_11","SABA200QB","SABA609Q1","SABA602Q1","SABA415Q1","SABA231Q1"}.Contains(Convert.ToString(args[0]))))
                 throw new InvalidOperationException("Read-only Indi query not allowed.");
             return dispatch.Invoke(method,args);
         }
@@ -233,6 +233,7 @@ namespace ShinhanNativeTrader {
         public string Kind,Code;
         public int Count;
         public List<Stock> Stocks=new List<Stock>();
+        public List<CashInstrument> Instruments=new List<CashInstrument>();
         public List<Bar> Bars=new List<Bar>();
         public List<Holding> Holdings=new List<Holding>();
         public decimal Price;
@@ -240,6 +241,8 @@ namespace ShinhanNativeTrader {
         public AccountCashSnapshot Cash;
         public BrokerOrdersSnapshot BrokerOrders;
         public AccountOrderCapacity Capacity;
+        public BrokerHoldingsSnapshot TradeHoldings;
+        public DateTime RequestStartedUtc,ReceivedUtc;
         public string Clock,Message,OrderNo;
     }
 
@@ -281,8 +284,11 @@ namespace ShinhanNativeTrader {
                 reply.Count=Rows(io,12000);var seen=new HashSet<string>();
                 for(int row=0;row<reply.Count;row++) {
                     var symbol=Rules.Code(multi(row,1));var market=multi(row,2).Trim();var name=multi(row,3).Trim();
-                    if(symbol!=""&&(market=="0"||market=="1")&&multi(row,14).Trim()=="ST"&&
-                        multi(row,6).Trim()=="0"&&multi(row,7).Trim()=="0"&&multi(row,8).Trim()=="0") {
+                    var product=multi(row,14).Trim();var suspended=multi(row,6).Trim()!="0";
+                    if(symbol!=""&&(market=="0"||market=="1"))
+                        reply.Instruments.Add(new CashInstrument{Code=symbol,Market=market,Product=product,Suspended=suspended});
+                    if(symbol!=""&&(market=="0"||market=="1")&&product=="ST"&&
+                        !suspended&&multi(row,7).Trim()=="0"&&multi(row,8).Trim()=="0") {
                         if(!seen.Add(symbol))throw new InvalidOperationException("Duplicate stock_mst symbol.");
                         reply.Stocks.Add(new Stock{Code=symbol,Name=name,Market=market});
                     }
@@ -327,6 +333,9 @@ namespace ShinhanNativeTrader {
                 if(reply.Price<=0)throw new FieldFailure("TR_1110_11 price single[24] must be positive");
                 reply.Clock="";reply.HasTradeClock=false;
                 reply.Message="조회 가격: 거래시각 미제공, 자동매매 사용 제외";
+            }else if(kind=="TRADEHOLDINGS") {
+                reply.TradeHoldings=AccountQueries.ReadHoldings(io,DateTime.UtcNow);reply.Holdings=reply.TradeHoldings.Holdings;
+                reply.Count=reply.Holdings.Count;
             }else if(kind=="CASH") {
                 reply.Cash=AccountQueries.ReadCash(io,DateTime.UtcNow);reply.Count=1;
             }else if(kind=="CAPACITY") {
@@ -355,10 +364,11 @@ namespace ShinhanNativeTrader {
 
     // Serial request state is independent of COM and WinForms and can be replayed in unit tests.
     public sealed class IndiRequestCoordinator : IDisposable {
-        sealed class Snapshot { public int Id;public int? ProviderErrorState;public IndiReply Reply;public Exception Error; }
+        sealed class Snapshot { public int Id;public int? ProviderErrorState;public IndiReply Reply;public Exception Error;public DateTime ReceivedUtc; }
         sealed class Pending {
             public string Kind,Code;public int? Id;
             public decimal? RequestedPrice;
+            public DateTime RequestStartedUtc;
             public readonly List<Snapshot> Early=new List<Snapshot>();
             public string[] Sensitive=new string[0];
         }
@@ -400,7 +410,7 @@ namespace ShinhanNativeTrader {
             if(failed)throw new InvalidOperationException("Indi requests halted after an earlier error; reconnect required.");
             if(Busy){Log("Rejected request while another TR is pending.");return false;}
             var current=new Pending{Kind=kind,Code=code,RequestedPrice=requestedPrice};pending=current;
-            if((kind=="HOLDINGS"||kind=="CASH"||kind=="CAPACITY"||kind=="ORDERS")&&input!=null) {
+            if((kind=="HOLDINGS"||kind=="TRADEHOLDINGS"||kind=="CASH"||kind=="CAPACITY"||kind=="ORDERS")&&input!=null) {
                 var accountIndex=kind=="ORDERS"?1:0;
                 current.Sensitive=input.Where(x=>x.Key==accountIndex||x.Key==2).Select(x=>x.Value).ToArray();
                 foreach(var value in current.Sensitive)if(!string.IsNullOrWhiteSpace(value))sessionSensitive.Add(value);
@@ -417,6 +427,7 @@ namespace ShinhanNativeTrader {
                 stage="SetSingleData";
                 if(input!=null)foreach(var field in input.OrderBy(x=>x.Key))Accepted(io.Invoke("SetSingleData",field.Key,field.Value),"SetSingleData");
                 stage="RequestData";
+                current.RequestStartedUtc=DateTime.UtcNow;
                 object raw=io.Invoke("RequestData");
                 Log("RequestData return type="+(raw==null?"null":raw.GetType().Name));
                 var id=RequestId(raw);
@@ -442,7 +453,7 @@ namespace ShinhanNativeTrader {
             var current=pending;
             if(current==null){Log("Ignored unsolicited/duplicate ReceiveData rid="+id);return;}
             if(current.Id.HasValue&&current.Id.Value!=id){Log("Ignored mismatched ReceiveData rid="+id);return;}
-            var snapshot=new Snapshot{Id=id};
+            var snapshot=new Snapshot{Id=id,ReceivedUtc=DateTime.UtcNow};
             // The OCX has now set this response's status. Capture it while the
             // response buffer is valid; a later request can clear it again.
             var diagnostic=Diagnose(current,"ReceiveData rid="+id);
@@ -465,6 +476,11 @@ namespace ShinhanNativeTrader {
                 Halt("Indi returned an error in matching ReceiveData rid="+snapshot.Id+"; GetErrorState="+snapshot.ProviderErrorState.Value+". See sanitized INDI diagnostics.");return;
             }
             if(snapshot.Error!=null){Diagnose(current,"response error rid="+snapshot.Id);Halt("Indi response parse failed ("+snapshot.Error.GetBaseException().GetType().Name+"); "+IndiResponseParser.FailureContext(snapshot.Error)+". Provider exception text omitted.");return;}
+            snapshot.Reply.RequestStartedUtc=current.RequestStartedUtc;snapshot.Reply.ReceivedUtc=snapshot.ReceivedUtc;
+            if(snapshot.Reply.TradeHoldings!=null){snapshot.Reply.TradeHoldings.RequestStartedUtc=current.RequestStartedUtc;snapshot.Reply.TradeHoldings.ReceivedUtc=snapshot.ReceivedUtc;}
+            if(snapshot.Reply.Cash!=null)snapshot.Reply.Cash.ReceivedUtc=snapshot.ReceivedUtc;
+            if(snapshot.Reply.Capacity!=null)snapshot.Reply.Capacity.ReceivedUtc=snapshot.ReceivedUtc;
+            if(snapshot.Reply.BrokerOrders!=null)snapshot.Reply.BrokerOrders.ReceivedUtc=snapshot.ReceivedUtc;
             pending=null;Log("RECEIVED "+current.Kind+" rid="+snapshot.Id+" rows="+snapshot.Reply.Count);
             if(Done!=null)Done(snapshot.Reply);
         }
@@ -478,22 +494,28 @@ namespace ShinhanNativeTrader {
         public void Dispose(){if(disposed)return;disposed=true;pending=null;sessionSensitive.Clear();io.ReceiveData-=OnData;io.Error-=Halt;}
     }
 
-    // A dedicated order OCX is created lazily only after the production order
-    // gate passes. It never shares response buffers with the read-only OCX.
+    // A dedicated order OCX is initialized independently of short-lived proofs.
+    // Sending still requires the account authorization and current preflight;
+    // it never shares response buffers with the read-only OCX.
     internal sealed class IndiLiveOrderConnection : ILiveOrderWire {
         readonly Control surface;readonly Action<string> log;
         ComIndiTransport owner;ComLiveOrderWire wire;bool disposed;
         public event Action<LiveOrderAcknowledgement> Acknowledged;
-        public IndiLiveOrderConnection(Control surface,Action<string> log){this.surface=surface;this.log=log;}
+        public IndiLiveOrderConnection(Control surface,Action<string> log){this.surface=surface;this.log=log;PrepareChannel();}
+        void PrepareChannel() {
+            // Site/initialize the dedicated control before collecting a short-lived
+            // order preflight. Initialization itself does not submit any order.
+            try {
+                owner=new ComIndiTransport(surface,log);wire=new ComLiveOrderWire(owner.NativeControl);
+                wire.Acknowledged+=Forward;
+            }catch{if(wire!=null){wire.Dispose();wire=null;}if(owner!=null){owner.Dispose();owner=null;}throw;}
+        }
         public int Send(LiveOrderIntent intent,LiveAccountCredentials credentials,LiveOrderPreflight checks,DateTime utc) {
-            if(disposed)throw new ObjectDisposedException("IndiLiveOrderConnection");
-            LiveOrderSafety.EnsureAllowed();
-            if(wire==null) {
-                try {
-                    owner=new ComIndiTransport(surface,log);wire=new ComLiveOrderWire(owner.NativeControl);
-                    wire.Acknowledged+=Forward;
-                }catch{if(wire!=null){wire.Dispose();wire=null;}if(owner!=null){owner.Dispose();owner=null;}throw;}
-            }
+            try {
+                if(disposed)throw new ObjectDisposedException("IndiLiveOrderConnection");
+                LiveOrderSafety.EnsureAllowed(checks,credentials,utc);
+                if(wire==null)PrepareChannel();
+            }catch{throw new LiveOrderNotSentException();}
             return wire.Send(intent,credentials,checks,utc);
         }
         void Forward(LiveOrderAcknowledgement reply){if(Acknowledged!=null)Acknowledged(reply);}
@@ -546,6 +568,7 @@ namespace ShinhanNativeTrader {
             return Request("HOLDINGS","SABA200QB",new Dictionary<int,string>{{0,account.Trim()},{1,"01"},{2,password}},"");
         }
         public bool Cash(string account,string password){return Request("CASH","SABA602Q1",AccountQueries.CashInputs(account,password),"");}
+        public bool TradeHoldings(string account,string password){return Request("TRADEHOLDINGS","SABA609Q1",AccountQueries.HoldingsInputs(account,password),"");}
         public bool Orders(string account,string password,string date){return Request("ORDERS","SABA231Q1",AccountQueries.OrdersInputs(account,password,date),date);}
         public bool Capacity(string account,string password,string code,decimal limitPrice) {
             code=ValidateCode(code);

@@ -13,6 +13,7 @@ const IID TypedDispatchInterface = { 0xb4a0d92f, 0x6683, 0x4824, { 0x9c, 0x63, 0
 const DISPID DataEvent = 11;
 const DISPID SystemEvent = 17;
 const DISPID ShortEvent = 29;
+const DISPID VariantEvent = 31;
 LONG liveObjects = 0;
 class Fixture;
 
@@ -31,6 +32,7 @@ public:
     HRESULT STDMETHODCALLTYPE Unadvise(DWORD cookie) override;
     HRESULT STDMETHODCALLTYPE EnumConnections(IEnumConnections** value) override;
     HRESULT Emit(DISPID eventId, VARTYPE type, LONG value);
+    HRESULT EmitVariant(DISPID eventId, const VARIANT& value);
     LONG SinkCount() const { return sink_ == nullptr ? 0 : 1; }
 };
 
@@ -70,7 +72,7 @@ public:
         if (iid != IID_NULL) return DISP_E_UNKNOWNINTERFACE;
         if (names == nullptr || ids == nullptr) return E_POINTER;
         if (count != 1) return DISP_E_UNKNOWNNAME;
-        const wchar_t* const methods[] = { L"RequestData", L"EmitData", L"EmitSystem", L"EmitShort", L"GetSinkCount", L"GetBufferText" };
+        const wchar_t* const methods[] = { L"RequestData", L"EmitData", L"EmitSystem", L"EmitShort", L"GetSinkCount", L"GetBufferText", L"EmitVariant" };
         for (UINT i = 0; i < ARRAYSIZE(methods); ++i) {
             if (_wcsicmp(names[0], methods[i]) == 0) { ids[0] = static_cast<DISPID>(i + 1); return S_OK; }
         }
@@ -112,6 +114,10 @@ public:
                 if (result->bstrVal == nullptr) return E_OUTOFMEMORY;
             }
             return S_OK;
+        }
+        if(id == 7) {
+            if(args->cArgs != 1) return DISP_E_BADPARAMCOUNT;
+            return point_.EmitVariant(VariantEvent,args->rgvarg[0]);
         }
         return DISP_E_MEMBERNOTFOUND;
     }
@@ -168,6 +174,17 @@ HRESULT ConnectionPoint::Emit(DISPID eventId, VARTYPE type, LONG value) {
     const HRESULT result = callback->Invoke(eventId, IID_NULL, LOCALE_INVARIANT, DISPATCH_METHOD,
         &parameters, nullptr, nullptr, nullptr);
     callback->Release(); return result;
+}
+HRESULT ConnectionPoint::EmitVariant(DISPID eventId, const VARIANT& value) {
+    if(sink_ == nullptr) return S_OK;
+    IDispatch* callback = sink_; callback->AddRef();
+    VARIANT argument; VariantInit(&argument);
+    HRESULT result = VariantCopy(&argument,&value);
+    if(SUCCEEDED(result)) {
+        DISPPARAMS parameters = { &argument, nullptr, 1, 0 };
+        result = callback->Invoke(eventId,IID_NULL,LOCALE_INVARIANT,DISPATCH_METHOD,&parameters,nullptr,nullptr,nullptr);
+    }
+    VariantClear(&argument); callback->Release(); return result;
 }
 
 // A separate, strict automation target checks the production typed command adapter.

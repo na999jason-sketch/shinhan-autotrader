@@ -69,6 +69,7 @@ namespace ShinhanNativeTrader {
             Check(!BeginQuote(requests)&&fake.RequestCount==1,"one request at a time");
             fake.Data(99);Check(received==0&&requests.Busy,"mismatched response ignored");
             fake.Data(7);Check(received==1&&!requests.Busy&&reply.Price==70000,"matching quote copied and completed");
+            Check(reply.RequestStartedUtc.Kind==DateTimeKind.Utc&&reply.ReceivedUtc.Kind==DateTimeKind.Utc&&reply.RequestStartedUtc<=reply.ReceivedUtc,"copied response preserves the request-start and callback UTC timestamps for evidence barriers");
             fake.Data(7);Check(received==1,"duplicate response ignored");
             requests.Timeout();Check(fatal==0,"idle timeout has no effect");
             requests.Dispose();fake.Data(7);Check(received==1,"disposed coordinator unhooks receive handler");

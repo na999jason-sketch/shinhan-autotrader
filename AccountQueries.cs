@@ -41,6 +41,21 @@ namespace ShinhanNativeTrader {
         public bool HasExecutionIds { get { return false; } }
     }
 
+    public sealed class BrokerHoldingsSnapshot {
+        // SABA609Q1 SI3=1/MO2=1 is the trade basis, including today's fills.
+        // Its settlement-day quantity MO9 must never replace Holding.Quantity.
+        public readonly List<Holding> Holdings=new List<Holding>();
+        public readonly Dictionary<string,int> SellableQuantities=new Dictionary<string,int>(StringComparer.Ordinal);
+        public readonly Dictionary<string,bool> CashSourceValidated=new Dictionary<string,bool>(StringComparer.Ordinal);
+        // MO11 has no buy/sell direction. It is not safe to copy it to either
+        // Holding.BuyPending or Holding.SellPending, or to ignore it at preflight.
+        public readonly Dictionary<string,int> UnfilledQuantities=new Dictionary<string,int>(StringComparer.Ordinal);
+        public DateTime ReceivedUtc,RequestStartedUtc;
+        public string BrokerDate;
+        public bool BrokerDateValidated;
+        public decimal? RealizedProfit,UnrealizedProfit;
+    }
+
     public sealed class HoldingValuation {
         public string Code,Name;
         public decimal Quantity,AveragePrice,CurrentPrice;
@@ -117,6 +132,12 @@ namespace ShinhanNativeTrader {
             Credentials(account,password);
             return new Dictionary<int,string>{{0,account.Trim()},{1,"01"},{2,password},{3,"1"}};
         }
+        public static Dictionary<int,string> HoldingsInputs(string account,string password) {
+            Credentials(account,password);
+            // Average cost, trade basis, ordinary product, excluding ELW, and
+            // both single/multi output are explicitly bound by this request.
+            return new Dictionary<int,string>{{0,account.Trim()},{1,"01"},{2,password},{3,"1"},{4,"1"},{5,"1"},{6,"0"}};
+        }
         public static Dictionary<int,string> CapacityInputs(string account,string password,string code,decimal limitPrice) {
             Credentials(account,password);code=Code(code);
             if(limitPrice<=0||limitPrice!=decimal.Truncate(limitPrice))throw new ArgumentException("A positive whole-won limit price is required.");
@@ -161,6 +182,57 @@ namespace ShinhanNativeTrader {
             // Names/statuses may be displayed, but control/bidi data cannot create
             // arbitrary log records. Neither account nor password is read here.
             return new string(value.Where(c=>!char.IsControl(c)&&char.GetUnicodeCategory(c)!=UnicodeCategory.Format).Take(120).ToArray());
+        }
+        static decimal? OptionalSingleNumber(IIndiTransport io,int field,string query) {
+            string value;
+            // Some installed server versions omit aggregate output. This must
+            // remain unknown, rather than inventing a zero profit or rejecting
+            // independently readable positions. Provider text is never kept.
+            try {value=Single(io,field,query);}catch(AccountQueryException){return null;}
+            return value==""?null:(decimal?)Number(value,query+" single["+field+"]",true);
+        }
+        public static BrokerHoldingsSnapshot ReadHoldings(IIndiTransport io,DateTime receivedUtc) {
+            if(io==null)throw new ArgumentNullException("io");Utc(receivedUtc);
+            const string query="SABA609Q1";
+            var result=new BrokerHoldingsSnapshot {ReceivedUtc=receivedUtc,BrokerDate=""};
+            for(int row=0,count=Rows(io,query);row<count;row++) {
+                var code=Rules.Code(Multi(io,row,0,query));
+                if(code=="")throw new AccountQueryException(query+" invalid stock symbol multi[0].");
+                if(result.SellableQuantities.ContainsKey(code))
+                    throw new AccountQueryException(query+" duplicate stock symbol multi[0]; cash/credit rows cannot be merged safely.");
+                if(Multi(io,row,2,query)!="1")
+                    throw new AccountQueryException(query+" trade-basis response required in multi[2].");
+                var kind=Multi(io,row,3,query);
+                var quantity=Quantity(Multi(io,row,4,query),query+" holding quantity[4]");
+                // These fields are unsettled trades and settlement-day stock,
+                // not open buy/sell orders. Validate, but do not relabel them.
+                for(int field=5;field<=9;field++)Quantity(Multi(io,row,field,query),query+" settlement quantity["+field+"]");
+                var sellable=Quantity(Multi(io,row,10,query),query+" orderable quantity[10]");
+                var unfilled=Quantity(Multi(io,row,11,query),query+" unfilled quantity[11]");
+                if(sellable>quantity)
+                    throw new AccountQueryException(query+" orderable quantity exceeds trade-basis holdings multi[4/10].");
+                var loanText=Multi(io,row,22,query);
+                var loan=Number(loanText,query+" loan amount[22]",false,true);
+                // The official description documents the literal '보통'. No
+                // undocumented numeric alias is assumed to mean cash stock.
+                var cash=kind=="보통"&&loanText!=""&&loan==0;
+                result.Holdings.Add(new Holding {Code=code,Name=Text(Multi(io,row,1,query)),Quantity=quantity,
+                    AvgPrice=Number(Multi(io,row,12,query),query+" average price[12]"),
+                    Price=Number(Multi(io,row,13,query),query+" current price[13]"),CreditQty=cash?0m:quantity});
+                result.SellableQuantities.Add(code,(int)sellable);
+                result.UnfilledQuantities.Add(code,(int)unfilled);
+                result.CashSourceValidated.Add(code,cash);
+            }
+            string brokerDate;
+            try {brokerDate=Single(io,0,query);}catch(AccountQueryException){brokerDate="";}
+            DateTime parsed;
+            if(brokerDate.Length==8&&brokerDate.All(c=>c>='0'&&c<='9')&&
+                DateTime.TryParseExact(brokerDate,"yyyyMMdd",CultureInfo.InvariantCulture,DateTimeStyles.None,out parsed)) {
+                result.BrokerDate=brokerDate;result.BrokerDateValidated=true;
+            }
+            result.RealizedProfit=OptionalSingleNumber(io,16,query);
+            result.UnrealizedProfit=OptionalSingleNumber(io,19,query);
+            return result;
         }
         public static AccountCashSnapshot ReadCash(IIndiTransport io,DateTime receivedUtc) {
             if(io==null)throw new ArgumentNullException("io");Utc(receivedUtc);

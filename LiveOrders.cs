@@ -11,7 +11,12 @@ using System.Xml.Serialization;
 
 namespace ShinhanNativeTrader {
     public enum LiveOrderKind { Buy, Sell, Amend, Cancel }
-    public enum LiveOrderStatus { Prepared, Dispatching, AwaitingAcknowledgement, Working, PartiallyFilled, AwaitingConfirmation, Filled, Cancelled, Rejected, Replaced, Unknown }
+    public enum LiveOrderStatus { Prepared, Dispatching, AwaitingAcknowledgement, Working, PartiallyFilled, AwaitingConfirmation, Filled, Cancelled, Rejected, Replaced, Unknown, NotSent }
+    // Only a transport that has not entered RequestData may produce this proof.
+    // It contains no provider exception, credentials or request field values.
+    public sealed class LiveOrderNotSentException : InvalidOperationException {
+        internal LiveOrderNotSentException():base("주문 준비 또는 조건 확인 중 중단되어 증권사로 전송되지 않았습니다. 상태를 새로 확인하십시오."){}
+    }
 
     public sealed class LiveOrderIntent {
         public string ClientKey, Code, OriginalBrokerOrderNumber;
@@ -28,7 +33,45 @@ namespace ShinhanNativeTrader {
             Account=account;Password=password;
         }
     }
+    // Explicit user approval for one account in this process. This token says
+    // nothing about broker readiness; every submission still validates live data.
+    // No account number, password or activation state is serialized to disk.
+    public sealed class LiveTradingSession {
+        readonly object sync=new object();
+        readonly string salt=Guid.NewGuid().ToString("N");
+        string accountHash;DateTime? authorizedUtc,validUntilUtc,tradingDateKorea;bool active;
+        public bool Active {get{lock(sync)return active;}}
+        public DateTime? AuthorizedUtc {get{lock(sync)return authorizedUtc;}}
+        public DateTime? ValidUntilUtc {get{lock(sync)return validUntilUtc;}}
+        public DateTime? TradingDateKorea {get{lock(sync)return tradingDateKorea;}}
+        public void Authorize(string account,DateTime utc) {
+            LiveOrderSafety.RequireUtc(utc);
+            if(!ValidAccount(account))throw new ArgumentException("실주문 운영을 시작할 계좌번호를 확인하십시오.");
+            var hash=HashAccount(account);
+            var korea=MarketTime.ToKorea(utc);var sessionDate=korea.Date;
+            if(korea.TimeOfDay>=new TimeSpan(15,20,0))sessionDate=sessionDate.AddDays(1);
+            while(sessionDate.DayOfWeek==DayOfWeek.Saturday||sessionDate.DayOfWeek==DayOfWeek.Sunday)sessionDate=sessionDate.AddDays(1);
+            var expiry=DateTime.SpecifyKind(sessionDate.AddHours(15).AddMinutes(20).AddHours(-9),DateTimeKind.Utc);
+            lock(sync){accountHash=hash;authorizedUtc=utc;validUntilUtc=expiry;tradingDateKorea=sessionDate;active=true;}
+        }
+        public void Revoke(){lock(sync){active=false;accountHash=null;authorizedUtc=null;validUntilUtc=null;tradingDateKorea=null;}}
+        public bool MatchesAccount(string account) {
+            if(!ValidAccount(account))return false;
+            var hash=HashAccount(account);
+            lock(sync)return active&&accountHash==hash;
+        }
+        internal bool Allows(string account,DateTime utc) {
+            if(!ValidAccount(account))return false;
+            var hash=HashAccount(account);
+            lock(sync)return active&&accountHash==hash&&authorizedUtc.HasValue&&utc>=authorizedUtc.Value&&validUntilUtc.HasValue&&utc<validUntilUtc.Value
+                &&tradingDateKorea.HasValue&&MarketTime.ToKorea(utc).Date==tradingDateKorea.Value;
+        }
+        static bool ValidAccount(string account){return account!=null&&account.Length==11&&account.All(c=>c>='0'&&c<='9');}
+        string HashAccount(string account){using(var hash=SHA256.Create())return Convert.ToBase64String(hash.ComputeHash(Encoding.UTF8.GetBytes(salt+":"+account)));}
+    }
     public sealed class LiveOrderPreflight {
+        [XmlIgnore] public LiveTradingSession Authorization;
+        [XmlIgnore] public Func<bool> EvidenceStillCurrent;
         public bool AccountAuthorized, OrderableAmountVerified, SellableQuantityVerified, OrdersReconciled, FillsReconciled, RecoveryVerified, PriceRuleVerified, QuoteVerified,OriginalOrderVerified;
         public LiveOrderKind OriginalTradeKind;
         public decimal Cash100Orderable, CapacityAmount, OperatingLimit;
@@ -36,15 +79,19 @@ namespace ShinhanNativeTrader {
         public DateTime SnapshotUtc, QuoteUtc;
     }
     public static class LiveOrderSafety {
-        // Static extraction and fake/native COM tests do not establish a verified
-        // current broker contract. There is intentionally no UI/config override.
-        public static bool ProductionContractVerified {get{return false;}}
-        public const string BlockReason="실주문 잠금: 현재 주문 명세와 체결·미체결·주문가능금액·재시작 대사의 실서버 검증이 완료되지 않았습니다.";
-        public static void EnsureAllowed() {if(!ProductionContractVerified)throw new InvalidOperationException(BlockReason);}
+        public const string BlockReason="실주문 운영 중지: 이 계좌의 실주문 운영 시작 승인이 필요합니다.";
+        public static void EnsureAllowed(LiveOrderPreflight checks,LiveAccountCredentials credentials,DateTime utc) {
+            RequireUtc(utc);
+            if(checks==null||credentials==null||checks.Authorization==null||!checks.Authorization.Allows(credentials.Account,utc))
+                throw new InvalidOperationException(BlockReason);
+        }
         public static void ValidatePreflight(LiveOrderIntent intent,LiveOrderPreflight checks,DateTime utc,DateTime lastBrokerChangeUtc,decimal reservedBuyAmount=0) {
             LiveOrderProtocol.ValidateIntent(intent);RequireUtc(utc);
             if(checks==null||!checks.AccountAuthorized||!checks.OrdersReconciled||!checks.FillsReconciled||!checks.RecoveryVerified)
                 throw new InvalidOperationException("실계좌 승인 및 주문·체결·복구 대사가 필요합니다.");
+            bool current=false;
+            try{current=checks.EvidenceStillCurrent!=null&&checks.EvidenceStillCurrent();}catch{ /* Provider/runtime details must not escape a proof callback. */ }
+            if(!current)throw new InvalidOperationException("실계좌·시세 조회 증거가 변경됐거나 현재 상태를 확인할 수 없습니다. 재조회가 필요합니다.");
             RequireUtc(checks.SnapshotUtc);RequireUtc(checks.QuoteUtc);
             var korea=MarketTime.ToKorea(utc);
             bool session=intent.Kind==LiveOrderKind.Cancel?korea.DayOfWeek!=DayOfWeek.Saturday&&korea.DayOfWeek!=DayOfWeek.Sunday&&korea.TimeOfDay>=TimeSpan.FromHours(9)&&korea.TimeOfDay<new TimeSpan(15,30,0):Rules.ValidTime(korea);
@@ -81,6 +128,8 @@ namespace ShinhanNativeTrader {
         public static bool ValidBrokerNumber(string value) {
             return !string.IsNullOrEmpty(value)&&value.Length<=32&&value.All(c=>c>='0'&&c<='9')&&value.Any(c=>c!='0');
         }
+        public static string BrokerNumberKey(string value){return ValidBrokerNumber(value)?value.TrimStart('0'):null;}
+        public static bool BrokerNumbersEqual(string first,string second){var key=BrokerNumberKey(first);return key!=null&&key==BrokerNumberKey(second);}
         public static string QueryName(LiveOrderIntent intent) {ValidateIntent(intent);return intent.Kind==LiveOrderKind.Buy||intent.Kind==LiveOrderKind.Sell?"SABA101U1":"SABA102U1";}
         public static SortedDictionary<int,string> BuildFields(LiveOrderIntent intent,LiveAccountCredentials credentials) {
             ValidateIntent(intent);if(credentials==null)throw new ArgumentNullException("credentials");
@@ -91,16 +140,16 @@ namespace ShinhanNativeTrader {
                 {8,"A"+intent.Code},{9,intent.Quantity.ToString(CultureInfo.InvariantCulture)},{10,intent.LimitPrice.ToString(CultureInfo.InvariantCulture)},
                 {11,"1"},{12,"2"},{13,"0"},{14,original?"":"0"},{15,""},{16,original?intent.OriginalBrokerOrderNumber:""}
             };
-            // Full XTR/Helper defaults differ at13 and17..35; they are not silently
-            // invented here. The production contract gate remains blocked until
-            // current documentation and program-trade classification are verified.
+            // Only documented regular cash-limit inputs are emitted. Additional
+            // XTR defaults and current market routing require broker validation;
+            // authorization is not a claim that static metadata proves live behavior.
             if(!original)result[21]="Y";
             return result;
         }
     }
 
     public sealed class LiveOrderRecord {
-        public string Id,ClientKey,Code,BrokerOrderNumber,OriginalBrokerOrderNumber,TradingDate;
+        public string Id,ClientKey,OriginalClientKey,Code,BrokerOrderNumber,OriginalBrokerOrderNumber,TradingDate;
         public LiveOrderKind Kind,TradeKind;
         public LiveOrderStatus Status;
         public int Quantity,FilledQuantity,CancelledQuantity;
@@ -152,7 +201,7 @@ namespace ShinhanNativeTrader {
         public bool StorageFault {get{return storageFault;}}
         public decimal ReservedBuyAmount {get{lock(sync){CheckUsable();return state.Orders.Where(o=>IsUnresolved(o)&&o.TradeKind==LiveOrderKind.Buy&&o.Kind!=LiveOrderKind.Cancel)
             .Sum(o=>o.Kind==LiveOrderKind.Amend&&o.Status!=LiveOrderStatus.Working&&o.Status!=LiveOrderStatus.PartiallyFilled&&o.Status!=LiveOrderStatus.Unknown
-                ?Math.Max(0,Remaining(o)*o.LimitPrice-state.Orders.Where(p=>p.BrokerOrderNumber==o.OriginalBrokerOrderNumber&&IsUnresolved(p)).Sum(p=>Remaining(p)*p.LimitPrice))
+                ?Math.Max(0,Remaining(o)*o.LimitPrice-state.Orders.Where(p=>p.TradingDate==o.TradingDate&&LiveOrderProtocol.BrokerNumbersEqual(p.BrokerOrderNumber,o.OriginalBrokerOrderNumber)&&IsUnresolved(p)).Sum(p=>Remaining(p)*p.LimitPrice))
                 :Remaining(o)*o.LimitPrice);}}}
         public void BindAccount(string account) {
             if(account==null||account.Length!=11||account.Any(c=>c<'0'||c>'9'))throw new ArgumentException("실계좌번호 형식을 확인하십시오.");
@@ -164,7 +213,7 @@ namespace ShinhanNativeTrader {
             });
         }
         public static bool IsUnresolved(LiveOrderRecord order) {
-            return order.Status!=LiveOrderStatus.Filled&&order.Status!=LiveOrderStatus.Cancelled&&order.Status!=LiveOrderStatus.Rejected&&order.Status!=LiveOrderStatus.Replaced;
+            return order.Status!=LiveOrderStatus.Filled&&order.Status!=LiveOrderStatus.Cancelled&&order.Status!=LiveOrderStatus.Rejected&&order.Status!=LiveOrderStatus.Replaced&&order.Status!=LiveOrderStatus.NotSent;
         }
         public LiveOrderRecord Prepare(LiveOrderIntent intent,DateTime utc) {
             LiveOrderProtocol.ValidateIntent(intent);LiveOrderSafety.RequireUtc(utc);string id=Guid.NewGuid().ToString("N");
@@ -179,7 +228,7 @@ namespace ShinhanNativeTrader {
                     if(original.Code!=intent.Code||!IsWorking(original)||intent.Quantity>Remaining(original))throw new InvalidOperationException("원주문의 종목·미체결 수량·상태 검증 실패.");
                     if(intent.Kind==LiveOrderKind.Amend&&intent.Quantity!=Remaining(original))throw new InvalidOperationException("현재 정정 코드는 원주문 잔여 전량 정정만 지원합니다.");
                     tradeKind=original.TradeKind;
-                    if(copy.Orders.Any(o=>o.OriginalBrokerOrderNumber==original.BrokerOrderNumber&&IsUnresolved(o)))throw new InvalidOperationException("원주문의 정정·취소가 이미 진행 중입니다.");
+                    if(copy.Orders.Any(o=>o.TradingDate==original.TradingDate&&LiveOrderProtocol.BrokerNumbersEqual(o.OriginalBrokerOrderNumber,original.BrokerOrderNumber)&&IsUnresolved(o)))throw new InvalidOperationException("원주문의 정정·취소가 이미 진행 중입니다.");
                 }
                 copy.Orders.Add(new LiveOrderRecord{Id=id,ClientKey=intent.ClientKey,Code=intent.Code,Kind=intent.Kind,TradeKind=tradeKind,TradingDate=TradeDate(utc),
                     OriginalBrokerOrderNumber=intent.OriginalBrokerOrderNumber,Quantity=intent.Quantity,LimitPrice=intent.LimitPrice,
@@ -192,6 +241,24 @@ namespace ShinhanNativeTrader {
             Update(id,utc,order=>{if(order.Status!=LiveOrderStatus.Dispatching)throw new InvalidOperationException("주문 전송 상태가 아닙니다.");order.RequestId=requestId;order.Status=LiveOrderStatus.AwaitingAcknowledgement;});
         }
         public void MarkUnknown(string id,DateTime utc){Update(id,utc,order=>{if(IsUnresolved(order))order.Status=LiveOrderStatus.Unknown;});}
+        internal void RecordNotSent(string id,DateTime utc) {
+            Update(id,utc,order=>{
+                if((order.Status!=LiveOrderStatus.Dispatching&&order.Status!=LiveOrderStatus.Prepared)||order.RequestId.HasValue||!string.IsNullOrEmpty(order.BrokerOrderNumber)
+                    ||order.FilledQuantity!=0||order.CancelledQuantity!=0)throw new InvalidOperationException("전송되지 않았다는 증명이 현재 주문 상태와 일치하지 않습니다.");
+                order.OriginalClientKey=order.ClientKey;
+                // Keep a durable audit record without consuming the strategy key.
+                // Only this proven pre-RequestData state can free that original key.
+                order.ClientKey="not-sent/"+order.Id;order.Status=LiveOrderStatus.NotSent;
+            });
+        }
+        public void MarkBrokerEvidenceUnknown(string id,DateTime utc) {
+            Update(id,utc,order=>{
+                if(!LiveOrderProtocol.ValidBrokerNumber(order.BrokerOrderNumber))throw new InvalidOperationException("증권사 주문번호와 일치하는 상충 증거가 필요합니다.");
+                // Contradictory broker facts invalidate even a previously terminal
+                // order. They cannot be dismissed merely because local state closed.
+                order.Status=LiveOrderStatus.Unknown;
+            },true);
+        }
         public void RecordAcknowledgement(string id,int requestId,string brokerOrderNumber,bool providerError,DateTime utc) {
             Update(id,utc,order=>{
                 if(order.Status!=LiveOrderStatus.AwaitingAcknowledgement||order.RequestId!=requestId)throw new InvalidOperationException("주문 접수 응답의 요청번호가 다릅니다.");
@@ -200,7 +267,7 @@ namespace ShinhanNativeTrader {
                 bool zero=!string.IsNullOrEmpty(brokerOrderNumber)&&brokerOrderNumber.All(c=>c=='0');
                 if(providerError&&!positive||zero){order.Status=LiveOrderStatus.Rejected;return;}
                 if(!positive){order.Status=LiveOrderStatus.Unknown;return;}
-                if(state.Orders.Any(o=>o.Id!=id&&o.TradingDate==order.TradingDate&&o.BrokerOrderNumber==brokerOrderNumber))throw new InvalidOperationException("증권사 주문번호가 중복됐습니다.");
+                if(state.Orders.Any(o=>o.Id!=id&&o.TradingDate==order.TradingDate&&LiveOrderProtocol.BrokerNumbersEqual(o.BrokerOrderNumber,brokerOrderNumber)))throw new InvalidOperationException("증권사 주문번호가 중복됐습니다.");
                 order.BrokerOrderNumber=brokerOrderNumber;
                 order.Status=providerError?LiveOrderStatus.Unknown:order.Kind==LiveOrderKind.Amend||order.Kind==LiveOrderKind.Cancel?LiveOrderStatus.AwaitingConfirmation:LiveOrderStatus.Working;
             },true);
@@ -217,10 +284,10 @@ namespace ShinhanNativeTrader {
             bool applied=false;
             Change(copy=>{
                 var order=recovery?Find(copy,orderId):FindBroker(copy,brokerOrderNumber,TradeDate(utc));
-                if(order.BrokerOrderNumber!=brokerOrderNumber||!LiveOrderProtocol.ValidBrokerNumber(brokerOrderNumber))throw new InvalidOperationException("복구 체결의 증권사 주문번호가 일치하지 않습니다.");
+                if(!LiveOrderProtocol.BrokerNumbersEqual(order.BrokerOrderNumber,brokerOrderNumber))throw new InvalidOperationException("복구 체결의 증권사 주문번호가 일치하지 않습니다.");
                 var previous=copy.Executions.SingleOrDefault(f=>f.OrderId==order.Id&&f.ExecutionId==executionId);
                 if(previous!=null) {
-                    if(previous.BrokerOrderNumber!=brokerOrderNumber||previous.Quantity!=quantity||previous.Price!=price)throw new InvalidOperationException("동일 체결번호의 내용이 다릅니다.");
+                    if(!LiveOrderProtocol.BrokerNumbersEqual(previous.BrokerOrderNumber,brokerOrderNumber)||previous.Quantity!=quantity||previous.Price!=price)throw new InvalidOperationException("동일 체결번호의 내용이 다릅니다.");
                     return;
                 }
                 if(order.Kind==LiveOrderKind.Cancel||order.Kind==LiveOrderKind.Amend&&order.Status==LiveOrderStatus.AwaitingConfirmation)throw new InvalidOperationException("미확인 정정·취소 요청 자체를 체결로 처리할 수 없습니다.");
@@ -229,18 +296,18 @@ namespace ShinhanNativeTrader {
                     throw new InvalidOperationException("체결의 수량·지정가·주문 상태 검증 실패.");
                 order.FilledQuantity+=quantity;order.UpdatedUtc=utc;
                 order.Status=recovery?LiveOrderStatus.Unknown:Remaining(order)==0?(order.CancelledQuantity>0?LiveOrderStatus.Cancelled:LiveOrderStatus.Filled):LiveOrderStatus.PartiallyFilled;
-                copy.Executions.Add(new LiveExecutionRecord{ExecutionId=executionId,OrderId=order.Id,BrokerOrderNumber=brokerOrderNumber,TradingDate=order.TradingDate,Quantity=quantity,Price=price,ExecutedUtc=utc});
+                copy.Executions.Add(new LiveExecutionRecord{ExecutionId=executionId,OrderId=order.Id,BrokerOrderNumber=order.BrokerOrderNumber,TradingDate=order.TradingDate,Quantity=quantity,Price=price,ExecutedUtc=utc});
                 BrokerChanged(copy,utc);applied=true;
             });return applied;
         }
         public void ConfirmCancellation(string originalBrokerNumber,string cancellationBrokerNumber,string confirmationId,int cancelledQuantity,DateTime utc) {
             LiveOrderSafety.RequireUtc(utc);if(string.IsNullOrWhiteSpace(confirmationId)||cancelledQuantity<=0)throw new ArgumentException("증권사 취소확인 식별자와 취소수량이 필요합니다.");
             Change(copy=>{
-                var key=TradeDate(utc)+"|"+cancellationBrokerNumber+"|"+confirmationId+"|"+cancelledQuantity.ToString(CultureInfo.InvariantCulture);
+                var key=TradeDate(utc)+"|"+LiveOrderProtocol.BrokerNumberKey(cancellationBrokerNumber)+"|"+confirmationId+"|"+cancelledQuantity.ToString(CultureInfo.InvariantCulture);
                 if(copy.ConfirmationIds.Contains(key))return;
-                if(copy.ConfirmationIds.Any(k=>k.StartsWith(TradeDate(utc)+"|"+cancellationBrokerNumber+"|"+confirmationId+"|",StringComparison.Ordinal)))throw new InvalidOperationException("동일 취소확인 식별자의 내용이 다릅니다.");
+                if(copy.ConfirmationIds.Any(k=>k.StartsWith(TradeDate(utc)+"|"+LiveOrderProtocol.BrokerNumberKey(cancellationBrokerNumber)+"|"+confirmationId+"|",StringComparison.Ordinal)))throw new InvalidOperationException("동일 취소확인 식별자의 내용이 다릅니다.");
                 var original=FindBroker(copy,originalBrokerNumber,TradeDate(utc));var cancellation=FindBroker(copy,cancellationBrokerNumber,TradeDate(utc));
-                if(cancellation.Kind!=LiveOrderKind.Cancel||cancellation.OriginalBrokerOrderNumber!=originalBrokerNumber
+                if(cancellation.Kind!=LiveOrderKind.Cancel||!LiveOrderProtocol.BrokerNumbersEqual(cancellation.OriginalBrokerOrderNumber,originalBrokerNumber)
                     ||cancellation.Status!=LiveOrderStatus.AwaitingConfirmation||!IsWorking(original)||cancelledQuantity>Remaining(original)||cancelledQuantity>cancellation.Quantity||utc<cancellation.CreatedUtc||utc<original.CreatedUtc)
                     throw new InvalidOperationException("증권사 취소확인과 원주문이 일치하지 않습니다.");
                 original.CancelledQuantity+=cancelledQuantity;original.UpdatedUtc=utc;
@@ -252,16 +319,32 @@ namespace ShinhanNativeTrader {
         public void ConfirmAmendment(string originalBrokerNumber,string amendmentBrokerNumber,string confirmationId,int remainingQuantity,decimal limitPrice,DateTime utc) {
             LiveOrderSafety.RequireUtc(utc);if(string.IsNullOrWhiteSpace(confirmationId)||remainingQuantity<=0||limitPrice<=0)throw new ArgumentException("증권사 정정확인 값이 필요합니다.");
             Change(copy=>{
-                var key=TradeDate(utc)+"|"+amendmentBrokerNumber+"|"+confirmationId+"|"+remainingQuantity.ToString(CultureInfo.InvariantCulture)+"|"+limitPrice.ToString(CultureInfo.InvariantCulture);
+                var key=TradeDate(utc)+"|"+LiveOrderProtocol.BrokerNumberKey(amendmentBrokerNumber)+"|"+confirmationId+"|"+remainingQuantity.ToString(CultureInfo.InvariantCulture)+"|"+limitPrice.ToString(CultureInfo.InvariantCulture);
                 if(copy.ConfirmationIds.Contains(key))return;
-                if(copy.ConfirmationIds.Any(k=>k.StartsWith(TradeDate(utc)+"|"+amendmentBrokerNumber+"|"+confirmationId+"|",StringComparison.Ordinal)))throw new InvalidOperationException("동일 정정확인 식별자의 내용이 다릅니다.");
+                if(copy.ConfirmationIds.Any(k=>k.StartsWith(TradeDate(utc)+"|"+LiveOrderProtocol.BrokerNumberKey(amendmentBrokerNumber)+"|"+confirmationId+"|",StringComparison.Ordinal)))throw new InvalidOperationException("동일 정정확인 식별자의 내용이 다릅니다.");
                 var original=FindBroker(copy,originalBrokerNumber,TradeDate(utc));var amendment=FindBroker(copy,amendmentBrokerNumber,TradeDate(utc));
-                if(amendment.Kind!=LiveOrderKind.Amend||amendment.OriginalBrokerOrderNumber!=originalBrokerNumber||amendment.Status!=LiveOrderStatus.AwaitingConfirmation
+                if(amendment.Kind!=LiveOrderKind.Amend||!LiveOrderProtocol.BrokerNumbersEqual(amendment.OriginalBrokerOrderNumber,originalBrokerNumber)||amendment.Status!=LiveOrderStatus.AwaitingConfirmation
                     ||!IsWorking(original)||remainingQuantity!=Remaining(original)||remainingQuantity!=amendment.Quantity||limitPrice!=amendment.LimitPrice||utc<amendment.CreatedUtc||utc<original.CreatedUtc)
                     throw new InvalidOperationException("증권사 정정확인과 원주문이 일치하지 않습니다. 추가 대사가 필요합니다.");
                 original.Status=LiveOrderStatus.Replaced;original.UpdatedUtc=utc;
                 amendment.Status=LiveOrderStatus.Working;amendment.UpdatedUtc=utc;
                 copy.ConfirmationIds.Add(key);BrokerChanged(copy,utc);
+            });
+        }
+        public void RecordBrokerRejection(string brokerOrderNumber,string tradingDate,string eventKind,DateTime utc) {
+            LiveOrderSafety.RequireUtc(utc);
+            if(eventKind!="09"&&eventKind!="19"&&eventKind!="98"&&eventKind!="99")throw new ArgumentException("명시적인 증권사 주문 거부 이벤트가 필요합니다.");
+            Change(copy=>{
+                var order=FindBroker(copy,brokerOrderNumber,tradingDate);
+                bool isNew=order.Kind==LiveOrderKind.Buy||order.Kind==LiveOrderKind.Sell;
+                if(isNew!=(eventKind=="09"||eventKind=="19")||utc<order.CreatedUtc||order.FilledQuantity!=0)
+                    throw new InvalidOperationException("주문 거부 이벤트와 주문 종류·체결 기록이 상충합니다.");
+                if(order.Status==LiveOrderStatus.Rejected)return;
+                if(order.Status==LiveOrderStatus.Filled||order.Status==LiveOrderStatus.Cancelled||order.Status==LiveOrderStatus.Replaced)
+                    throw new InvalidOperationException("종료된 주문과 거부 이벤트가 상충합니다.");
+                order.Status=LiveOrderStatus.Rejected;order.UpdatedUtc=utc;BrokerChanged(copy,utc);
+                // Only the rejected command closes. In particular a rejected
+                // cancellation/amendment never releases the original order.
             });
         }
         // Recovery consumes an authoritative order snapshot; it cannot invent fills.
@@ -279,11 +362,11 @@ namespace ShinhanNativeTrader {
                 if(order.Status!=LiveOrderStatus.Unknown||string.IsNullOrEmpty(copy.AccountFingerprint)||copy.AccountFingerprint!=evidence.AccountFingerprint
                     ||!LiveOrderProtocol.ValidBrokerNumber(evidence.BrokerOrderNumber)||order.TradingDate!=evidence.TradingDate||order.Code!=evidence.Code
                     ||order.Kind!=evidence.Kind||order.TradeKind!=evidence.TradeKind||order.Quantity!=evidence.Quantity||order.LimitPrice!=evidence.LimitPrice
-                    ||(order.OriginalBrokerOrderNumber??"")!=(evidence.OriginalBrokerOrderNumber??"")||utc<order.CreatedUtc
-                    ||(!string.IsNullOrEmpty(order.BrokerOrderNumber)&&order.BrokerOrderNumber!=evidence.BrokerOrderNumber)
-                    ||copy.Orders.Any(o=>o.Id!=id&&o.TradingDate==order.TradingDate&&o.BrokerOrderNumber==evidence.BrokerOrderNumber))
+                    ||((!string.IsNullOrEmpty(order.OriginalBrokerOrderNumber)||!string.IsNullOrEmpty(evidence.OriginalBrokerOrderNumber))&&!LiveOrderProtocol.BrokerNumbersEqual(order.OriginalBrokerOrderNumber,evidence.OriginalBrokerOrderNumber))||utc<order.CreatedUtc
+                    ||(!string.IsNullOrEmpty(order.BrokerOrderNumber)&&!LiveOrderProtocol.BrokerNumbersEqual(order.BrokerOrderNumber,evidence.BrokerOrderNumber))
+                    ||copy.Orders.Any(o=>o.Id!=id&&o.TradingDate==order.TradingDate&&LiveOrderProtocol.BrokerNumbersEqual(o.BrokerOrderNumber,evidence.BrokerOrderNumber)))
                     throw new InvalidOperationException("복구 주문의 계좌·거래일·종목·방향·수량·가격이 일치하지 않습니다.");
-                order.BrokerOrderNumber=evidence.BrokerOrderNumber;order.UpdatedUtc=utc;BrokerChanged(copy,utc);
+                if(string.IsNullOrEmpty(order.BrokerOrderNumber))order.BrokerOrderNumber=evidence.BrokerOrderNumber;order.UpdatedUtc=utc;BrokerChanged(copy,utc);
             });
         }
         public void ReconcileWorking(string id,string brokerNumber,int ordered,int filled,int open,DateTime utc,string tradingDate=null) {
@@ -293,8 +376,9 @@ namespace ShinhanNativeTrader {
                 if(order.Status!=LiveOrderStatus.Unknown||order.TradingDate!=(tradingDate??TradeDate(utc))||!LiveOrderProtocol.ValidBrokerNumber(brokerNumber)||ordered!=order.Quantity
                     ||filled!=order.FilledQuantity||filled<0||open<0||filled+open+order.CancelledQuantity!=order.Quantity
                     ||order.Kind==LiveOrderKind.Cancel||order.Kind==LiveOrderKind.Amend&&string.IsNullOrEmpty(order.BrokerOrderNumber))throw new InvalidOperationException("재시작 주문과 증권사 체결·미체결 대사가 일치하지 않습니다.");
-                if(copy.Orders.Any(o=>o.Id!=id&&o.TradingDate==order.TradingDate&&o.BrokerOrderNumber==brokerNumber))throw new InvalidOperationException("증권사 주문번호가 중복됐습니다.");
-                order.BrokerOrderNumber=brokerNumber;order.UpdatedUtc=utc;
+                if(copy.Orders.Any(o=>o.Id!=id&&o.TradingDate==order.TradingDate&&LiveOrderProtocol.BrokerNumbersEqual(o.BrokerOrderNumber,brokerNumber))
+                    ||!string.IsNullOrEmpty(order.BrokerOrderNumber)&&!LiveOrderProtocol.BrokerNumbersEqual(order.BrokerOrderNumber,brokerNumber))throw new InvalidOperationException("증권사 주문번호가 중복되거나 기존 기록과 다릅니다.");
+                if(string.IsNullOrEmpty(order.BrokerOrderNumber))order.BrokerOrderNumber=brokerNumber;order.UpdatedUtc=utc;
                 order.Status=open==0?(order.CancelledQuantity>0?LiveOrderStatus.Cancelled:LiveOrderStatus.Filled):(filled>0?LiveOrderStatus.PartiallyFilled:LiveOrderStatus.Working);
                 BrokerChanged(copy,utc);
             });
@@ -304,7 +388,7 @@ namespace ShinhanNativeTrader {
         static LiveOrderRecord Find(LiveOrderJournalState copy,string id){var order=copy.Orders.SingleOrDefault(o=>o.Id==id);if(order==null)throw new InvalidOperationException("실계좌 주문 기록을 찾을 수 없습니다.");return order;}
         static string TradeDate(DateTime utc){return MarketTime.ToKorea(utc).ToString("yyyyMMdd",CultureInfo.InvariantCulture);}
         static void BrokerChanged(LiveOrderJournalState copy,DateTime utc){if(utc>copy.LastBrokerChangeUtc)copy.LastBrokerChangeUtc=utc;}
-        static LiveOrderRecord FindBroker(LiveOrderJournalState copy,string number,string tradingDate){if(!LiveOrderProtocol.ValidBrokerNumber(number))throw new InvalidOperationException("증권사 주문번호가 필요합니다.");var order=copy.Orders.SingleOrDefault(o=>o.BrokerOrderNumber==number&&o.TradingDate==tradingDate);if(order==null)throw new InvalidOperationException("증권사 주문·거래일과 로컬 기록이 일치하지 않습니다.");return order;}
+        static LiveOrderRecord FindBroker(LiveOrderJournalState copy,string number,string tradingDate){if(!LiveOrderProtocol.ValidBrokerNumber(number))throw new InvalidOperationException("증권사 주문번호가 필요합니다.");var order=copy.Orders.SingleOrDefault(o=>LiveOrderProtocol.BrokerNumbersEqual(o.BrokerOrderNumber,number)&&o.TradingDate==tradingDate);if(order==null)throw new InvalidOperationException("증권사 주문·거래일과 로컬 기록이 일치하지 않습니다.");return order;}
         void Update(string id,DateTime utc,Action<LiveOrderRecord> action,bool brokerChange=false) {
             LiveOrderSafety.RequireUtc(utc);Change(copy=>{var order=Find(copy,id);if(utc<order.CreatedUtc)throw new InvalidOperationException("주문 전 시각의 이벤트입니다.");action(order);order.UpdatedUtc=utc;if(brokerChange)BrokerChanged(copy,utc);});
         }
@@ -321,12 +405,12 @@ namespace ShinhanNativeTrader {
         static void Validate(LiveOrderJournalState value) {
             if(value==null||value.Version!=1||value.Mode!="RealAccount"||string.IsNullOrEmpty(value.AccountSalt)||value.Orders==null||value.Executions==null||value.ConfirmationIds==null||value.LastBrokerChangeUtc.Kind!=DateTimeKind.Utc)
                 throw new InvalidDataException("손상되거나 지원하지 않는 실주문 기록입니다.");
-            if(value.Orders.Any(o=>o==null||string.IsNullOrWhiteSpace(o.Id)||string.IsNullOrWhiteSpace(o.ClientKey)||string.IsNullOrEmpty(o.Code)||Rules.Code(o.Code)!=o.Code
+            if(value.Orders.Any(o=>o==null||string.IsNullOrWhiteSpace(o.Id)||o.Id.Length>64||string.IsNullOrWhiteSpace(o.ClientKey)||o.ClientKey.Length>128||string.IsNullOrEmpty(o.Code)||Rules.Code(o.Code)!=o.Code
                 ||o.Quantity<=0||o.Quantity>1000000||o.LimitPrice<=0||o.FilledQuantity<0||o.CancelledQuantity<0||Remaining(o)<0||o.CreatedUtc.Kind!=DateTimeKind.Utc||o.UpdatedUtc.Kind!=DateTimeKind.Utc||o.UpdatedUtc<o.CreatedUtc||o.TradingDate!=TradeDate(o.CreatedUtc)
                 ||!Enum.IsDefined(typeof(LiveOrderKind),o.Kind)||(o.TradeKind!=LiveOrderKind.Buy&&o.TradeKind!=LiveOrderKind.Sell)||!Enum.IsDefined(typeof(LiveOrderStatus),o.Status)||(!string.IsNullOrEmpty(o.BrokerOrderNumber)&&!LiveOrderProtocol.ValidBrokerNumber(o.BrokerOrderNumber))))
                 throw new InvalidDataException("손상된 실주문 항목입니다.");
             if(value.Orders.GroupBy(o=>o.Id).Any(g=>g.Count()>1)||value.Orders.GroupBy(o=>o.ClientKey).Any(g=>g.Count()>1)
-                ||value.Orders.Where(o=>!string.IsNullOrEmpty(o.BrokerOrderNumber)).GroupBy(o=>o.TradingDate+":"+o.BrokerOrderNumber).Any(g=>g.Count()>1)
+                ||value.Orders.Where(o=>!string.IsNullOrEmpty(o.BrokerOrderNumber)).GroupBy(o=>o.TradingDate+":"+LiveOrderProtocol.BrokerNumberKey(o.BrokerOrderNumber)).Any(g=>g.Count()>1)
                 ||value.Executions.GroupBy(f=>f.OrderId+":"+f.ExecutionId).Any(g=>g.Count()>1)||value.ConfirmationIds.Distinct().Count()!=value.ConfirmationIds.Count)
                 throw new InvalidDataException("중복 실주문·체결 식별자입니다.");
             if(value.Executions.Any(f=>f==null||string.IsNullOrWhiteSpace(f.ExecutionId)||f.Quantity<=0||f.Price<=0||f.ExecutedUtc.Kind!=DateTimeKind.Utc
@@ -339,6 +423,10 @@ namespace ShinhanNativeTrader {
                     ||(order.Status==LiveOrderStatus.AwaitingAcknowledgement&&(!order.RequestId.HasValue||order.RequestId.Value<=0))
                     ||((order.Status==LiveOrderStatus.Working||order.Status==LiveOrderStatus.PartiallyFilled||order.Status==LiveOrderStatus.Filled||order.Status==LiveOrderStatus.AwaitingConfirmation)&&!LiveOrderProtocol.ValidBrokerNumber(order.BrokerOrderNumber)))
                     throw new InvalidDataException("실주문과 체결 기록 합계가 다릅니다.");
+                if(order.Status==LiveOrderStatus.NotSent&&(order.ClientKey!="not-sent/"+order.Id||string.IsNullOrWhiteSpace(order.OriginalClientKey)||order.OriginalClientKey.Length>128
+                    ||order.RequestId.HasValue||!string.IsNullOrEmpty(order.BrokerOrderNumber)||order.FilledQuantity!=0||order.CancelledQuantity!=0)
+                    ||order.Status!=LiveOrderStatus.NotSent&&!string.IsNullOrEmpty(order.OriginalClientKey))
+                    throw new InvalidDataException("전송 전 중단 기록과 원래 전략 키의 감사 이력이 다릅니다.");
             }
         }
         public void Dispose(){lock(sync){if(disposed)return;disposed=true;lease.Dispose();}}
@@ -369,15 +457,26 @@ namespace ShinhanNativeTrader {
             try{subscriptions.AddInt32Callback(source.DispIds["ReceiveData"],source.ArgumentTypes["ReceiveData"],OnData);}catch{subscriptions.Dispose();throw;}
         }
         public int Send(LiveOrderIntent intent,LiveAccountCredentials credentials,LiveOrderPreflight checks,DateTime utc) {
-            LiveOrderSafety.EnsureAllowed();LiveOrderSafety.ValidatePreflight(intent,checks,utc,DateTime.SpecifyKind(DateTime.MinValue,DateTimeKind.Utc));
-            if(disposed)throw new ObjectDisposedException("ComLiveOrderWire");if(Thread.CurrentThread.ManagedThreadId!=ownerThread||busy)throw new InvalidOperationException("Indi order control is busy or outside its owning STA.");
-            busy=true;pendingId=null;early.Clear();
+            bool enteredRequestData=false,ownsPending=false;
             try {
+                LiveOrderSafety.EnsureAllowed(checks,credentials,utc);LiveOrderSafety.ValidatePreflight(intent,checks,utc,DateTime.SpecifyKind(DateTime.MinValue,DateTimeKind.Utc));
+                if(disposed)throw new ObjectDisposedException("ComLiveOrderWire");if(Thread.CurrentThread.ManagedThreadId!=ownerThread||busy)throw new InvalidOperationException("Indi order control is busy or outside its owning STA.");
+                busy=true;ownsPending=true;pendingId=null;early.Clear();
                 var query=LiveOrderProtocol.QueryName(intent);if(!dispatch.SetQueryName(query)||!string.Equals(Convert.ToString(dispatch.GetQueryName(),CultureInfo.InvariantCulture),query,StringComparison.OrdinalIgnoreCase))throw new InvalidOperationException("Indi order query selection failed.");
                 foreach(var field in LiveOrderProtocol.BuildFields(intent,credentials))if(!dispatch.SetSingleData(checked((short)field.Key),field.Value))throw new InvalidOperationException("Indi order input failed.");
+                // COM calls may pump the UI. A user stop/account change during
+                // input preparation must revoke permission before the side effect.
+                var dispatchUtc=DateTime.UtcNow;
+                LiveOrderSafety.EnsureAllowed(checks,credentials,dispatchUtc);
+                LiveOrderSafety.ValidatePreflight(intent,checks,dispatchUtc,DateTime.SpecifyKind(DateTime.MinValue,DateTimeKind.Utc));
+                enteredRequestData=true;
                 int id=dispatch.RequestData();if(id<=0)throw new InvalidOperationException("Indi order submission did not return an accepted request ID.");
                 pendingId=id;var match=early.FirstOrDefault(a=>a.RequestId==id);early.Clear();if(match!=null)Emit(match);return id;
-            }catch{busy=false;pendingId=null;early.Clear();throw;}
+            }catch{
+                if(ownsPending){busy=false;pendingId=null;early.Clear();}
+                if(!enteredRequestData)throw new LiveOrderNotSentException();
+                throw new InvalidOperationException("실주문 요청 실행 이후 응답을 확인할 수 없습니다. 증권사 주문·체결 대사가 필요합니다.");
+            }
         }
         void OnData(int id) {
             if(disposed||!busy||Thread.CurrentThread.ManagedThreadId!=ownerThread)return;
@@ -392,14 +491,15 @@ namespace ShinhanNativeTrader {
     }
     public sealed class LiveOrderGateway : IDisposable {
         readonly LiveOrderJournal journal;readonly ILiveOrderWire wire;readonly Func<DateTime> clock;
-        readonly List<LiveOrderAcknowledgement> early=new List<LiveOrderAcknowledgement>();string pendingOrder;int? pendingRequest;DateTime? pendingSince;bool disposed;
+        readonly List<LiveOrderAcknowledgement> early=new List<LiveOrderAcknowledgement>();string pendingOrder;int? pendingRequest;DateTime? pendingSince;bool disposed,invalidating;
         public bool Busy {get{return pendingOrder!=null;}}
+        public event Action<LiveOrderRecord> OrderChanged;
         public LiveOrderGateway(LiveOrderJournal journal,ILiveOrderWire wire,Func<DateTime> utcNow=null) {
             if(journal==null||wire==null)throw new ArgumentNullException("Live-order journal and wire are required.");
             this.journal=journal;this.wire=wire;clock=utcNow??(()=>DateTime.UtcNow);wire.Acknowledged+=OnAcknowledged;
         }
         public LiveOrderRecord Submit(LiveOrderIntent intent,LiveAccountCredentials credentials,LiveOrderPreflight checks,DateTime utc) {
-            if(disposed)throw new ObjectDisposedException("LiveOrderGateway");LiveOrderSafety.EnsureAllowed();
+            if(disposed)throw new ObjectDisposedException("LiveOrderGateway");LiveOrderSafety.EnsureAllowed(checks,credentials,utc);
             if(credentials==null)throw new ArgumentNullException("credentials");
             // The operating limit is independent of broker cash/capacity. Preserve
             // outstanding buy exposure across different symbols and through cancel
@@ -407,39 +507,78 @@ namespace ShinhanNativeTrader {
             // until authoritative replacement confirmation; no optimistic release.
             LiveOrderSafety.ValidatePreflight(intent,checks,utc,journal.Snapshot.LastBrokerChangeUtc,journal.ReservedBuyAmount);
             if(intent.Kind==LiveOrderKind.Amend||intent.Kind==LiveOrderKind.Cancel) {
-                var original=journal.Snapshot.Orders.SingleOrDefault(o=>o.BrokerOrderNumber==intent.OriginalBrokerOrderNumber&&o.TradingDate==MarketTime.ToKorea(utc).ToString("yyyyMMdd",CultureInfo.InvariantCulture));
+                var original=journal.Snapshot.Orders.SingleOrDefault(o=>LiveOrderProtocol.BrokerNumbersEqual(o.BrokerOrderNumber,intent.OriginalBrokerOrderNumber)&&o.TradingDate==MarketTime.ToKorea(utc).ToString("yyyyMMdd",CultureInfo.InvariantCulture));
                 if(original==null||original.TradeKind!=checks.OriginalTradeKind)throw new InvalidOperationException("정정·취소 원주문의 방향과 실계좌 대사가 일치하지 않습니다.");
             }
             if(journal.RecoveryRequired||pendingOrder!=null)throw new InvalidOperationException("불명 주문 대사 또는 진행 중 주문 확인이 필요합니다.");
             journal.BindAccount(credentials.Account);
             var order=journal.Prepare(intent,utc);pendingOrder=order.Id;pendingRequest=null;pendingSince=utc;early.Clear();
-            // Durable Dispatching precedes the external side effect. Any exception
-            // after this point is Unknown, never proof of broker rejection.
+            // Durable Dispatching precedes the external side effect. Only the
+            // wire's proven pre-entry refusal can establish NotSent; other
+            // exceptions leave the request Unknown, never broker-rejected.
             journal.MarkDispatching(order.Id,utc);
+            bool wireReturned=false;
             try {
-                var id=wire.Send(intent,credentials,checks,utc);journal.MarkRequestAccepted(order.Id,id,clock());pendingRequest=id;
+                var id=wire.Send(intent,credentials,checks,utc);wireReturned=true;journal.MarkRequestAccepted(order.Id,id,clock());pendingRequest=id;
                 var match=early.FirstOrDefault(a=>a.RequestId==id);early.Clear();if(match!=null)OnAcknowledged(match);
                 return journal.Snapshot.Orders.Single(o=>o.Id==order.Id);
+            }catch(LiveOrderNotSentException){
+                // A typed refusal is proof only while the wire has not returned
+                // from submission. Never reclassify a post-entry/returned request.
+                if(wireReturned) {
+                    try{journal.MarkUnknown(order.Id,clock());}catch{}
+                    pendingOrder=null;pendingRequest=null;pendingSince=null;early.Clear();NotifyChanged(order.Id);
+                    throw new InvalidOperationException("실주문 전송 결과 불명: 증권사 주문·체결 대사가 필요합니다.");
+                }
+                try{journal.RecordNotSent(order.Id,clock());}
+                catch{
+                    try{journal.MarkUnknown(order.Id,clock());}catch{}
+                    pendingOrder=null;pendingRequest=null;pendingSince=null;early.Clear();NotifyChanged(order.Id);
+                    throw new InvalidOperationException("미전송 감사 기록 저장 실패: 주문 기록 확인이 필요합니다.");
+                }
+                pendingOrder=null;pendingRequest=null;pendingSince=null;early.Clear();NotifyChanged(order.Id);
+                throw;
             }catch{
                 try{journal.MarkUnknown(order.Id,clock());}catch{ /* StorageFault keeps this instance blocked; durable Dispatching recovers as Unknown. */ }
-                pendingOrder=null;pendingRequest=null;pendingSince=null;early.Clear();throw new InvalidOperationException("실주문 전송 결과 불명: 재전송하지 말고 증권사 주문·체결을 대사해야 합니다.");
+                pendingOrder=null;pendingRequest=null;pendingSince=null;early.Clear();NotifyChanged(order.Id);throw new InvalidOperationException("실주문 전송 결과 불명: 재전송하지 말고 증권사 주문·체결을 대사해야 합니다.");
             }
         }
         void OnAcknowledged(LiveOrderAcknowledgement acknowledgement) {
             if(disposed||pendingOrder==null||acknowledgement==null)return;
             if(!pendingRequest.HasValue){if(early.Count<16)early.Add(acknowledgement);return;}
             if(acknowledgement.RequestId!=pendingRequest.Value)return;
+            var changedId=pendingOrder;
             try {
                 if(acknowledgement.ParseFailed)journal.MarkUnknown(pendingOrder,clock());
                 else journal.RecordAcknowledgement(pendingOrder,acknowledgement.RequestId,acknowledgement.BrokerOrderNumber,acknowledgement.ProviderError,clock());
             }catch{try{journal.MarkUnknown(pendingOrder,clock());}catch{ /* StorageFault is latched. Never turn read/validation failure into rejection. */ }}
             pendingOrder=null;pendingRequest=null;pendingSince=null;early.Clear();
+            NotifyChanged(changedId);
         }
-        public void Timeout(DateTime utc){LiveOrderSafety.RequireUtc(utc);if(pendingOrder==null||!pendingSince.HasValue||utc-pendingSince.Value<TimeSpan.FromSeconds(20))return;try{journal.MarkUnknown(pendingOrder,utc);}finally{pendingOrder=null;pendingRequest=null;pendingSince=null;early.Clear();}}
+        void NotifyChanged(string id) {
+            if(OrderChanged==null)return;
+            try{var order=journal.Snapshot.Orders.SingleOrDefault(o=>o.Id==id);if(order!=null)OrderChanged(order);}
+            catch{try{journal.MarkUnknown(id,clock());}catch{ /* Failed consumers/storage cannot establish reconciliation. */ }}
+        }
+        public void Timeout(DateTime utc){
+            LiveOrderSafety.RequireUtc(utc);if(pendingOrder==null||!pendingSince.HasValue||utc-pendingSince.Value<TimeSpan.FromSeconds(20))return;
+            var changedId=pendingOrder;try{journal.MarkUnknown(changedId,utc);}finally{pendingOrder=null;pendingRequest=null;pendingSince=null;early.Clear();}NotifyChanged(changedId);
+        }
+        public void Invalidate(DateTime utc) {
+            LiveOrderSafety.RequireUtc(utc);
+            if(invalidating)return;invalidating=true;
+            try {
+                var unresolved=journal.Snapshot.Orders.Where(o=>LiveOrderJournal.IsUnresolved(o)&&o.Status!=LiveOrderStatus.Unknown).Select(o=>o.Id).ToArray();
+                pendingOrder=null;pendingRequest=null;pendingSince=null;early.Clear();
+                foreach(var id in unresolved){journal.MarkUnknown(id,utc);NotifyChanged(id);}
+            }finally{invalidating=false;}
+        }
         public void Dispose(){
             if(disposed)return;disposed=true;
-            if(pendingOrder!=null){try{journal.MarkUnknown(pendingOrder,clock());}catch{ /* Durable in-flight states recover as Unknown on restart. */ }}
+            var changedId=pendingOrder;
+            if(changedId!=null){try{journal.MarkUnknown(changedId,clock());}catch{ /* Durable in-flight states recover as Unknown on restart. */ }}
             pendingOrder=null;pendingRequest=null;pendingSince=null;early.Clear();
+            if(changedId!=null)NotifyChanged(changedId);
             wire.Acknowledged-=OnAcknowledged;wire.Dispose();
         }
     }
