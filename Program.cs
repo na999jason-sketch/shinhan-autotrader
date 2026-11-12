@@ -9,7 +9,7 @@ using System.Windows.Forms;
 
 namespace ShinhanNativeTrader {
     internal static class Program {
-        internal const string Version="1.4.0";
+        internal const string Version="1.4.1";
         [STAThread]
         static int Main(string[] args) {
             if (args.Contains("--selftest")) {

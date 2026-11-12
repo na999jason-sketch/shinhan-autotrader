@@ -8,7 +8,7 @@ namespace ShinhanNativeTrader {
             public event Action<int> ReceiveData;
             public event Action<int> ReceiveSysMsg;
             public event Action<string> Error;
-            public int Id=7,Rows,RequestCount;
+            public int Id=7,Rows,RequestCount,ResponseErrorState;
             public bool OverrideRequestReturn,DiagnosticThrows,ErrorAfterRequest;
             public object RequestReturn;
             public int DiagnosticReads;
@@ -32,7 +32,8 @@ namespace ShinhanNativeTrader {
                 }
             }
             object Field(string key){object result;return Fields.TryGetValue(key,out result)?result:"";}
-            public void Data(int id){if(ReceiveData!=null)ReceiveData(id);}
+            // The official OCX writes response status N/E before firing ReceiveData.
+            public void Data(int id){Diagnostic.ErrorState=ResponseErrorState;if(ReceiveData!=null)ReceiveData(id);}
             public void Fail(string reason){if(Error!=null)Error(reason);}
             public void Sys(int id){if(ReceiveSysMsg!=null)ReceiveSysMsg(id);}
             public void Dispose(){}
@@ -70,6 +71,43 @@ namespace ShinhanNativeTrader {
             fake.Data(7);Check(received==1,"duplicate response ignored");
             requests.Timeout();Check(fatal==0,"idle timeout has no effect");
             requests.Dispose();fake.Data(7);Check(received==1,"disposed coordinator unhooks receive handler");
+
+            // Replay the user's 1.4.0 log: Int16 request 3 is accepted while the
+            // pre-response error state is 2 with no code/message; ReceiveData 3
+            // follows on the next message-pump turn. It must reach the parser.
+            fake=new FakeIndi{OverrideRequestReturn=true,RequestReturn=(short)3};fake.Stock();
+            fake.Diagnostic.ErrorState=2;fake.Diagnostic.ErrorCode="";fake.Diagnostic.Message="";
+            requests=new IndiRequestCoordinator(fake);received=0;fatal=0;
+            requests.Done+=value=>{received++;reply=value;};requests.Fatal+=reason=>fatal++;
+            Check(requests.Begin("STOCKS","stock_mst",null,"")&&requests.Busy&&!requests.Failed&&fatal==0,"accepted Int16 rid3 with empty state2 diagnostics waits for ReceiveData");
+            fake.Data(99);Check(received==0&&requests.Busy,"stale state2 does not weaken callback ID matching");
+            fake.Data(3);
+            Check(received==1&&reply.Stocks.Count==1&&reply.Stocks[0].Code=="005930"&&!requests.Busy&&!requests.Failed&&fatal==0,"actual matching rid3 is parsed despite pre-response state2");
+            fake.Data(3);Check(received==1,"rid3 completion remains exactly once");
+            fake.Id=4;fake.OverrideRequestReturn=false;fake.Quote();
+            Check(BeginQuote(requests)&&requests.Busy,"stale diagnostic status does not poison the next accepted quote");
+            fake.Data(4);Check(received==2&&reply.Price==70000&&!requests.Failed,"next quote completes after stock master with stale status");requests.Dispose();
+
+            fake=new FakeIndi{ErrorAfterRequest=true};fake.Quote();requests=new IndiRequestCoordinator(fake);received=0;
+            requests.Done+=value=>{received++;reply=value;};
+            fake.DuringRequest=()=>{fake.Data(7);fake.Fields["s:3"]="broken after callback";};
+            Check(BeginQuote(requests)&&received==1&&reply.Price==70000&&!requests.Failed,"stale diagnostic after submission cannot discard a reentrant matching response");requests.Dispose();
+
+            fake=new FakeIndi{ErrorAfterRequest=true};fake.Quote();requests=new IndiRequestCoordinator(fake);received=0;
+            requests.Done+=value=>received++;
+            fake.DuringRequest=()=>{fake.ResponseErrorState=2;fake.Data(99);fake.ResponseErrorState=0;fake.Data(7);};
+            Check(BeginQuote(requests)&&received==1&&!requests.Failed,"early mismatched provider error cannot poison a matching successful snapshot");requests.Dispose();
+
+            fake=new FakeIndi{ErrorAfterRequest=true};fake.Quote(price:"invalid");requests=new IndiRequestCoordinator(fake);received=0;fatal=0;
+            requests.Done+=value=>received++;requests.Fatal+=reason=>fatal++;
+            Check(BeginQuote(requests)&&requests.Busy,"accepted request awaits response validation even with diagnostic state2");
+            fake.Data(7);Check(requests.Failed&&received==0&&fatal==1,"malformed matching response still halts when submission diagnostics are stale");requests.Dispose();
+
+            fake=new FakeIndi{ErrorAfterRequest=true};fake.Quote();requests=new IndiRequestCoordinator(fake);received=0;fatal=0;
+            requests.Done+=value=>received++;requests.Fatal+=reason=>fatal++;
+            Check(BeginQuote(requests)&&requests.Busy,"accepted state2 request without callback remains pending");
+            requests.Timeout();fake.Data(7);
+            Check(requests.Failed&&!requests.Busy&&received==0&&fatal==1,"missing callback still times out and rejects a late response with state2");requests.Dispose();
 
             fake=new FakeIndi();fake.Quote();requests=new IndiRequestCoordinator(fake);received=0;
             requests.Done+=value=>{received++;reply=value;};
@@ -112,11 +150,19 @@ namespace ShinhanNativeTrader {
             requests.Done+=value=>received++;
             Check(BeginQuote(requests),"diagnostic getter failure does not replace a valid request");fake.Data(7);
             Check(received==1,"diagnostics failure does not discard a matching receive");requests.Dispose();
-            fake=new FakeIndi{ErrorAfterRequest=true};fake.Diagnostic.ErrorCode="1234567890";
+            fake=new FakeIndi{ErrorAfterRequest=true,ResponseErrorState=2};fake.Diagnostic.ErrorCode="1234567890";
             fake.Diagnostic.Message="계좌1234567890 암호4321 요청 오류";requests=new IndiRequestCoordinator(fake);
             var privateLog="";requests.Trace+=value=>privateLog+=value;requests.Fatal+=value=>privateLog+=value;
-            Check(!requests.Begin("HOLDINGS","SABA200QB",new Dictionary<int,string>{{0,"1234567890"},{1,"01"},{2,"4321"}},""),"holding provider error stops immediately");
+            received=0;fatal=0;requests.Done+=value=>received++;requests.Fatal+=value=>fatal++;
+            Check(requests.Begin("HOLDINGS","SABA200QB",new Dictionary<int,string>{{0,"1234567890"},{1,"01"},{2,"4321"}},"")&&requests.Busy&&!requests.Failed,"accepted holding request awaits its own response rather than stale diagnostics");
+            fake.Data(7);
+            Check(requests.Failed&&!requests.Busy&&fatal==1&&received==0,"matching holding error callback cannot be mistaken for an empty balance");
             Check(!privateLog.Contains("1234567890")&&!privateLog.Contains("4321")&&privateLog.Contains("오류"),"actual provider diagnostics retain reason while redacting credentials");requests.Dispose();
+
+            fake=new FakeIndi{ErrorAfterRequest=true,ResponseErrorState=2};fake.Quote();requests=new IndiRequestCoordinator(fake);received=0;fatal=0;
+            requests.Done+=value=>received++;requests.Fatal+=reason=>fatal++;
+            fake.DuringRequest=()=>fake.Data(7);
+            Check(!BeginQuote(requests)&&requests.Failed&&received==0&&fatal==1,"matching reentrant provider error is rejected after correlating the returned request id");requests.Dispose();
             fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);privateLog="";requests.Trace+=value=>privateLog+=value;
             Check(requests.Begin("HOLDINGS","SABA200QB",new Dictionary<int,string>{{0,"1234567890"},{1,"01"},{2,"4321"}},""),"holding request can complete before a later unrelated query");
             fake.Data(7);fake.Diagnostic.Message="이전 요청 암호4321";fake.Quote();

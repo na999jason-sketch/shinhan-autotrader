@@ -83,3 +83,16 @@ GitHub Actions
 - 실제고/저권한별도프로세스메시지전달테스트및PEmanifest검증을CI에추가했다.
 - 로컬175assertions통과. Mono는manifest를포함하지않으므로Windows산출물검증이필수다.
 - 사용자실제수신성공은미확인. 추출해시/분기주소/검증범위는docs/INDI_IPC_EVIDENCE.md참조.
+
+1.4.1 양수 접수 뒤 응답 전 잘못된 중단 수정 — 2026-11-12 KST
+- 사용자1.4.0 로그: 앱/Indi High12288, rid3, Win32Error0, NATIVE ReceiveData rid3.
+  전송과 실제 이벤트는 도착했으나 앱이 그 전에 GetErrorState2로 중단해 응답을 버렸다.
+- 공식 OCX는 RequestData 시작 시 상태/코드/메시지를 지워 대기 중 상태2가 된다.
+  콜백 전 N/E를 기록하므로, 접수 시점과 응답 시점의 상태 판정을 분리했다.
+- 양수 ID는 콜백 대기. 콜백 내부 상태/버퍼를 복사해 요청번호 일치 후 성공/오류 판정.
+  재진입 성공 뒤 상태가 바뀌어도 복사한 결과를 유지하고, 미일치 오류 응답은 무시한다.
+  실제 오류 응답은 빈 잔고로 처리하지 않으며 중복/파싱 오류/타임아웃 차단을 유지한다.
+- 로컬 경고 없는 C# x86 컴파일,189 assertions 및 Python17 tests 통과.
+  Linux Mono pointerBytes8이므로 Windows x86 런타임의 대체 증거는 아니다.
+- 최신 Windows CI, EXE/보고서 링크는 PR #1에 기록한다.
+- 실제 종목 행 파싱·현재가/일봉/잔고의 HTS 대조는 미확인. 실주문은 계속 비활성화.

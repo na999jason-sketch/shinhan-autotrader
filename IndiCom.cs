@@ -305,7 +305,7 @@ namespace ShinhanNativeTrader {
 
     // Serial request state is independent of COM and WinForms and can be replayed in unit tests.
     public sealed class IndiRequestCoordinator : IDisposable {
-        sealed class Snapshot { public int Id;public IndiReply Reply;public Exception Error; }
+        sealed class Snapshot { public int Id;public int? ProviderErrorState;public IndiReply Reply;public Exception Error; }
         sealed class Pending {
             public string Kind,Code;public int? Id;
             public readonly List<Snapshot> Early=new List<Snapshot>();
@@ -368,14 +368,15 @@ namespace ShinhanNativeTrader {
                 object raw=io.Invoke("RequestData");
                 Log("RequestData return type="+(raw==null?"null":raw.GetType().Name));
                 var id=RequestId(raw);
-                var diagnostic=Diagnose(current,"after RequestData rid="+id);
+                Diagnose(current,"after RequestData rid="+id);
                 // The official OCX's RequestData returns a positive ID on acceptance;
                 // connection/query/WM_COPYDATA failures return zero (GI004 included).
                 if(id<=0)throw new InvalidOperationException("RequestData did not return a positive accepted request ID.");
                 if(failed)return false;
-                if(diagnostic!=null&&diagnostic.ErrorState.HasValue&&diagnostic.ErrorState.Value>0) {
-                    Halt("Indi reported a request error: GetErrorState="+diagnostic.ErrorState.Value+", rid="+id+". See sanitized INDI diagnostics.");return false;
-                }
+                // RequestData clears the OCX's response status, so GetErrorState can
+                // be 2 with an empty code/message until ReceiveData sets N or E.
+                // Acceptance is the positive ID; response errors are checked from
+                // the callback-time snapshot, including reentrant callbacks.
                 current.Id=id;Log("REQUEST "+query+" rid="+id+"; awaiting actual ReceiveData.");
                 // ReceiveData can be raised before RequestData returns. Its buffer was copied in OnData.
                 var match=current.Early.FirstOrDefault(x=>x.Id==id);
@@ -390,8 +391,15 @@ namespace ShinhanNativeTrader {
             if(current==null){Log("Ignored unsolicited/duplicate ReceiveData rid="+id);return;}
             if(current.Id.HasValue&&current.Id.Value!=id){Log("Ignored mismatched ReceiveData rid="+id);return;}
             var snapshot=new Snapshot{Id=id};
-            try{snapshot.Reply=IndiResponseParser.Read(io,current.Kind,current.Code);}
-            catch(Exception ex){snapshot.Error=ex;}
+            // The OCX has now set this response's status. Capture it while the
+            // response buffer is valid; a later request can clear it again.
+            var diagnostic=Diagnose(current,"ReceiveData rid="+id);
+            if(diagnostic!=null&&diagnostic.ErrorState.HasValue&&diagnostic.ErrorState.Value>0)
+                snapshot.ProviderErrorState=diagnostic.ErrorState.Value;
+            else {
+                try{snapshot.Reply=IndiResponseParser.Read(io,current.Kind,current.Code);}
+                catch(Exception ex){snapshot.Error=ex;}
+            }
             if(!current.Id.HasValue) {
                 if(current.Early.Count>=16){Halt("Too many callbacks before RequestData returned.");return;}
                 current.Early.Add(snapshot);return;
@@ -400,6 +408,9 @@ namespace ShinhanNativeTrader {
         }
         void Complete(Pending current,Snapshot snapshot) {
             if(pending!=current||failed)return;
+            if(snapshot.ProviderErrorState.HasValue) {
+                Halt("Indi returned an error in matching ReceiveData rid="+snapshot.Id+"; GetErrorState="+snapshot.ProviderErrorState.Value+". See sanitized INDI diagnostics.");return;
+            }
             if(snapshot.Error!=null){Diagnose(current,"response error rid="+snapshot.Id);Halt("Indi response parse failed ("+snapshot.Error.GetBaseException().GetType().Name+"); verify installed field layout. Exception text omitted.");return;}
             pending=null;Log("RECEIVED "+current.Kind+" rid="+snapshot.Id+" rows="+snapshot.Reply.Count);
             if(Done!=null)Done(snapshot.Reply);
