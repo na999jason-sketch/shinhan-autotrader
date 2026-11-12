@@ -42,9 +42,13 @@ namespace ShinhanNativeTrader {
     }
 
     public sealed class BrokerHoldingsSnapshot {
-        // SABA609Q1 SI3=1/MO2=1 is the trade basis, including today's fills.
-        // Its settlement-day quantity MO9 must never replace Holding.Quantity.
+        // SI3 requests trade basis. A received row is certified as that basis
+        // only when its actual MO2 is the documented one-character code '1'.
+        // Unknown basis rows remain displayable, but cannot certify readiness.
         public readonly List<Holding> Holdings=new List<Holding>();
+        public bool BasisVerified;
+        public readonly Dictionary<string,bool> BasisValidated=new Dictionary<string,bool>(StringComparer.Ordinal);
+        public readonly Dictionary<string,string> BasisDiagnostics=new Dictionary<string,string>(StringComparer.Ordinal);
         public readonly Dictionary<string,int> SellableQuantities=new Dictionary<string,int>(StringComparer.Ordinal);
         public readonly Dictionary<string,bool> CashSourceValidated=new Dictionary<string,bool>(StringComparer.Ordinal);
         // MO11 has no buy/sell direction. It is not safe to copy it to either
@@ -157,6 +161,13 @@ namespace ShinhanNativeTrader {
             try {return (Convert.ToString(io.Invoke("GetMultiData",row,field),CultureInfo.InvariantCulture)??"").Trim();}
             catch {throw new AccountQueryException(query+" multi["+row+","+field+"] read failed; provider text withheld.");}
         }
+        static string OptionalProofMulti(IIndiTransport io,int row,int field,string query) {
+            try {return Multi(io,row,field,query);}catch(AccountQueryException){return null;}
+        }
+        static decimal? OptionalProofNumber(string value,string field) {
+            if(string.IsNullOrEmpty(value))return null;
+            try {return Number(value,field);}catch(InvalidOperationException){return null;}
+        }
         static decimal Number(string value,string field,bool signed=false,bool optional=false) {
             return IndiResponseParser.RequiredNumber(value,field,signed,optional);
         }
@@ -189,9 +200,28 @@ namespace ShinhanNativeTrader {
             // remain unknown, rather than inventing a zero profit or rejecting
             // independently readable positions. Provider text is never kept.
             try {value=Single(io,field,query);}catch(AccountQueryException){return null;}
-            return value==""?null:(decimal?)Number(value,query+" single["+field+"]",true);
+            if(value=="")return null;
+            try {return Number(value,query+" single["+field+"]",true);}
+            catch(InvalidOperationException){return null;}
         }
-        public static BrokerHoldingsSnapshot ReadHoldings(IIndiTransport io,DateTime receivedUtc) {
+        static string BasisDiagnostic(string basis) {
+            // Fixed classifications are safe to report. Raw account response
+            // strings must not be copied into logs to diagnose an enum mismatch.
+            switch(basis) {
+                case "1":return "TradeBasisCode1";
+                case "2":return "SettlementBasisCode2";
+                case "3":return "CreditBalanceCode3";
+                case "4":return "BondBalanceCode4";
+                case "5":return "OrdinaryBalanceCode5";
+                case "":return "Blank";
+                default:return "Unknown";
+            }
+        }
+        static bool CreditKind(string kind) {
+            return kind=="유통융자"||kind=="자기융자"||kind=="유통대주"||kind=="자기대주"||
+                kind=="차입매도"||kind=="매입자금"||kind=="예탁담보"||kind=="차입";
+        }
+        public static BrokerHoldingsSnapshot ReadHoldings(IIndiTransport io,DateTime receivedUtc,bool tradeBasisRequested=false) {
             if(io==null)throw new ArgumentNullException("io");Utc(receivedUtc);
             const string query="SABA609Q1";
             var result=new BrokerHoldingsSnapshot {ReceivedUtc=receivedUtc,BrokerDate=""};
@@ -200,29 +230,37 @@ namespace ShinhanNativeTrader {
                 if(code=="")throw new AccountQueryException(query+" invalid stock symbol multi[0].");
                 if(result.SellableQuantities.ContainsKey(code))
                     throw new AccountQueryException(query+" duplicate stock symbol multi[0]; cash/credit rows cannot be merged safely.");
-                if(Multi(io,row,2,query)!="1")
-                    throw new AccountQueryException(query+" trade-basis response required in multi[2].");
-                var kind=Multi(io,row,3,query);
+                var basis=OptionalProofMulti(io,row,2,query);
+                var basisValidated=basis=="1";
+                var kind=OptionalProofMulti(io,row,3,query);
                 var quantity=Quantity(Multi(io,row,4,query),query+" holding quantity[4]");
                 // These fields are unsettled trades and settlement-day stock,
-                // not open buy/sell orders. Validate, but do not relabel them.
-                for(int field=5;field<=9;field++)Quantity(Multi(io,row,field,query),query+" settlement quantity["+field+"]");
+                // not open buy/sell orders. They are not consumed, and optional
+                // blank settlement metadata must not discard valid positions.
                 var sellable=Quantity(Multi(io,row,10,query),query+" orderable quantity[10]");
                 var unfilled=Quantity(Multi(io,row,11,query),query+" unfilled quantity[11]");
                 if(sellable>quantity)
                     throw new AccountQueryException(query+" orderable quantity exceeds trade-basis holdings multi[4/10].");
-                var loanText=Multi(io,row,22,query);
-                var loan=Number(loanText,query+" loan amount[22]",false,true);
+                var loan=OptionalProofNumber(OptionalProofMulti(io,row,22,query),query+" loan amount[22]");
                 // The official description documents the literal '보통'. No
                 // undocumented numeric alias is assumed to mean cash stock.
-                var cash=kind=="보통"&&loanText!=""&&loan==0;
+                var cash=basisValidated&&kind=="보통"&&loan.HasValue&&loan.Value==0;
                 result.Holdings.Add(new Holding {Code=code,Name=Text(Multi(io,row,1,query)),Quantity=quantity,
                     AvgPrice=Number(Multi(io,row,12,query),query+" average price[12]"),
-                    Price=Number(Multi(io,row,13,query),query+" current price[13]"),CreditQty=cash?0m:quantity});
+                    // XTR binds this field to TRDPRC_1, like the other quote
+                    // parsers: the encoded sign is not a negative share price.
+                    Price=Math.Abs(Number(Multi(io,row,13,query),query+" current price[13]",true)),
+                    CreditQty=CreditKind(kind)||(loan.HasValue&&loan.Value>0)?quantity:0m});
+                result.BasisValidated.Add(code,basisValidated);
+                result.BasisDiagnostics.Add(code,BasisDiagnostic(basis));
                 result.SellableQuantities.Add(code,(int)sellable);
                 result.UnfilledQuantities.Add(code,(int)unfilled);
                 result.CashSourceValidated.Add(code,cash);
             }
+            // An empty response needs explicit request-context evidence from
+            // the coordinator, never vacuous All(). That evidence cannot
+            // override an unknown or conflicting basis in a returned row.
+            result.BasisVerified=result.Holdings.Count==0?tradeBasisRequested:result.BasisValidated.Values.All(x=>x);
             string brokerDate;
             try {brokerDate=Single(io,0,query);}catch(AccountQueryException){brokerDate="";}
             DateTime parsed;

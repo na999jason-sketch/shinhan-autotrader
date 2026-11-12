@@ -16,7 +16,7 @@ namespace ShinhanNativeTrader {
         public AccountUserActionException(string message):base(message){}
     }
     internal static class Program {
-        internal const string Version="2.1.0";
+        internal const string Version="2.1.1";
         [STAThread]
         static int Main(string[] args) {
             if(args.Contains("--selftest")) {
@@ -141,6 +141,7 @@ namespace ShinhanNativeTrader {
         int scanned,holdingRequests,connectionEpoch;
         string boundKey,lastReportKey;
         string gateDetail="실주문 미시작";
+        string lastBasisDiagnostic;
 
         public MainForm() {
             Text="Shinhan Native Trader "+Program.Version+" | 실계좌 자동매매";
@@ -350,7 +351,7 @@ namespace ShinhanNativeTrader {
         }
         void CloseGateway(){if(gateway!=null){var previous=gateway;gateway=null;previous.OrderChanged-=OnGatewayOrderChanged;previous.Dispose();}orderAcknowledgementPending=false;}
         void ReleaseAccount(){authorization.Revoke();CloseGateway();DisposeRealtime();accountEvents=null;readiness=null;if(journal!=null){journal.Dispose();journal=null;}if(credentials!=null){credentials.Dispose();credentials=null;}boundKey=null;account.ReadOnly=false;}
-        void ClearAccountData(){holdings.Clear();priceReceivedUtc.Clear();quoteDue.Clear();sellDecisions.Clear();balanceSignatures.Clear();cash=null;brokerOrders=null;tradeHoldings=null;holdingsReceivedUtc=null;blockedSignals.Clear();RefreshAccount();RefreshOrders();}
+        void ClearAccountData(){holdings.Clear();priceReceivedUtc.Clear();quoteDue.Clear();sellDecisions.Clear();balanceSignatures.Clear();cash=null;brokerOrders=null;tradeHoldings=null;holdingsReceivedUtc=null;lastBasisDiagnostic=null;blockedSignals.Clear();RefreshAccount();RefreshOrders();}
         void CloseSession() {
             DateTime day=session.SessionDateKorea??MarketTime.NowKorea.Date;string reason=session.CloseReason;
             authorization.Revoke();if(readiness!=null)readiness.SetAuthorization(false);UpdateOrderStatus();
@@ -439,7 +440,10 @@ namespace ShinhanNativeTrader {
                 if(readiness!=null&&stamped)readiness.ObserveTradeBalance(tradeHoldings);
                 if(accountEvents!=null&&tradeHoldings.BrokerDateValidated)accountEvents.SetBrokerDate(tradeHoldings.BrokerDate,tradeHoldings.ReceivedUtc);
                 ApplyHoldings(tradeHoldings.Holdings,stamped?(DateTime?)reply.ReceivedUtc:null);
-                FinishPreflight("TRADEHOLDINGS");state.Text="매매기준 실계좌 잔고 "+holdings.Count+"종목 / 기존·신규 보유 함께 감시";return;
+                LogBasisDiagnostic();FinishPreflight("TRADEHOLDINGS");
+                if(tradeHoldings.BasisVerified)state.Text="매매기준 실계좌 잔고 "+holdings.Count+"종목 / 기존·신규 보유 함께 감시";
+                else{state.Text="잔고 조회 계속 / 주문 잔고기준 확인 대기 · "+holdings.Count+"종목 표시";UpdateOrderStatus("조회 계속 / 주문 잔고기준 확인 대기");}
+                return;
             }
             if(reply.Kind=="HOLDINGS") {
                 if(tradeHoldings==null)ApplyHoldings(reply.Holdings,stamped?(DateTime?)reply.ReceivedUtc:null);
@@ -479,8 +483,28 @@ namespace ShinhanNativeTrader {
                 if(holding.Price>0&&receivedUtc.HasValue)priceReceivedUtc[holding.Code]=receivedUtc.Value;
                 if(holding.Quantity>0)EnsureLiveQuote(holding.Code);
             }
-            if(settingsStore!=null&&boundKey!=null){settingsStore.RefreshPositions(boundKey,holdings);configuration=settingsStore.Snapshot;}
+            if(settingsStore!=null&&boundKey!=null&&(tradeHoldings==null||tradeHoldings.BasisVerified)){settingsStore.RefreshPositions(boundKey,holdings);configuration=settingsStore.Snapshot;}
             RefreshAccount();
+        }
+        void LogBasisDiagnostic() {
+            if(tradeHoldings==null)return;
+            var categories=new[]{"TradeBasisCode1","SettlementBasisCode2","CreditBalanceCode3","BondBalanceCode4","OrdinaryBalanceCode5","Blank","Unknown"};
+            var counts=categories.ToDictionary(x=>x,x=>0,StringComparer.Ordinal);
+            foreach(var holding in tradeHoldings.Holdings) {
+                string category;
+                if(!tradeHoldings.BasisDiagnostics.TryGetValue(holding.Code,out category)||!counts.ContainsKey(category??""))category="Unknown";
+                counts[category]++;
+            }
+            string line="SABA609Q1 잔고기준 분류: "+string.Join("; ",categories.Select(x=>x+"="+counts[x].ToString(CultureInfo.InvariantCulture)))
+                +"; BasisVerified="+(tradeHoldings.BasisVerified?"True":"False");
+            if(line!=lastBasisDiagnostic){lastBasisDiagnostic=line;Log(line);}
+        }
+        string HoldingSourcePending(Holding held) {
+            if(tradeHoldings==null)return null;
+            bool verified;
+            if(!tradeHoldings.BasisVerified||!tradeHoldings.BasisValidated.TryGetValue(held.Code,out verified)||!verified)return "주문 잔고기준 확인 대기";
+            if(!tradeHoldings.CashSourceValidated.TryGetValue(held.Code,out verified)||!verified)return "현물 잔고구분 확인 대기";
+            return null;
         }
         bool ValidEntrySignal(Candidate candidate,RealtimeQuote quote,DateTime now) {
             return candidate!=null&&quote!=null&&candidate.Code==quote.Code&&candidate.SignalDate==MarketTime.ToKorea(now).ToString("yyyyMMdd",CultureInfo.InvariantCulture)
@@ -603,6 +627,7 @@ namespace ShinhanNativeTrader {
         }
         static string Amount(decimal? value){return value.HasValue?value.Value.ToString("N0",CultureInfo.CurrentCulture):"미확인";}
         string HoldingDecision(Holding held) {
+            string sourcePending=HoldingSourcePending(held);if(sourcePending!=null)return sourcePending;
             HoldingSellDecision decision;
             if(sellDecisions.TryGetValue(held.Code,out decision)) {
                 if(decision.AveragePrice==held.AvgPrice&&decision.Quantity==held.Quantity&&decision.CreditQuantity==held.CreditQty)return decision.Reason;
@@ -619,7 +644,8 @@ namespace ShinhanNativeTrader {
             if(previous!=reason)Log("매도 판정 "+held.Code+" / "+reason);
         }
         string EvaluateHoldingSell(Holding held,IndiReply quote,DateTime utc) {
-            string pending=null;
+            string pending=HoldingSourcePending(held);
+            if(pending!=null){SetHoldingDecision(held,pending);return null;}
             if(held.Quantity<=0)pending="보유수량 없음";
             else if(held.AvgPrice<=0)pending="평균단가 확인 대기";
             else if(held.CreditQty!=0)pending="신용·매도수량 검증 대기";

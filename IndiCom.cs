@@ -270,7 +270,7 @@ namespace ShinhanNativeTrader {
             if(count!=decimal.Truncate(count)||count>limit)throw new InvalidOperationException("Indi row count outside supported range.");
             return (int)count;
         }
-        public static IndiReply Read(IIndiTransport io,string kind,string code,Action<string,string,string> quoteTrace=null,decimal? requestedPrice=null) {
+        public static IndiReply Read(IIndiTransport io,string kind,string code,Action<string,string,string> quoteTrace=null,decimal? requestedPrice=null,bool tradeBasisRequested=false) {
             Func<int,string> single=col=>{
                 try{return Convert.ToString(io.Invoke("GetSingleData",col),CultureInfo.InvariantCulture)??"";}
                 catch(Exception ex){throw new FieldFailure("GetSingleData index="+col+" failed",ex);}
@@ -334,7 +334,7 @@ namespace ShinhanNativeTrader {
                 reply.Clock="";reply.HasTradeClock=false;
                 reply.Message="조회 가격: 거래시각 미제공, 자동매매 사용 제외";
             }else if(kind=="TRADEHOLDINGS") {
-                reply.TradeHoldings=AccountQueries.ReadHoldings(io,DateTime.UtcNow);reply.Holdings=reply.TradeHoldings.Holdings;
+                reply.TradeHoldings=AccountQueries.ReadHoldings(io,DateTime.UtcNow,tradeBasisRequested);reply.Holdings=reply.TradeHoldings.Holdings;
                 reply.Count=reply.Holdings.Count;
             }else if(kind=="CASH") {
                 reply.Cash=AccountQueries.ReadCash(io,DateTime.UtcNow);reply.Count=1;
@@ -367,6 +367,7 @@ namespace ShinhanNativeTrader {
         sealed class Snapshot { public int Id;public int? ProviderErrorState;public IndiReply Reply;public Exception Error;public DateTime ReceivedUtc; }
         sealed class Pending {
             public string Kind,Code;public int? Id;
+            public bool TradeBasisRequested;
             public decimal? RequestedPrice;
             public DateTime RequestStartedUtc;
             public readonly List<Snapshot> Early=new List<Snapshot>();
@@ -426,6 +427,13 @@ namespace ShinhanNativeTrader {
                 Log("Query name readback verified: "+query);
                 stage="SetSingleData";
                 if(input!=null)foreach(var field in input.OrderBy(x=>x.Key))Accepted(io.Invoke("SetSingleData",field.Key,field.Value),"SetSingleData");
+                // A successful, complete trade-basis request can scope an empty
+                // holdings response. It must never override a conflicting row.
+                string product,basis,unit,selection,output;
+                current.TradeBasisRequested=kind=="TRADEHOLDINGS"&&string.Equals(query,"SABA609Q1",StringComparison.OrdinalIgnoreCase)
+                    &&input!=null&&input.TryGetValue(1,out product)&&product=="01"
+                    &&input.TryGetValue(3,out basis)&&basis=="1"&&input.TryGetValue(4,out unit)&&unit=="1"
+                    &&input.TryGetValue(5,out selection)&&selection=="1"&&input.TryGetValue(6,out output)&&output=="0";
                 stage="RequestData";
                 current.RequestStartedUtc=DateTime.UtcNow;
                 object raw=io.Invoke("RequestData");
@@ -461,7 +469,8 @@ namespace ShinhanNativeTrader {
                 snapshot.ProviderErrorState=diagnostic.ErrorState.Value;
             else {
                 try{snapshot.Reply=IndiResponseParser.Read(io,current.Kind,current.Code,
-                    (symbol,clock,price)=>Log(IndiDiagnosticFormatter.FormatQuote(current.Kind,symbol,clock,price,sessionSensitive)),current.RequestedPrice);}
+                    (symbol,clock,price)=>Log(IndiDiagnosticFormatter.FormatQuote(current.Kind,symbol,clock,price,sessionSensitive)),current.RequestedPrice,
+                    current.TradeBasisRequested&&diagnostic!=null&&diagnostic.ErrorState==0);}
                 catch(Exception ex){snapshot.Error=ex;}
             }
             if(!current.Id.HasValue) {

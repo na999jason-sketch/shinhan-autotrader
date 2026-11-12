@@ -154,15 +154,21 @@ namespace ShinhanNativeTrader {
             lock(sync){
                 if(!Newer(holdingTime,stamp))return false;
                 var next=new Dictionary<string,Sellable>(StringComparer.Ordinal);
+                bool basisVerified=value.BasisVerified;
                 foreach(var h in values) {
-                    int quantity,unfilled;bool validated;
+                    int quantity,unfilled;bool validated,basis;
                     if(!value.SellableQuantities.TryGetValue(h.Code,out quantity)||quantity<0||!value.UnfilledQuantities.TryGetValue(h.Code,out unfilled)||unfilled<0)
                         throw new ArgumentException("Trade-basis holdings are missing broker quantities.");
                     value.CashSourceValidated.TryGetValue(h.Code,out validated);
+                    basisVerified=basisVerified&&value.BasisValidated.TryGetValue(h.Code,out basis)&&basis;
                     next[h.Code]=new Sellable{Code=h.Code,Quantity=quantity,Unfilled=unfilled,Validated=validated,Time=stamp};
                 }
                 if(value.UnfilledQuantities.Any(x=>x.Value>0&&!next.ContainsKey(x.Key)))throw new ArgumentException("Unmatched pending broker position evidence.");
-                holdings=values;holdingTime=stamp;holdingsTradeBasis=true;sellable.Clear();foreach(var pair in next)sellable[pair.Key]=pair.Value;
+                // Unknown basis remains displayable but must not certify the
+                // account exposure for either new buys or strategy sales.
+                // A verified empty frame is allowed only through the parser's
+                // explicitly bound trade-basis request context.
+                holdings=values;holdingTime=stamp;holdingsTradeBasis=basisVerified;sellable.Clear();foreach(var pair in next)sellable[pair.Key]=pair.Value;
                 brokerDate=value.BrokerDate;brokerDateValidated=value.BrokerDateValidated;brokerDateTime=stamp;AdvanceEpoch();return true;
             }
         }

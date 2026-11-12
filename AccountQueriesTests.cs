@@ -11,7 +11,7 @@ namespace ShinhanNativeTrader {
             public event Action<string> Error {add{} remove{}}
             public object Count=0;
             public bool ThrowGetter;
-            public string ThrowMethod;
+            public string ThrowMethod,ThrowField;
             public readonly Dictionary<string,object> Fields=new Dictionary<string,object>();
             public object Invoke(string name,params object[] args) {
                 if(ThrowGetter||name==ThrowMethod)throw new InvalidOperationException("account=12345678901 password=4321 SECRET");
@@ -20,6 +20,7 @@ namespace ShinhanNativeTrader {
                 if(name=="GetSingleData")key="s:"+args[0];
                 else if(name=="GetMultiData")key="m:"+args[0]+":"+args[1];
                 else throw new InvalidOperationException("Unexpected test query method.");
+                if(key==ThrowField)throw new InvalidOperationException("account=12345678901 password=4321 SECRET");
                 object value;return Fields.TryGetValue(key,out value)?value:"";
             }
             public void Dispose(){}
@@ -99,6 +100,7 @@ namespace ShinhanNativeTrader {
             Check(balance.Holdings.Count==1&&balance.Holdings[0].Code=="005930"&&balance.Holdings[0].Quantity==7,"today's three bought shares are included by trade quantity rather than four settled shares");
             Check(balance.Holdings[0].AvgPrice==70000&&balance.Holdings[0].Price==71000&&balance.Holdings[0].CreditQty==0,"trade holdings preserve actual broker average and current prices");
             Check(balance.SellableQuantities["005930"]==7&&balance.CashSourceValidated["005930"]&&balance.UnfilledQuantities["005930"]==0,"documented ordinary no-loan trade position supplies typed sellable quantity");
+            Check(balance.BasisVerified&&balance.BasisValidated["005930"]&&balance.BasisDiagnostics["005930"]=="TradeBasisCode1","only actual documented trade code supplies row and frame basis proof");
             Check(balance.Holdings[0].BuyPending==0&&balance.Holdings[0].SellPending==0,"unsettled bought shares are not mislabeled as open buy orders");
             Check(balance.RealizedProfit==-1250&&balance.UnrealizedProfit==7000,"optional broker profit fields preserve signed actual values");
             Check(balance.BrokerDate=="20261112"&&balance.BrokerDateValidated&&balance.ReceivedUtc==utc&&balance.RequestStartedUtc==default(DateTime),"broker date comes from header while request start must come from the coordinator");
@@ -106,6 +108,8 @@ namespace ShinhanNativeTrader {
             Check(!balance.RealizedProfit.HasValue&&!balance.UnrealizedProfit.HasValue&&balance.Holdings.Count==1,"omitted broker profit aggregates remain unknown without hiding readable holdings");
             io.Fields["s:16"]="0";balance=AccountQueries.ReadHoldings(io,utc);
             Check(balance.RealizedProfit.HasValue&&balance.RealizedProfit.Value==0,"an explicitly returned zero profit differs from missing output");
+            io.Fields["s:16"]="unavailable";io.Fields["s:19"]="--";balance=AccountQueries.ReadHoldings(io,utc);
+            Check(!balance.RealizedProfit.HasValue&&!balance.UnrealizedProfit.HasValue&&balance.Holdings[0].Quantity==7,"malformed optional profit aggregates do not discard independently readable positions");
             io.ThrowMethod="GetSingleData";balance=AccountQueries.ReadHoldings(io,utc);
             Check(balance.Holdings.Count==1&&!balance.RealizedProfit.HasValue&&!balance.UnrealizedProfit.HasValue&&!balance.BrokerDateValidated,"missing server aggregate getters do not fabricate dates or profit");
             io.ThrowMethod=null;io.Fields["s:0"]="20260230";balance=AccountQueries.ReadHoldings(io,utc);
@@ -115,11 +119,17 @@ namespace ShinhanNativeTrader {
             io=new Response();io.Holding(0,"A005930","유통융자");io.SetRow(0,22,"100000");balance=AccountQueries.ReadHoldings(io,utc);
             Check(balance.Holdings[0].Quantity==7&&!balance.CashSourceValidated["005930"]&&balance.Holdings[0].CreditQty==7,"credit positions stay visible and cannot become ordinary cash order sources");
             io.SetRow(0,3,"00");io.SetRow(0,22,"0");balance=AccountQueries.ReadHoldings(io,utc);
-            Check(!balance.CashSourceValidated["005930"]&&balance.Holdings[0].Quantity==7,"undocumented numeric cash kind is not guessed from a zero loan");
+            Check(!balance.CashSourceValidated["005930"]&&balance.Holdings[0].Quantity==7&&balance.Holdings[0].CreditQty==0,"undocumented cash kind is neither guessed as cash nor falsely labeled as credit from a zero loan");
             io.SetRow(0,3,"보통");io.SetRow(0,22,"");balance=AccountQueries.ReadHoldings(io,utc);
             Check(!balance.CashSourceValidated["005930"],"missing loan field cannot certify a cash position source");
+            io.SetRow(0,22,"unavailable");balance=AccountQueries.ReadHoldings(io,utc);
+            Check(balance.Holdings.Count==1&&balance.Holdings[0].Quantity==7&&!balance.CashSourceValidated["005930"]&&balance.Holdings[0].CreditQty==0,"malformed optional loan leaves real positions readable without certifying cash or inventing credit shares");
             io.SetRow(0,22,"1");balance=AccountQueries.ReadHoldings(io,utc);
             Check(!balance.CashSourceValidated["005930"],"ordinary label with nonzero loan remains ineligible");
+            foreach(var field in new[]{2,3,22}) {
+                io=new Response();io.Holding(0);io.ThrowField="m:0:"+field;balance=AccountQueries.ReadHoldings(io,utc);
+                Check(balance.Holdings[0].Quantity==7&&!balance.CashSourceValidated["005930"]&&balance.Holdings[0].CreditQty==0&&balance.BasisVerified==(field!=2),"unavailable optional source-proof metadata preserves core positions and fails only the corresponding order proof");
+            }
             io=new Response();io.Holding(0);io.SetRow(0,11,"2");balance=AccountQueries.ReadHoldings(io,utc);
             Check(balance.UnfilledQuantities["005930"]==2&&balance.Holdings[0].SellPending==0&&balance.Holdings[0].BuyPending==0,"directionless unfilled shares remain explicit for reconciliation instead of invented side totals");
             io.SetRow(0,4,"0");io.SetRow(0,10,"0");balance=AccountQueries.ReadHoldings(io,utc);
@@ -129,16 +139,33 @@ namespace ShinhanNativeTrader {
             io.SetRow(0,10,"1.5");Reject(()=>AccountQueries.ReadHoldings(io,utc),"fractional sellable domestic shares reject");
             io=new Response();io.Holding(0);io.SetRow(0,4,"2147483648");Reject(()=>AccountQueries.ReadHoldings(io,utc),"trade holdings outside supported share bounds reject");
             io=new Response();io.Holding(0);io.SetRow(0,11,"-1");Reject(()=>AccountQueries.ReadHoldings(io,utc),"negative unfilled shares reject");
-            io=new Response();io.Holding(0);io.SetRow(0,8,"1.5");Reject(()=>AccountQueries.ReadHoldings(io,utc),"fractional settlement metadata cannot acquire valid cash-source status");
-            io=new Response();io.Holding(0);io.SetRow(0,2,"2");failure=Capture(()=>AccountQueries.ReadHoldings(io,utc));
-            Check(AccountQueries.FailureContext(failure)!=null&&AccountQueries.FailureContext(failure).Contains("multi[2]"),"settlement-basis response cannot masquerade as trade-basis holdings");
+            io=new Response();io.Holding(0);foreach(var field in new[]{5,6,7,8,9})io.SetRow(0,field,"");balance=AccountQueries.ReadHoldings(io,utc);
+            Check(balance.Holdings[0].Quantity==7&&balance.BasisVerified,"unused blank settlement metadata does not prevent displaying trade-basis positions");
+            io=new Response();io.Holding(0);io.SetRow(0,2,"2");balance=AccountQueries.ReadHoldings(io,utc);
+            Check(balance.Holdings[0].Quantity==7&&!balance.BasisVerified&&!balance.BasisValidated["005930"]&&!balance.CashSourceValidated["005930"]&&balance.BasisDiagnostics["005930"]=="SettlementBasisCode2","settlement-basis positions remain readable but cannot certify trade-basis orders");
+            foreach(var basis in new[]{"","0","9","매매기준",account}) {
+                io=new Response();io.Holding(0);io.SetRow(0,2,basis);balance=AccountQueries.ReadHoldings(io,utc,true);
+                Check(balance.Holdings.Count==1&&balance.Holdings[0].Quantity==7&&!balance.BasisVerified&&!balance.BasisValidated["005930"]&&!balance.CashSourceValidated["005930"],"unrecognized actual basis is displayed without certification even when the request was trade-basis bound");
+                Check(balance.BasisDiagnostics["005930"]==(basis==""?"Blank":"Unknown"),"basis diagnosis uses a fixed classification and never raw provider values");
+            }
+            foreach(var basis in new[]{"3","4","5"}) {
+                io=new Response();io.Holding(0);io.SetRow(0,2,basis);balance=AccountQueries.ReadHoldings(io,utc);
+                Check(balance.Holdings.Count==1&&!balance.BasisVerified&&!balance.CashSourceValidated["005930"]&&balance.BasisDiagnostics["005930"]!="Unknown","documented nontrade basis labels stay recognized but cannot approve a cash trade");
+            }
+            io=new Response();io.Holding(0);io.Holding(1,"A000660");io.SetRow(1,2,"");balance=AccountQueries.ReadHoldings(io,utc,true);
+            Check(balance.Holdings.Count==2&&!balance.BasisVerified&&balance.BasisValidated["005930"]&&!balance.BasisValidated["000660"],"one unverified row cannot certify the whole account while each row remains displayable");
+            io=new Response();io.Holding(0);io.SetRow(0,13,"-71000");balance=AccountQueries.ReadHoldings(io,utc);
+            Check(balance.Holdings[0].Price==71000&&balance.CashSourceValidated["005930"],"signed TRDPRC_1 current-price encoding normalizes to an absolute share price");
+            io.SetRow(0,13,"broken");Reject(()=>AccountQueries.ReadHoldings(io,utc),"an actually malformed core price still rejects without inventing a value");
             io=new Response();io.Holding(0);io.Holding(1,"A005930","유통융자");failure=Capture(()=>AccountQueries.ReadHoldings(io,utc));
             Check(AccountQueries.FailureContext(failure)!=null&&AccountQueries.FailureContext(failure).Contains("duplicate stock symbol"),"cash and credit rows for one symbol fail closed instead of being dropped or silently merged");
             io=new Response();io.Holding(0);io.ThrowMethod="GetMultiData";failure=Capture(()=>AccountQueries.ReadHoldings(io,utc));context=AccountQueries.FailureContext(failure);
             Check(context!=null&&context.Contains("SABA609Q1 multi[0,0]")&&!failure.ToString().Contains(account)&&!failure.ToString().Contains(password)&&failure.InnerException==null,"trade holdings getter failure retains only safe query and field context");
             Reject(()=>AccountQueries.ReadHoldings(new Response(),DateTime.SpecifyKind(utc,DateTimeKind.Local)),"trade balance requires an explicit UTC response time");
             balance=AccountQueries.ReadHoldings(new Response(),utc);
-            Check(balance.Holdings.Count==0&&!balance.BrokerDateValidated&&!balance.RealizedProfit.HasValue,"empty positions do not invent broker-session or profit proof");
+            Check(balance.Holdings.Count==0&&!balance.BrokerDateValidated&&!balance.RealizedProfit.HasValue&&!balance.BasisVerified,"empty positions do not invent broker-session, profit or row-basis proof");
+            balance=AccountQueries.ReadHoldings(new Response(),utc,true);
+            Check(balance.Holdings.Count==0&&balance.BasisVerified&&!balance.BrokerDateValidated&&!balance.RealizedProfit.HasValue,"explicit validated trade request context scopes an empty balance without inventing broker dates or rows");
 
             io=new Response();io.Capacity(0,"40","999","99999999");io.Capacity(1,"100","11","800000");
             var capacity=AccountQueries.ReadCapacity(io,"005930",70000,utc);

@@ -34,6 +34,7 @@ namespace ShinhanNativeTrader {
             object Field(string key){object result;return Fields.TryGetValue(key,out result)?result:"";}
             // The official OCX writes response status N/E before firing ReceiveData.
             public void Data(int id){Diagnostic.ErrorState=ResponseErrorState;if(ReceiveData!=null)ReceiveData(id);}
+            public void DeliverWithoutSettingStatus(int id){if(ReceiveData!=null)ReceiveData(id);}
             public void Fail(string reason){if(Error!=null)Error(reason);}
             public void Sys(int id){if(ReceiveSysMsg!=null)ReceiveSysMsg(id);}
             public void Dispose(){}
@@ -53,6 +54,11 @@ namespace ShinhanNativeTrader {
                 Rows=1;Fields["m:0:0"]="A005930";Fields["m:0:1"]="Samsung";
                 for(int i=2;i<=7;i++)Fields["m:0:"+i]="0";
                 Fields["m:0:2"]="10";Fields["m:0:5"]="70000";Fields["m:0:6"]="65000";
+            }
+            public void TradeHolding(string basis) {
+                Rows=1;Fields["m:0:0"]="A005930";Fields["m:0:1"]="TEST";Fields["m:0:2"]=basis;
+                Fields["m:0:3"]="보통";Fields["m:0:4"]="2";Fields["m:0:10"]="2";Fields["m:0:11"]="0";
+                Fields["m:0:12"]="70000";Fields["m:0:13"]="-71000";Fields["m:0:22"]="0";
             }
         }
         static int checks;
@@ -89,6 +95,54 @@ namespace ShinhanNativeTrader {
             Check(requests.Begin("CASH","SABA602Q1",AccountQueries.CashInputs("12345678901","5678"),""),"cash account query uses its read-only contract");
             fake.Data(7);Check(received==1&&reply.Cash.Cash100Orderable==500000,"cash100 amount is copied from official field30");
             Check(!accountTrace.Contains("12345678901")&&!accountTrace.Contains("5678"),"cash diagnostics redact account and password in every stage");requests.Dispose();
+
+            // Replay the 2.1 regression: ReceiveData succeeds, but the basis
+            // field differs from the documented code. Positions stay visible,
+            // account queries continue, and unknown data cannot authorize orders.
+            fake=new FakeIndi{OverrideRequestReturn=true,RequestReturn=(short)3799};fake.TradeHolding("");
+            requests=new IndiRequestCoordinator(fake);received=0;fatal=0;
+            requests.Done+=value=>{received++;reply=value;};requests.Fatal+=reason=>fatal++;
+            Check(requests.Begin("TRADEHOLDINGS","SABA609Q1",AccountQueries.HoldingsInputs("12345678901","5678"),""),"609 trade-basis request accepts its actual callback independently of row certainty");
+            fake.Data(3798);Check(received==0&&requests.Busy,"609 unknown-basis regression preserves request ID matching");
+            fake.Data(3799);
+            Check(received==1&&fatal==0&&!requests.Failed&&!requests.Busy&&reply.Holdings.Count==1,"a successful unknown-basis response no longer halts or discards readable holdings");
+            Check(reply.Holdings[0].Quantity==2&&reply.Holdings[0].Price==71000&&!reply.TradeHoldings.BasisVerified
+                &&!reply.TradeHoldings.BasisValidated["005930"],"unknown basis stays unverified despite the bound request and signed current price is preserved as a price");
+            Check(reply.TradeHoldings.RequestStartedUtc.Kind==DateTimeKind.Utc&&reply.TradeHoldings.RequestStartedUtc<=reply.TradeHoldings.ReceivedUtc,"unknown-basis display retains real coordinator evidence timestamps");
+            fake.OverrideRequestReturn=false;fake.Id=3800;fake.Fields["s:1"]="1000000";fake.Fields["s:20"]="800000";fake.Fields["s:30"]="500000";
+            Check(requests.Begin("CASH","SABA602Q1",AccountQueries.CashInputs("12345678901","5678"),""),"cash can be requested after a readable basis-unconfirmed balance");
+            fake.Data(3800);Check(received==2&&reply.Cash.Cash100Orderable==500000&&fatal==0&&!requests.Failed,"a basis warning does not poison subsequent account queries");requests.Dispose();
+
+            fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);received=0;reply=null;
+            requests.Done+=value=>{received++;reply=value;};
+            fake.DuringRequest=()=>fake.Data(7);
+            Check(requests.Begin("TRADEHOLDINGS","SABA609Q1",AccountQueries.HoldingsInputs("12345678901","5678"),"")
+                &&received==1&&reply.TradeHoldings.BasisVerified&&reply.Holdings.Count==0,"a matched reentrant empty response is scoped by the complete accepted trade-basis request");requests.Dispose();
+            foreach(var field in new[]{3,6}) {
+                fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);reply=null;
+                requests.Done+=value=>reply=value;
+                var partial=AccountQueries.HoldingsInputs("12345678901","5678");partial[field]=field==3?"2":"1";
+                requests.Begin("TRADEHOLDINGS","SABA609Q1",partial,"");fake.Data(7);
+                Check(reply!=null&&!reply.TradeHoldings.BasisVerified,"empty response cannot certify a different basis or suppressed multi output: input "+field);requests.Dispose();
+            }
+            fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);reply=null;
+            requests.Done+=value=>reply=value;
+            requests.Begin("TRADEHOLDINGS","SABA200QB",AccountQueries.HoldingsInputs("12345678901","5678"),"");fake.Data(7);
+            Check(reply!=null&&!reply.TradeHoldings.BasisVerified,"a different query cannot inherit empty 609 trade-basis evidence");requests.Dispose();
+            fake=new FakeIndi{ResponseErrorState=2};requests=new IndiRequestCoordinator(fake);received=0;fatal=0;
+            requests.Done+=value=>received++;requests.Fatal+=reason=>fatal++;
+            requests.Begin("TRADEHOLDINGS","SABA609Q1",AccountQueries.HoldingsInputs("12345678901","5678"),"");fake.Data(7);
+            Check(received==0&&fatal==1&&requests.Failed,"a provider error is never reclassified as a verified empty holdings response");requests.Dispose();
+            for(int unavailable=0;unavailable<2;unavailable++) {
+                fake=new FakeIndi{DiagnosticThrows=unavailable==0};requests=new IndiRequestCoordinator(fake);reply=null;
+                requests.Done+=value=>reply=value;
+                if(unavailable==1)fake.Diagnostic.ErrorState=null;
+                requests.Begin("TRADEHOLDINGS","SABA609Q1",AccountQueries.HoldingsInputs("12345678901","5678"),"");
+                // Preserve an unavailable callback state rather than FakeIndi.Data's
+                // normal simulation of the provider writing a known response state.
+                if(unavailable==0)fake.Data(7);else fake.DeliverWithoutSettingStatus(7);
+                Check(reply!=null&&reply.Holdings.Count==0&&!reply.TradeHoldings.BasisVerified,"unavailable callback error status cannot certify a request-bound empty balance: "+unavailable);requests.Dispose();
+            }
 
             fake=new FakeIndi();fake.Diagnostic.Message="계좌12345678901 암호5678";requests=new IndiRequestCoordinator(fake);received=0;accountTrace="";
             requests.Trace+=value=>accountTrace+=value;requests.Done+=value=>{received++;reply=value;};

@@ -29,8 +29,8 @@ namespace ShinhanNativeTrader {
             }
         }
         static BrokerHoldingsSnapshot Positions(DateTime at) {
-            var b=new BrokerHoldingsSnapshot{BrokerDate="12",BrokerDateValidated=false,RequestStartedUtc=at.AddSeconds(-4),ReceivedUtc=at.AddSeconds(-3)};
-            b.Holdings.Add(new Holding{Code="005930",Quantity=2,AvgPrice=70000,Price=70000});b.SellableQuantities["005930"]=2;b.UnfilledQuantities["005930"]=0;b.CashSourceValidated["005930"]=true;return b;
+            var b=new BrokerHoldingsSnapshot{BrokerDate="12",BrokerDateValidated=false,BasisVerified=true,RequestStartedUtc=at.AddSeconds(-4),ReceivedUtc=at.AddSeconds(-3)};
+            b.Holdings.Add(new Holding{Code="005930",Quantity=2,AvgPrice=70000,Price=70000});b.SellableQuantities["005930"]=2;b.UnfilledQuantities["005930"]=0;b.CashSourceValidated["005930"]=true;b.BasisValidated["005930"]=true;return b;
         }
         static AccountOrderCapacity Cap(string code,DateTime at){return new AccountOrderCapacity{Code=code,LimitPrice=10000,Ratio=100,Quantity=100,MaximumQuantity=100,Amount=1000000,MaximumAmount=1000000,ReceivedUtc=at.AddMilliseconds(-500)};}
         static LiveOrderIntent Buy(int qty=1){return new LiveOrderIntent{Kind=LiveOrderKind.Buy,Code="000660",Quantity=qty,LimitPrice=10000,ClientKey="new-entry"};}
@@ -41,7 +41,7 @@ namespace ShinhanNativeTrader {
         static void Known(Fixture f,int filled=0) {
             f.Journal.Orders.Add(Working(filled));f.Journal.LastBrokerChangeUtc=Now.AddSeconds(-6);
             var balance=Positions(Now.AddMilliseconds(100));balance.Holdings.Add(new Holding{Code="000880",Quantity=filled,AvgPrice=filled==0?0:9950,Price=10000});
-            balance.SellableQuantities["000880"]=filled;balance.UnfilledQuantities["000880"]=10-filled;balance.CashSourceValidated["000880"]=true;
+            balance.SellableQuantities["000880"]=filled;balance.UnfilledQuantities["000880"]=10-filled;balance.CashSourceValidated["000880"]=true;balance.BasisValidated["000880"]=true;
             f.Data.ObserveTradeBalance(balance);
             var orders=new BrokerOrdersSnapshot{TradingDate="20261112",ReceivedUtc=Now.AddMilliseconds(-100)};
             orders.Orders.Add(new BrokerOrderRow{OrderNumber="11",Code="000880",SideCode="2",ProductCode="01",CreditCode="00",Quantity=10,LimitPrice=10000,FilledQuantity=filled,OpenQuantity=10-filled,AverageFillPrice=filled==0?0:9950});
@@ -107,6 +107,19 @@ namespace ShinhanNativeTrader {
             Check(!f.Evaluate().Ready,"outside-program open orders cannot be treated as local reconciliation evidence");
             f=new Fixture();var pending=Positions(Now.AddMilliseconds(100));pending.UnfilledQuantities["005930"]=1;f.Data.ObserveTradeBalance(pending);
             Check(!f.Evaluate().Ready,"neutral broker pending quantity must match known open order rows");
+
+            f=new Fixture();var priorReady=f.Evaluate();var unknownBasis=Positions(Now.AddMilliseconds(100));unknownBasis.BasisVerified=false;
+            Check(f.Data.ObserveTradeBalance(unknownBasis),"unknown basis data can replace the display snapshot without being rejected as a transport failure");
+            Check(!f.Evaluate().Ready&&!f.Evaluate().Checks.OrdersReconciled,"unknown holding basis cannot certify account exposure for a new buy");
+            Check(!f.Evaluate(Sell()).Ready,"unknown holding basis cannot authorize a sale even when the numeric quantity is positive");
+            Check(!priorReady.EvidenceStillCurrent(),"an accepted unknown-basis response invalidates an older ready proof");
+            var mismatchedBasis=Positions(Now.AddMilliseconds(200));mismatchedBasis.BasisValidated["005930"]=false;f.Data.ObserveTradeBalance(mismatchedBasis);
+            Check(!f.Evaluate().Ready,"an aggregate basis flag cannot override an unverified individual position");
+            f.Data.ObserveTradeBalance(Positions(Now.AddMilliseconds(300)));Check(f.Evaluate().Ready,"a later explicitly verified trade-basis frame can restore data readiness");
+            f=new Fixture();var empty=new BrokerHoldingsSnapshot{RequestStartedUtc=Now.AddMilliseconds(-200),ReceivedUtc=Now.AddMilliseconds(-100)};f.Data.ObserveTradeBalance(empty);
+            Check(!f.Evaluate().Ready,"an unbound empty query response is not assumed to be a complete trade-basis balance");
+            empty=new BrokerHoldingsSnapshot{BasisVerified=true,RequestStartedUtc=Now.AddMilliseconds(-100),ReceivedUtc=Now};f.Data.ObserveTradeBalance(empty);
+            Check(f.Evaluate().Ready,"an explicitly request-bound empty trade-basis frame permits a new buy after the last position has been sold");
 
             f=new Fixture();Check(f.Evaluate(Sell(2)).Ready&&f.Evaluate(Sell(2)).Checks.SellableQuantity==2,"a supported fresh trade-basis quantity can support a bounded cash-stock sale");
             Check(!f.Evaluate(Sell(3)).Ready,"settlement or total holding quantity cannot expand verified sellable quantity");
