@@ -9,7 +9,7 @@ using System.Windows.Forms;
 
 namespace ShinhanNativeTrader {
     internal static class Program {
-        internal const string Version="1.2.0";
+        internal const string Version="1.3.0";
         [STAThread]
         static int Main(string[] args) {
             if (args.Contains("--selftest")) {
@@ -63,7 +63,7 @@ namespace ShinhanNativeTrader {
         readonly Queue<Candidate> buyQuotes = new Queue<Candidate>();
         readonly Dictionary<string, DateTime> quoteDue = new Dictionary<string, DateTime>();
         IndiApi api; PaperTradingEngine engine; Candidate requestedBuy;
-        bool scanning, trading, halted, requestedScan; int scanned, holdingRequests;
+        bool scanning, trading, halted, requestedScan,firstQueryQueued; int scanned, holdingRequests,connectionEpoch;
 
         public MainForm() {
             Text = "Shinhan Native Trader "+Program.Version+" | .NET 4.8 x86 | 실주문 잠금";
@@ -125,6 +125,7 @@ namespace ShinhanNativeTrader {
         void Safe(Action action) {
             try { action(); } catch (Exception ex) {
                 Halt(); Log("작업 중단: " + ex.GetBaseException().GetType().Name+" HRESULT=0x"+ex.GetBaseException().HResult.ToString("X8"));
+                if(ex is IndiConnectionException)Log(ex.Message);
                 // Vendor exceptions can echo request fields; never persist their text.
                 state.Text = "작업 오류로 자동 처리 중단. 입력·상태 확인 (" + ex.GetType().Name + ")";
             }
@@ -136,11 +137,18 @@ namespace ShinhanNativeTrader {
         string ValidCode() { var value = Rules.Code(code.Text); if (value == "") throw new ArgumentException("6자리 종목코드 필요"); return value; }
         void Connect() {
             if (api == null) { api = new IndiApi(nativeArea); api.Trace += Log; api.Done += reply => Safe(() => Reply(reply)); api.Fatal += message => { Halt(); state.Text = "Indi 응답 실패. 진단 로그의 INDI 오류 정보를 확인하십시오."; }; }
-            if(api.Busy)return;
+            if(api.Busy||firstQueryQueued)return;
             // Set waiting text first: RequestData may call Done or Fatal synchronously.
             state.Text = "OCX 준비 및 stock_mst 응답 확인 중 (수신 전에는 연결 성공 아님)";
             api.Connect();
-            if(!api.Stocks()&&api.TransportReady)state.Text="종목 요청을 보내지 못했습니다. 진단 로그를 확인하십시오.";
+            firstQueryQueued=true;int epoch=++connectionEpoch;
+            // Let the initialized ActiveX return to its owning UI pump before its first
+            // query. The standard designer-created control receives this pump turn too.
+            BeginInvoke(new Action(()=> {
+                if(IsDisposed||epoch!=connectionEpoch)return;
+                firstQueryQueued=false;
+                Safe(()=>{if(!api.Stocks()&&api.TransportReady)state.Text="종목 요청을 보내지 못했습니다. 진단 로그를 확인하십시오.";});
+            }));
         }
         void StartScan() {
             RequireIdle(); RequireEngine(); if (symbols.Count == 0) throw new InvalidOperationException("종목조회 필요"); if (scanning) return;
@@ -148,7 +156,7 @@ namespace ShinhanNativeTrader {
             foreach (var s in symbols.OrderBy(x => x.Code)) scans.Enqueue(s);
             scanning = true; trading = true; Log("전체 스캔 시작. 최신 현재가 조회 후에만 모의매수합니다.");
         }
-        public void Halt() { scanning = false; trading = false; requestedScan = false; scans.Clear(); buyQuotes.Clear(); requestedBuy = null; state.Text = "자동 처리 중단 / 실주문 잠금"; }
+        public void Halt() { scanning = false; trading = false; requestedScan = false; firstQueryQueued=false;connectionEpoch++;scans.Clear(); buyQuotes.Clear(); requestedBuy = null; state.Text = "자동 처리 중단 / 실주문 잠금"; }
         void Schedule() {
             if (!trading || api == null || !api.Connected || api.Busy) return; RequireEngine();
             var due = engine.Snapshot.Positions.Where(p => !quoteDue.ContainsKey(p.Code) || quoteDue[p.Code] <= DateTime.UtcNow)

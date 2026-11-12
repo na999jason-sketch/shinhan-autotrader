@@ -105,12 +105,16 @@ namespace ShinhanNativeTrader {
         object Invoke(string method,params object[] args);
     }
 
+    internal sealed class IndiConnectionException : Exception {
+        public IndiConnectionException(string safeMessage) : base(safeMessage) {}
+    }
+
     internal sealed class ComIndiTransport : IIndiTransport,IIndiDiagnostics {
         readonly Control surface;
         readonly int ownerThread;
         readonly Action<string> log;
         ComEventSubscriptions subscriptions;
-        IndiHost host;object com;ComEventInfo source;bool disposed;
+        IndiHost host;object com;ComEventInfo source;IndiReadOnlyDispatch dispatch;bool disposed;
         public event Action<int> ReceiveData;
         public event Action<int> ReceiveSysMsg;
         public event Action<string> Error;
@@ -128,9 +132,19 @@ namespace ShinhanNativeTrader {
                 if(subscriptions==null||subscriptions.Count!=2)throw new InvalidOperationException("AxHost did not complete its event CreateSink stage.");
                 log("ActiveX site ready; handleCreated="+host.IsHandleCreated+" visible="+host.Visible+
                     "; server response NOT YET VERIFIED.");
+                ComMethodInfo initialization;
+                if(!source.Methods.TryGetValue("StartIndi",out initialization)||initialization.Parameters!=4||initialization.ReturnType!=VarEnum.VT_BOOL)
+                    throw new IndiConnectionException("설치된 Indi의 StartIndi 초기화 서명이 지원되지 않습니다.");
+                string starter=IndiInstallation.FindStarter(Type.GetTypeFromProgID("GIEXPERTCONTROL.GiExpertControlCtrl.1",true).GUID);
+                if(starter==null)throw new IndiConnectionException("등록된 신한 Indi 설치 폴더에서 giexpertstarter.exe를 찾지 못했습니다.");
+                // A running Helper establishes the shared service, not this newly-created
+                // OCX instance. Follow the C# sample's per-control initialization call.
+                bool started=dispatch.Initialize(starter);
+                log("OCX StartIndi initialization invoked; result="+started+"; credentials supplied by this app: none.");
+                log(IndiDiagnosticFormatter.Format(ReadDiagnostics(),new string[0]));
             }catch{Dispose();throw;}
         }
-        void AttachInterfaces(object control){com=control;source=ComTypeDiscovery.Discover(control);}
+        void AttachInterfaces(object control){com=control;source=ComTypeDiscovery.Discover(control);dispatch=new IndiReadOnlyDispatch(control);}
         void CreateSink(object control) {
             DetachSink();
             if(source==null)AttachInterfaces(control);
@@ -168,12 +182,12 @@ namespace ShinhanNativeTrader {
             if(disposed)throw new ObjectDisposedException("ComIndiTransport");
             if(Thread.CurrentThread.ManagedThreadId!=ownerThread)throw new InvalidOperationException("Indi call must use its owning STA.");
             // This control is reserved for read-only requests, even if another caller gets this boundary.
-            if(method!="SetQueryName"&&method!="SetSingleData"&&method!="RequestData"&&method!="GetSingleData"&&
+            if(method!="SetQueryName"&&method!="GetQueryName"&&method!="SetSingleData"&&method!="RequestData"&&method!="GetSingleData"&&
                 method!="GetMultiData"&&method!="GetMultiRowCount"&&!DiagnosticMethod(method))throw new InvalidOperationException("Read-only Indi method not allowed: "+method);
             if(DiagnosticMethod(method)&&(!SupportsDiagnostic(method)||args.Length!=0))throw new InvalidOperationException("Installed Indi diagnostic signature is unavailable.");
             if(method=="SetQueryName"&&(args.Length!=1||!new[]{"stock_mst","TR_SCHART","SC","SABA200QB"}.Contains(Convert.ToString(args[0]))))
                 throw new InvalidOperationException("Read-only Indi query not allowed.");
-            return com.GetType().InvokeMember(method,BindingFlags.InvokeMethod,null,com,args,CultureInfo.InvariantCulture);
+            return dispatch.Invoke(method,args);
         }
         static bool DiagnosticMethod(string name) {
             return name=="GetCommState"||name=="GetErrorState"||name=="GetErrorCode"||name=="GetErrorMessage";
@@ -207,7 +221,7 @@ namespace ShinhanNativeTrader {
             DetachSink();
             if(host!=null){host.Dispose();host=null;}
             // AxHost owns its RCW; do not FinalReleaseComObject behind the ActiveX site.
-            com=null;
+            com=null;dispatch=null;
         }
     }
 
@@ -342,6 +356,11 @@ namespace ShinhanNativeTrader {
             try {
                 Diagnose(current,"before "+query);
                 Accepted(io.Invoke("SetQueryName",query),"SetQueryName");
+                stage="GetQueryName";
+                var actualQuery=io.Invoke("GetQueryName") as string;
+                if(actualQuery==null||!string.Equals(actualQuery.Trim(),query,StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("Installed Indi did not retain the requested query name.");
+                Log("Query name readback verified: "+query);
                 stage="SetSingleData";
                 if(input!=null)foreach(var field in input.OrderBy(x=>x.Key))Accepted(io.Invoke("SetSingleData",field.Key,field.Value),"SetSingleData");
                 stage="RequestData";

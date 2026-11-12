@@ -25,7 +25,7 @@ namespace ShinhanNativeTrader {
             Check(Rules.PaperQty(100000,10000)==1,"budget sizing includes buffer");
             Check(Rules.PaperQty(0,10000)==0,"zero available cash");
             Check(!Rules.ValidTime(new DateTime(2026,11,10,18,0,0)),"do not trade after hours");
-            return 11 + IndiTests.Run() + IndiDiagnosticTests.Run() + TradingEngineTests.Run();
+            return 11 + IndiTests.Run() + IndiDiagnosticTests.Run() + IndiInstallationTests.Run() + TradingEngineTests.Run();
         }
     }
 }

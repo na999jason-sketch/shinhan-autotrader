@@ -2,3 +2,4 @@ LIBRARY NativeComFixture
 EXPORTS
     CreateFixture
     GetLiveFixtureCount
+    CreateTypedFixture

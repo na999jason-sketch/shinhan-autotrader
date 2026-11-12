@@ -18,6 +18,8 @@ internal static class NativeComTests {
     static extern int CreateFixture(out IntPtr value);
     [DllImport("NativeComFixture.dll", CallingConvention=CallingConvention.Cdecl, ExactSpelling=true)]
     static extern int GetLiveFixtureCount();
+    [DllImport("NativeComFixture.dll", CallingConvention=CallingConvention.Cdecl, ExactSpelling=true)]
+    static extern int CreateTypedFixture(out IntPtr value);
     static void Check(bool pass, string message) {
         checks++;
         if(!pass) throw new Exception(message);
@@ -114,5 +116,67 @@ internal static class NativeComTests {
             Marshal.FinalReleaseComObject(source);
         }
         Check(GetLiveFixtureCount() == 0,"native fixture releases after exact delegate detach and RCW disposal");
+        RunTypedDispatch();
+    }
+    static void RunTypedDispatch() {
+        IntPtr pointer; Marshal.ThrowExceptionForHR(CreateTypedFixture(out pointer));
+        object source;
+        try { source=Marshal.GetObjectForIUnknown(pointer); } finally { Marshal.Release(pointer); }
+        var directory=Path.Combine(Path.GetTempPath(),"IndiDispatchFixture-"+Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var starter=Path.Combine(directory,"giexpertstarter.exe");
+        // An empty marker exercises marshaling only; no executable is launched by the fixture.
+        File.WriteAllText(starter,"");
+        var priorCulture=CultureInfo.CurrentCulture;
+        try {
+            var adapter=new IndiReadOnlyDispatch(source);
+            Check(Marshal.IsComObject(source),"typed command adapter obtains its exact dispatch IID from a native RCW");
+            bool invalidPath=false;
+            try { adapter.Initialize("giexpertstarter.exe"); } catch(ArgumentException) { invalidPath=true; }
+            Check(invalidPath&&Number(source,"GetInitializeCount")==0,"relative starter paths are rejected before invoking COM");
+            Check(adapter.Initialize(starter),"explicit initialization uses the typed StartIndi DISPID");
+            Check(Number(source,"GetInitializeCount")==1&&Number(source,"GetBlankCredentialCount")==3,"StartIndi receives three empty VARIANT BSTR credentials");
+            Check(Convert.ToString(Invoke(source,"GetLastPath"),CultureInfo.InvariantCulture)==starter,"initialization forwards the full selected starter path");
+            Check(Number(source,"GetLastDispId")==25&&Number(source,"GetFirstArgType")==8&&Number(source,"GetSecondArgType")==8,"initialization preserves its DISPID and VARIANT string argument types");
+            CultureInfo.CurrentCulture=CultureInfo.GetCultureInfo("ko-KR");
+            Check((bool)adapter.Invoke("SetQueryName","stock_mst"),"typed SetQueryName returns VARIANT_BOOL correctly");
+            Check(Number(source,"GetFirstArgType")==8,"typed query name is a VARIANT BSTR");
+            Check((string)adapter.Invoke("GetQueryName")=="stock_mst","typed query readback preserves the selected query");
+            int typedLcid=Number(source,"GetLastLcid");
+            Check(typedLcid!=CultureInfo.InvariantCulture.LCID,"typed dispatch does not force the reflection invariant-culture LCID");
+            Invoke(source,"GetQueryName");
+            Check(Number(source,"GetLastLcid")==CultureInfo.InvariantCulture.LCID,"reflection path demonstrably supplied invariant LCID127");
+            Check((bool)adapter.Invoke("SetSingleData",0,"005930"),"typed single input accepts an integer field index and string value");
+            Check(Number(source,"GetFirstArgType")==2&&Number(source,"GetSecondArgType")==8,"single input marshals index as VT_I2 and data as VARIANT BSTR");
+            Check((string)adapter.Invoke("GetSingleData",1)=="005930"&&Number(source,"GetLastIndex")==1,"typed single data uses its Int16 index contract");
+            Check((string)adapter.Invoke("GetMultiData",2,5)=="70000","typed multi data returns a VARIANT value");
+            Check(Number(source,"GetFirstArgType")==2&&Number(source,"GetSecondArgType")==2&&Number(source,"GetLastRow")==2&&Number(source,"GetLastIndex")==5,"multi data preserves reversed COM arguments and both VT_I2 widths");
+            object id=adapter.Invoke("RequestData");
+            Check(id is short&&(short)id==73,"RequestData remains boxed Int16 instead of converting null or bool");
+            Check(adapter.Invoke("GetMultiRowCount") is short&&(short)adapter.Invoke("GetMultiRowCount")==1,"row count follows the Int16 return contract");
+            Check((short)adapter.Invoke("GetCommState")==0&&(short)adapter.Invoke("GetErrorState")==0,"typed diagnostic state getters preserve zero values");
+            Check((string)adapter.Invoke("GetErrorCode")==""&&(string)adapter.Invoke("GetErrorMessage")=="","typed diagnostic variant getters preserve empty values");
+            int before=Number(source,"GetCallCount");
+            bool refused=false;
+            try { adapter.Invoke("SetQueryName","SABA101U1"); } catch(InvalidOperationException) { refused=true; }
+            Check(refused&&Number(source,"GetCallCount")==before,"order query is rejected before native dispatch");
+            refused=false;
+            try { adapter.Invoke("StartIndi","id","password","certificate",starter); } catch(InvalidOperationException) { refused=true; }
+            Check(refused&&Number(source,"GetCallCount")==before,"generic invocation cannot supply login credentials");
+            refused=false;
+            try { adapter.Invoke("GetSingleData",40000); } catch(ArgumentException) { refused=true; }
+            Check(refused&&Number(source,"GetCallCount")==before,"overflowing indices are rejected before COM");
+            refused=false;
+            try { adapter.Invoke("GetSingleData","1"); } catch(ArgumentException) { refused=true; }
+            Check(refused&&Number(source,"GetCallCount")==before,"string indices are rejected instead of silently converting to Int16");
+            refused=false;
+            try { adapter.Invoke("GetSingleData",false); } catch(ArgumentException) { refused=true; }
+            Check(refused&&Number(source,"GetCallCount")==before,"bool indices are rejected instead of silently becoming zero");
+        } finally {
+            CultureInfo.CurrentCulture=priorCulture;
+            Marshal.FinalReleaseComObject(source);
+            Directory.Delete(directory,true);
+        }
+        Check(GetLiveFixtureCount()==0,"typed native command fixture is released without invoking a broker");
     }
 }

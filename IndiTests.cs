@@ -14,13 +14,15 @@ namespace ShinhanNativeTrader {
             public int DiagnosticReads;
             public readonly IndiDiagnosticSnapshot Diagnostic=new IndiDiagnosticSnapshot{CommState=0,ErrorState=0,ErrorCode="0",Message=""};
             public bool SetQueryAccepted=true,SetFieldAccepted=true;
+            public string QueryName,QueryReadbackOverride;
             public string ThrowMethod;
             public Action DuringRequest;
             public readonly Dictionary<string,object> Fields=new Dictionary<string,object>();
             public object Invoke(string method,params object[] args) {
                 if(method==ThrowMethod)throw new InvalidOperationException("account-123-password-SECRET");
                 switch(method) {
-                    case "SetQueryName":return SetQueryAccepted;
+                    case "SetQueryName":QueryName=Convert.ToString(args[0],CultureInfo.InvariantCulture);return SetQueryAccepted;
+                    case "GetQueryName":return QueryReadbackOverride??QueryName;
                     case "SetSingleData":return SetFieldAccepted;
                     case "RequestData":RequestCount++;if(DuringRequest!=null)DuringRequest();if(ErrorAfterRequest)Diagnostic.ErrorState=2;return OverrideRequestReturn?RequestReturn:Id;
                     case "GetMultiRowCount":return Rows;
@@ -121,6 +123,10 @@ namespace ShinhanNativeTrader {
             Check(BeginQuote(requests)&&!privateLog.Contains("4321"),"retained provider messages cannot leak a prior request password");requests.Dispose();
             fake=new FakeIndi{SetQueryAccepted=false};requests=new IndiRequestCoordinator(fake);
             Check(!BeginQuote(requests)&&requests.Failed&&fake.RequestCount==0,"SetQueryName failure prevents request");requests.Dispose();
+            fake=new FakeIndi{QueryReadbackOverride="wrong_query"};requests=new IndiRequestCoordinator(fake);
+            Check(!BeginQuote(requests)&&requests.Failed&&fake.RequestCount==0,"query readback mismatch prevents a malformed request");requests.Dispose();
+            fake=new FakeIndi{QueryReadbackOverride="sc  "};fake.Quote();requests=new IndiRequestCoordinator(fake);
+            Check(BeginQuote(requests),"canonical query readback permits case normalization and padding");requests.Dispose();
             fake=new FakeIndi{SetFieldAccepted=false};requests=new IndiRequestCoordinator(fake);
             Check(!BeginQuote(requests)&&requests.Failed&&fake.RequestCount==0,"SetSingleData failure prevents request");requests.Dispose();
 
