@@ -59,6 +59,7 @@ namespace ShinhanNativeTrader {
         static void Check(bool condition,string name){checks++;if(!condition)throw new Exception("Indi test failed: "+name);}
         static void Reject(Action action,string name){bool rejected=false;try{action();}catch(InvalidOperationException){rejected=true;}Check(rejected,name);}
         static bool BeginQuote(IndiRequestCoordinator requests){return requests.Begin("QUOTE","SC",new Dictionary<int,string>{{0,"005930"}},"005930");}
+        static bool BeginSnapshot(IndiRequestCoordinator requests){return requests.Begin("SNAPSHOT","TR_1110_11",new Dictionary<int,string>{{0,"005930"}},"005930");}
         public static int Run() {
             checks=0;
             var fake=new FakeIndi();fake.Quote();var requests=new IndiRequestCoordinator(fake);
@@ -190,8 +191,42 @@ namespace ShinhanNativeTrader {
             BeginQuote(requests);fake.Data(7);Check(requests.Failed,"malformed quote faults closed");requests.Dispose();
             fake=new FakeIndi();fake.Quote(code:"000660");
             Reject(()=>IndiResponseParser.Read(fake,"QUOTE","005930"),"response symbol must match requested symbol");
-            fake.Quote(clock:"256100");Reject(()=>IndiResponseParser.Read(fake,"QUOTE","005930"),"invalid quote clock rejected");
+            fake.Quote(clock:"256100");reply=IndiResponseParser.Read(fake,"QUOTE","005930");
+            Check(reply.Price==70000&&!reply.HasTradeClock&&reply.Clock==""&&reply.Message.Contains("자동매매 사용 제외"),"invalid trade clock permits display only and is never fabricated");
+            Check(!MarketTime.CanUseQuote(reply,new DateTime(2026,11,12,0,15,30,DateTimeKind.Utc)),"invalid trade clock blocks paper buy and sell use");
+            fake.Quote(clock:"");reply=IndiResponseParser.Read(fake,"QUOTE","005930");
+            Check(reply.Price==70000&&!reply.HasTradeClock&&!MarketTime.CanUseQuote(reply,new DateTime(2026,11,12,0,15,30,DateTimeKind.Utc)),"missing trade clock cannot halt a valid display price or feed paper trading");
+            fake.Quote();reply=IndiResponseParser.Read(fake,"QUOTE","005930");
+            Check(reply.HasTradeClock&&MarketTime.CanUseQuote(reply,new DateTime(2026,11,12,0,15,30,DateTimeKind.Utc)),"validated SC time is usable only during a fresh regular session");
+            Check(!MarketTime.CanUseQuote(reply,new DateTime(2026,11,12,0,17,0,DateTimeKind.Utc)),"stale valid SC clock remains blocked");
+            Check(!MarketTime.CanUseQuote(new IndiReply{Code="",Price=70000,Clock="091530",HasTradeClock=true},new DateTime(2026,11,12,0,15,30,DateTimeKind.Utc)),"empty symbol cannot pass the common trading quote gate");
             fake.Quote(price:"-70,000");Check(IndiResponseParser.Read(fake,"QUOTE","005930").Price==70000,"signed broker quote price normalized");
+
+            // The official snapshot has 31 outputs, price at24, and no symbol/time
+            // echoes. Distinct old SC fields catch accidental reuse of its layout.
+            fake=new FakeIndi();fake.Fields["s:1"]="not a symbol echo";fake.Fields["s:2"]="not a clock";
+            fake.Fields["s:3"]="not a price";fake.Fields["s:24"]="70,000";
+            requests=new IndiRequestCoordinator(fake);received=0;fatal=0;diagnostics="";
+            requests.Done+=value=>{received++;reply=value;};requests.Fatal+=reason=>fatal++;requests.Trace+=value=>diagnostics+=value;
+            Check(BeginSnapshot(requests)&&fake.QueryName=="TR_1110_11"&&requests.Busy,"manual current-price request uses the dedicated snapshot TR");
+            fake.Data(99);Check(received==0&&requests.Busy,"snapshot response correlation rejects unrelated IDs");
+            fake.Data(7);
+            Check(received==1&&fatal==0&&!requests.Failed&&reply.Kind=="QUOTE"&&reply.Code=="005930"&&reply.Price==70000,"snapshot price24 is delivered to the quote UI with requested symbol");
+            Check(!reply.HasTradeClock&&reply.Clock==""&&!MarketTime.CanUseQuote(reply,new DateTime(2026,11,12,0,15,30,DateTimeKind.Utc)),"snapshot receipt time never substitutes for trade time");
+            reply.Clock="091530";Check(!MarketTime.CanUseQuote(reply,new DateTime(2026,11,12,0,15,30,DateTimeKind.Utc)),"display-only snapshot flag blocks trading even if a clock is supplied later");
+            Check(diagnostics.Contains("price[24]")&&!diagnostics.Contains("not a symbol echo"),"snapshot diagnostics only inspect documented public price output");requests.Dispose();
+
+            fake=new FakeIndi();fake.Fields["s:24"]="";requests=new IndiRequestCoordinator(fake);diagnostics="";
+            requests.Trace+=value=>diagnostics+=value;BeginSnapshot(requests);fake.Data(7);
+            Check(requests.Failed&&diagnostics.Contains("TR_1110_11 price single[24]"),"empty snapshot price fails with the exact field context");requests.Dispose();
+            fake.Fields["s:24"]="0";Reject(()=>IndiResponseParser.Read(fake,"SNAPSHOT","005930"),"zero snapshot price is not a usable display quote");
+
+            fake=new FakeIndi();fake.Quote(code:"");requests=new IndiRequestCoordinator(fake);diagnostics="";
+            requests.Trace+=value=>diagnostics+=value;BeginQuote(requests);fake.Data(7);
+            Check(requests.Failed&&diagnostics.Contains("SC symbol single[1]")&&diagnostics.Contains("symbol[1]=\"\""),"SC symbol failure identifies the exact missing field");requests.Dispose();
+            fake=new FakeIndi();fake.Quote(price:"N/A");requests=new IndiRequestCoordinator(fake);diagnostics="";
+            requests.Trace+=value=>diagnostics+=value;BeginQuote(requests);fake.Data(7);
+            Check(requests.Failed&&diagnostics.Contains("SC price single[3]")&&diagnostics.Contains("price[3]=\"N/A\""),"SC price failure preserves only public quote fields and parser-owned context");requests.Dispose();
             Reject(()=>IndiResponseParser.RequiredNumber("", "cash"),"blank numeric field not zero");
             Reject(()=>IndiResponseParser.RequiredNumber("1e6", "cash"),"scientific notation rejected");
             Reject(()=>IndiResponseParser.RequiredNumber("1,,000", "cash"),"bad comma grouping rejected");

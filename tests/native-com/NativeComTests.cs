@@ -149,6 +149,12 @@ internal static class NativeComTests {
             Check((bool)adapter.Invoke("SetSingleData",0,"005930"),"typed single input accepts an integer field index and string value");
             Check(Number(source,"GetFirstArgType")==2&&Number(source,"GetSecondArgType")==8,"single input marshals index as VT_I2 and data as VARIANT BSTR");
             Check((string)adapter.Invoke("GetSingleData",1)=="005930"&&Number(source,"GetLastIndex")==1,"typed single data uses its Int16 index contract");
+            Check((bool)adapter.Invoke("SetQueryName","TR_1110_11")&&Number(source,"GetFirstArgType")==8,"manual snapshot query is admitted through the production typed read-only adapter");
+            Check((string)adapter.Invoke("GetQueryName")=="TR_1110_11","manual snapshot query retains its distinct native query name");
+            Check((bool)adapter.Invoke("SetSingleData",0,"005930")&&Number(source,"GetLastIndex")==0,"manual snapshot forwards its sole short-code input at index zero");
+            Check((string)adapter.Invoke("GetSingleData",24)=="70000"&&Number(source,"GetLastIndex")==24&&Number(source,"GetFirstArgType")==2,"manual snapshot price reads native field24 with a VT_I2 index");
+            Check((string)adapter.Invoke("GetSingleData",1)=="","manual snapshot fixture does not invent the SC symbol echo");
+            Check((bool)adapter.Invoke("SetQueryName","SC")&&(string)adapter.Invoke("GetQueryName")=="SC","SC quote polling remains admitted separately from manual snapshots");
             Check((string)adapter.Invoke("GetMultiData",2,5)=="70000","typed multi data returns a VARIANT value");
             Check(Number(source,"GetFirstArgType")==2&&Number(source,"GetSecondArgType")==2&&Number(source,"GetLastRow")==2&&Number(source,"GetLastIndex")==5,"multi data preserves reversed COM arguments and both VT_I2 widths");
             object id=adapter.Invoke("RequestData");
@@ -160,6 +166,11 @@ internal static class NativeComTests {
             bool refused=false;
             try { adapter.Invoke("SetQueryName","SABA101U1"); } catch(InvalidOperationException) { refused=true; }
             Check(refused&&Number(source,"GetCallCount")==before,"order query is rejected before native dispatch");
+            foreach(var orderQuery in new[]{"SABA102U1","SCDA601U2"}) {
+                refused=false;
+                try { adapter.Invoke("SetQueryName",orderQuery); } catch(InvalidOperationException) { refused=true; }
+                Check(refused&&Number(source,"GetCallCount")==before,"additional order or cancellation query is rejected before native dispatch: "+orderQuery);
+            }
             refused=false;
             try { adapter.Invoke("StartIndi","id","password","certificate",starter); } catch(InvalidOperationException) { refused=true; }
             Check(refused&&Number(source,"GetCallCount")==before,"generic invocation cannot supply login credentials");

@@ -69,7 +69,7 @@ namespace ShinhanNativeTrader {
                 case "SetQueryName":
                     Count(args,1);
                     var query=args[0] as string;
-                    if(query!="stock_mst"&&query!="TR_SCHART"&&query!="SC"&&query!="SABA200QB")
+                    if(query!="stock_mst"&&query!="TR_SCHART"&&query!="SC"&&query!="TR_1110_11"&&query!="SABA200QB")
                         throw new InvalidOperationException("Only known read-only Indi queries are allowed.");
                     return dispatch.SetQueryName(query);
                 case "SetSingleData":

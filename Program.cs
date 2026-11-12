@@ -9,7 +9,7 @@ using System.Windows.Forms;
 
 namespace ShinhanNativeTrader {
     internal static class Program {
-        internal const string Version="1.4.1";
+        internal const string Version="1.4.2";
         [STAThread]
         static int Main(string[] args) {
             if (args.Contains("--selftest")) {
@@ -75,7 +75,7 @@ namespace ShinhanNativeTrader {
             var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = true }; root.Controls.Add(buttons, 0, 1);
             AddButton(buttons, "Indi 연결·종목 조회", Connect); buttons.Controls.Add(code);
             AddButton(buttons, "일봉 분석", () => { RequireIdle(); requestedScan = false; api.Bars(ValidCode(), BarCount()); });
-            AddButton(buttons, "현재가 조회", () => { RequireIdle(); requestedBuy = null; api.Quote(ValidCode()); });
+            AddButton(buttons, "현재가 조회", () => { RequireIdle(); requestedBuy = null; api.SnapshotQuote(ValidCode()); });
             AddButton(buttons, "전체 스캔·모의매매 시작", StartScan);
             AddButton(buttons, "모의 보유 감시 재개", () => { RequireIdle(); RequireEngine(); trading = true; Log("모의 보유종목 감시 시작"); });
             AddButton(buttons, "자동 처리 중단", Halt);
@@ -181,8 +181,11 @@ namespace ShinhanNativeTrader {
                 if (c != null) { candidatesGrid.Rows.Add(c.Code, c.Name, c.Price, c.Score, c.Reason); if (fromScan && trading && scanning) buyQuotes.Enqueue(c); }
                 state.Text = "일봉 분석 " + scanned + " / 대기 " + scans.Count + " / 후보 " + candidatesGrid.Rows.Count;
             } else if (r.Kind == "QUOTE") {
-                var intent = requestedBuy; requestedBuy = null; Log("현재가 " + r.Code + " " + r.Price.ToString("N0") + " 시각=" + r.Clock);
-                if (!trading || engine == null || !Rules.ValidTime(MarketTime.NowKorea) || !MarketTime.IsFreshQuote(r.Clock, DateTime.UtcNow) || r.Price <= 0) return;
+                var intent = requestedBuy; requestedBuy = null;
+                state.Text="현재가 "+r.Code+" "+r.Price.ToString("N0")+"원 / "+(r.HasTradeClock?"체결시각 "+r.Clock:"거래시각 미확인 · 자동매매 사용 제외");
+                Log("현재가 " + r.Code + " " + r.Price.ToString("N0") + " 시각=" + (r.HasTradeClock?r.Clock:"미확인"));
+                if(!string.IsNullOrEmpty(r.Message))Log(r.Message);
+                if (!trading || engine == null || !MarketTime.CanUseQuote(r,DateTime.UtcNow)) return;
                 var p = engine.Snapshot.Positions.FirstOrDefault(x => x.Code == r.Code);
                 if (p != null) {
                     var reason = engine.UpdateQuote(r.Code, r.Price);

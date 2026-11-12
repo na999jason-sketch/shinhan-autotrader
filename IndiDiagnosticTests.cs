@@ -69,6 +69,19 @@ namespace ShinhanNativeTrader {
             Check(IndiDiagnosticFormatter.Format(null, new[] { "1234" }).Contains("unavailable"), "null snapshot is supported");
             line = IndiDiagnosticFormatter.Format(snapshot, BrokenSecrets());
             Check(line.Contains("redaction input failure") && !line.Contains(originalMessage), "redaction input failure withholds provider text");
+
+            line=IndiDiagnosticFormatter.FormatQuote("QUOTE","005930","15:30:00","70,000",null);
+            Check(line.Contains("symbol[1]=\"005930\"")&&line.Contains("clock[2]=\"15:30:00\"")&&line.Contains("price[3]=\"70,000\""),"public quote diagnostics preserve exact documented fields and shapes");
+            line=IndiDiagnosticFormatter.FormatQuote("QUOTE","1234567890","091530","pa\nss",new[]{"1234567890","pa\nss"});
+            Check(!line.Contains("1234567890")&&!line.Contains("pa\\u000Ass")&&line.Contains("[REDACTED]"),"quote fields still redact all known session credentials before escaping");
+            line=IndiDiagnosticFormatter.FormatQuote("QUOTE","005930\0","15\r\n30\u202E","\"bad\\price",null);
+            Check(!line.Any(char.IsControl)&&!line.Contains("\u202E")&&line.Contains("\\u0000")&&line.Contains("\\u202E")&&line.Contains("\\\"bad\\\\price"),"invalid public quote characters are escaped in one physical line");
+            line=IndiDiagnosticFormatter.FormatQuote("SNAPSHOT","unused","unused",new string('9',1000),null);
+            Check(line.Contains("price[24]")&&!line.Contains("unused")&&line.Length<300&&line.Contains("length=1000"),"snapshot diagnostics are bounded and contain only field24");
+            line=IndiDiagnosticFormatter.FormatQuote("HOLDINGS","ACCOUNT","PASSWORD","SECRET",null);
+            Check(!line.Contains("ACCOUNT")&&!line.Contains("PASSWORD")&&!line.Contains("SECRET"),"public quote formatter refuses account response kinds");
+            line=IndiDiagnosticFormatter.FormatQuote("QUOTE","005930","091530","SECRET",BrokenSecrets());
+            Check(line.Contains("redaction input failure")&&!line.Contains("SECRET"),"quote redaction failure withholds the entire payload");
             return checks;
         }
     }

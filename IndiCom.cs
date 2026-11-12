@@ -186,7 +186,7 @@ namespace ShinhanNativeTrader {
             if(method!="SetQueryName"&&method!="GetQueryName"&&method!="SetSingleData"&&method!="RequestData"&&method!="GetSingleData"&&
                 method!="GetMultiData"&&method!="GetMultiRowCount"&&!DiagnosticMethod(method))throw new InvalidOperationException("Read-only Indi method not allowed: "+method);
             if(DiagnosticMethod(method)&&(!SupportsDiagnostic(method)||args.Length!=0))throw new InvalidOperationException("Installed Indi diagnostic signature is unavailable.");
-            if(method=="SetQueryName"&&(args.Length!=1||!new[]{"stock_mst","TR_SCHART","SC","SABA200QB"}.Contains(Convert.ToString(args[0]))))
+            if(method=="SetQueryName"&&(args.Length!=1||!new[]{"stock_mst","TR_SCHART","SC","TR_1110_11","SABA200QB"}.Contains(Convert.ToString(args[0]))))
                 throw new InvalidOperationException("Read-only Indi query not allowed.");
             return dispatch.Invoke(method,args);
         }
@@ -233,17 +233,27 @@ namespace ShinhanNativeTrader {
         public List<Bar> Bars=new List<Bar>();
         public List<Holding> Holdings=new List<Holding>();
         public decimal Price;
+        public bool HasTradeClock;
         public string Clock,Message,OrderNo;
     }
 
     public static class IndiResponseParser {
+        // Only parser-owned context is safe to print. Provider exception messages
+        // can contain credentials and must never be forwarded with InnerException.
+        sealed class FieldFailure : InvalidOperationException {
+            public readonly string Context;
+            public FieldFailure(string context,Exception inner=null):base(context,inner){Context=context;}
+        }
+        internal static string FailureContext(Exception error) {
+            var failure=error as FieldFailure;return failure==null?"unclassified provider/validation error":failure.Context;
+        }
         static readonly Regex Number=new Regex(@"^[+-]?(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)(?:\.[0-9]+)?$",RegexOptions.CultureInvariant);
         public static decimal RequiredNumber(object raw,string label,bool signed=false,bool optional=false) {
             var text=(Convert.ToString(raw,CultureInfo.InvariantCulture)??"").Trim();
             if(optional&&text=="")return 0;
             decimal value;
             if(!Number.IsMatch(text)||!decimal.TryParse(text.Replace(",",""),NumberStyles.AllowLeadingSign|NumberStyles.AllowDecimalPoint,
-                CultureInfo.InvariantCulture,out value)||(!signed&&value<0))throw new InvalidOperationException("Invalid Indi numeric field: "+label);
+                CultureInfo.InvariantCulture,out value)||(!signed&&value<0))throw new FieldFailure("Invalid numeric field: "+label);
             return value;
         }
         static int Rows(IIndiTransport io,int limit) {
@@ -251,9 +261,15 @@ namespace ShinhanNativeTrader {
             if(count!=decimal.Truncate(count)||count>limit)throw new InvalidOperationException("Indi row count outside supported range.");
             return (int)count;
         }
-        public static IndiReply Read(IIndiTransport io,string kind,string code) {
-            Func<int,string> single=col=>Convert.ToString(io.Invoke("GetSingleData",col),CultureInfo.InvariantCulture)??"";
-            Func<int,int,string> multi=(row,col)=>Convert.ToString(io.Invoke("GetMultiData",row,col),CultureInfo.InvariantCulture)??"";
+        public static IndiReply Read(IIndiTransport io,string kind,string code,Action<string,string,string> quoteTrace=null) {
+            Func<int,string> single=col=>{
+                try{return Convert.ToString(io.Invoke("GetSingleData",col),CultureInfo.InvariantCulture)??"";}
+                catch(Exception ex){throw new FieldFailure("GetSingleData index="+col+" failed",ex);}
+            };
+            Func<int,int,string> multi=(row,col)=>{
+                try{return Convert.ToString(io.Invoke("GetMultiData",row,col),CultureInfo.InvariantCulture)??"";}
+                catch(Exception ex){throw new FieldFailure("GetMultiData row="+row+" index="+col+" failed",ex);}
+            };
             var reply=new IndiReply{Kind=kind,Code=code};
             if(kind=="STOCKS") {
                 reply.Count=Rows(io,12000);var seen=new HashSet<string>();
@@ -279,11 +295,32 @@ namespace ShinhanNativeTrader {
                     reply.Bars.Add(bar);
                 }
             }else if(kind=="QUOTE") {
-                reply.Code=Rules.Code(single(1));reply.Price=Math.Abs(RequiredNumber(single(3),"quote price",true));reply.Clock=single(2).Trim();
+                var rawCode=single(1);var rawClock=single(2);var rawPrice=single(3);
+                if(quoteTrace!=null)quoteTrace(rawCode,rawClock,rawPrice);
+                reply.Code=Rules.Code(rawCode);
+                if(reply.Code=="")throw new FieldFailure("SC symbol single[1] is blank or invalid");
+                if(reply.Code!=code)throw new FieldFailure("SC symbol single[1] differs from requested symbol");
+                reply.Price=Math.Abs(RequiredNumber(rawPrice,"SC price single[3]",true));
+                if(reply.Price<=0)throw new FieldFailure("SC price single[3] must be positive");
+                reply.Clock=rawClock.Trim();
                 DateTime clock;
-                if(reply.Code==""||reply.Code!=code||reply.Price<=0||
-                    !DateTime.TryParseExact(reply.Clock,"HHmmss",CultureInfo.InvariantCulture,DateTimeStyles.None,out clock))
-                    throw new InvalidOperationException("SC quote symbol, price or clock does not match request.");
+                reply.HasTradeClock=DateTime.TryParseExact(reply.Clock,"HHmmss",CultureInfo.InvariantCulture,DateTimeStyles.None,out clock);
+                if(!reply.HasTradeClock) {
+                    reply.Clock="";reply.Message="거래시각 미확인: 가격 표시만 허용, 자동매매 사용 제외";
+                }
+            }else if(kind=="SNAPSHOT") {
+                // Official TR_1110_11 input0 identifies the stock; single24 is
+                // current price. There is no symbol echo or trade timestamp.
+                // Correlate the request ID and keep this display-only response
+                // outside all paper buy/sell paths, regardless of arrival time.
+                reply.Kind="QUOTE";
+                if(Rules.Code(code)==""||Rules.Code(code)!=code)throw new FieldFailure("Snapshot request symbol is invalid");
+                var rawPrice=single(24);
+                if(quoteTrace!=null)quoteTrace(code,"",rawPrice);
+                reply.Price=Math.Abs(RequiredNumber(rawPrice,"TR_1110_11 price single[24]",true));
+                if(reply.Price<=0)throw new FieldFailure("TR_1110_11 price single[24] must be positive");
+                reply.Clock="";reply.HasTradeClock=false;
+                reply.Message="조회 가격: 거래시각 미제공, 자동매매 사용 제외";
             }else if(kind=="HOLDINGS") {
                 reply.Count=Rows(io,2000);var seen=new HashSet<string>();
                 for(int row=0;row<reply.Count;row++) {
@@ -397,7 +434,8 @@ namespace ShinhanNativeTrader {
             if(diagnostic!=null&&diagnostic.ErrorState.HasValue&&diagnostic.ErrorState.Value>0)
                 snapshot.ProviderErrorState=diagnostic.ErrorState.Value;
             else {
-                try{snapshot.Reply=IndiResponseParser.Read(io,current.Kind,current.Code);}
+                try{snapshot.Reply=IndiResponseParser.Read(io,current.Kind,current.Code,
+                    (symbol,clock,price)=>Log(IndiDiagnosticFormatter.FormatQuote(current.Kind,symbol,clock,price,sessionSensitive)));}
                 catch(Exception ex){snapshot.Error=ex;}
             }
             if(!current.Id.HasValue) {
@@ -411,7 +449,7 @@ namespace ShinhanNativeTrader {
             if(snapshot.ProviderErrorState.HasValue) {
                 Halt("Indi returned an error in matching ReceiveData rid="+snapshot.Id+"; GetErrorState="+snapshot.ProviderErrorState.Value+". See sanitized INDI diagnostics.");return;
             }
-            if(snapshot.Error!=null){Diagnose(current,"response error rid="+snapshot.Id);Halt("Indi response parse failed ("+snapshot.Error.GetBaseException().GetType().Name+"); verify installed field layout. Exception text omitted.");return;}
+            if(snapshot.Error!=null){Diagnose(current,"response error rid="+snapshot.Id);Halt("Indi response parse failed ("+snapshot.Error.GetBaseException().GetType().Name+"); "+IndiResponseParser.FailureContext(snapshot.Error)+". Provider exception text omitted.");return;}
             pending=null;Log("RECEIVED "+current.Kind+" rid="+snapshot.Id+" rows="+snapshot.Reply.Count);
             if(Done!=null)Done(snapshot.Reply);
         }
@@ -457,6 +495,7 @@ namespace ShinhanNativeTrader {
             return Request("BARS","TR_SCHART",new Dictionary<int,string>{{0,code},{1,"D"},{2,"1"},{3,"00000000"},{4,"99999999"},{5,count.ToString(CultureInfo.InvariantCulture)}},code);
         }
         public bool Quote(string code){code=ValidateCode(code);return Request("QUOTE","SC",new Dictionary<int,string>{{0,code}},code);}
+        public bool SnapshotQuote(string code){code=ValidateCode(code);return Request("SNAPSHOT","TR_1110_11",new Dictionary<int,string>{{0,code}},code);}
         static string ValidateCode(string code){var normalized=Rules.Code(code);if(normalized=="")throw new ArgumentException("Six digit stock symbol required.");return normalized;}
         public bool Holdings(string account,string password) {
             if(string.IsNullOrWhiteSpace(account)||string.IsNullOrWhiteSpace(password))throw new InvalidOperationException("계좌번호/비밀번호를 PC 화면에서 입력해야 합니다.");

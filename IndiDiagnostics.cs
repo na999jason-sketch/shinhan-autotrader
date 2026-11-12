@@ -22,6 +22,32 @@ namespace ShinhanNativeTrader {
         const string Redacted = "[REDACTED]";
         static readonly Regex LongNumber = new Regex(@"\d{6,}", RegexOptions.CultureInvariant);
 
+        // This entry point is only for the documented public quote fields, never
+        // arbitrary holdings/order fields. Preserve their exact shapes to diagnose
+        // an empty/invalid symbol, price or time; still redact session credentials.
+        public static string FormatQuote(string kind,string symbol,string clock,string price,IEnumerable<string> sensitiveValues) {
+            string[] secrets;
+            try {
+                secrets=(sensitiveValues??Enumerable.Empty<string>()).Where(x=>!string.IsNullOrWhiteSpace(x))
+                    .SelectMany(x=>new[]{x,x.Trim()}).Distinct(StringComparer.Ordinal).OrderByDescending(x=>x.Length).ToArray();
+            }catch{return "QUOTE fields unavailable (redaction input failure).";}
+            if(kind!="QUOTE"&&kind!="SNAPSHOT")return "QUOTE fields unavailable (unsupported response kind).";
+            Func<string,string> field=raw=>{
+                var value=raw??"";
+                foreach(var secret in secrets)value=value.Replace(secret,Redacted);
+                var escaped=new StringBuilder();
+                foreach(var character in value.Take(40)) {
+                    if(char.IsControl(character)||char.GetUnicodeCategory(character)==UnicodeCategory.Format)
+                        escaped.Append("\\u"+((int)character).ToString("X4",CultureInfo.InvariantCulture));
+                    else if(character=='"'||character=='\\')escaped.Append('\\').Append(character);
+                    else escaped.Append(character);
+                }
+                return "\""+escaped+(value.Length>40?"...":"")+"\" (length="+(raw??"").Length+")";
+            };
+            return kind=="SNAPSHOT"?"TR_1110_11 fields: price[24]="+field(price)
+                :"SC fields: symbol[1]="+field(symbol)+"; clock[2]="+field(clock)+"; price[3]="+field(price);
+        }
+
         public static string Format(IndiDiagnosticSnapshot snapshot, IEnumerable<string> sensitiveValues) {
             if (snapshot == null) return "Indi diagnostics: unavailable.";
             string[] secrets;

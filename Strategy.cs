@@ -48,6 +48,10 @@ namespace ShinhanNativeTrader {
             return DateTime.SpecifyKind(utc.AddHours(9), DateTimeKind.Unspecified);
         }
         public static DateTime NowKorea { get { return ToKorea(DateTime.UtcNow); } }
+        public static bool CanUseQuote(IndiReply quote,DateTime receivedUtc) {
+            return quote!=null&&quote.HasTradeClock&&quote.Price>0&&!string.IsNullOrEmpty(quote.Code)&&Rules.Code(quote.Code)==quote.Code
+                &&IsFreshQuote(quote.Clock,receivedUtc);
+        }
         public static bool IsFreshQuote(string hhmmss, DateTime receivedUtc, int maxAgeSeconds = 45) {
             var korea = ToKorea(receivedUtc);
             if(!Rules.ValidTime(korea) || maxAgeSeconds < 0 || string.IsNullOrWhiteSpace(hhmmss)) return false;

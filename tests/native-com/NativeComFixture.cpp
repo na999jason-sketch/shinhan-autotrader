@@ -294,6 +294,9 @@ public:
             if(args->cArgs != 1) return DISP_E_BADPARAMCOUNT;
             if(firstType_ != VT_I2) return DISP_E_TYPEMISMATCH;
             index_ = args->rgvarg[0].iVal;
+            // The manual snapshot contract has price at field 24 and no symbol
+            // echo at field 1. It must not be interpreted as an SC tick.
+            if(query_ == L"TR_1110_11") return Text(result,index_ == 24 ? L"70000" : L"");
             return Text(result,L"005930");
         }
         if(id == 9) {
