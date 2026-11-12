@@ -36,9 +36,10 @@ namespace ShinhanNativeTrader {
             if(string.IsNullOrWhiteSpace(modulePath)) return null;
             var path = modulePath.Trim();
             if(path.Length > 1 && path[0] == '"' && path[path.Length-1] == '"') path = path.Substring(1,path.Length-2);
-            if(path.IndexOf('"') >= 0 || path.IndexOf('\0') >= 0 || !Path.IsPathRooted(path)) return null;
+            if(path.IndexOf('"') >= 0 || path.IndexOf('\0') >= 0) return null;
             for(int index=0;index<path.Length;index++) if(char.IsControl(path[index])) return null;
             try {
+                if(!Path.IsPathRooted(path)) return null;
                 var extension = Path.GetExtension(path);
                 if(!string.Equals(extension,".ocx",StringComparison.OrdinalIgnoreCase) &&
                    !string.Equals(extension,".dll",StringComparison.OrdinalIgnoreCase)) return null;
