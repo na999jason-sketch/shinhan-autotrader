@@ -1,0 +1,7 @@
+# Windows UIPI integration fixture
+
+Run `tests\uipi\run.ps1` from an elevated Windows PowerShell with the .NET Framework 4.8 targeting pack and MSBuild available. The fixture requires an x86 process at high integrity; it fails with an explicit assertion if the launching shell is not elevated. It does not request elevation itself.
+
+The fixture creates its own hidden receiver window on a background STA with a running Windows message loop. A separate child that inherits the parent's high integrity sends `WM_COPYDATA` (`0x004A`) and must receive `73`. The parent then creates a restricted token, disables its maximum privileges, lowers its mandatory integrity label to Low, and starts the same `asInvoker` executable with that token. This child verifies its actual Low integrity, the target HWND and its owning process, then sends the same message. It must receive `0` with `ERROR_ACCESS_DENIED` (`5`), and the receiver's message count must remain unchanged. Both children have a finite timeout and are terminated if they hang.
+
+The restricted process uses `CreateProcessAsUserW`, with `CreateProcessWithTokenW` as a fallback for hosts that lack the first API's required privilege. This fixture does not launch or message Indi, execute a vendor SDK, access credentials, log in, submit orders, or change Windows message filters or machine settings. It demonstrates the Windows integrity boundary for the message transport; broker readiness and the cause of a particular live GI004 response require separate diagnostics.

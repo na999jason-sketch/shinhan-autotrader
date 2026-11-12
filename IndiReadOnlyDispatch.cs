@@ -38,10 +38,16 @@ namespace ShinhanNativeTrader {
     public sealed class IndiReadOnlyDispatch {
         public static readonly Guid InterfaceId=new Guid("B4A0D92F-6683-4824-9C63-53F7DAD7F57C");
         readonly IIndiReadOnlyDispatch dispatch;
+        public int? LastRequestNativeError {get;private set;}
+        [DllImport("kernel32.dll",EntryPoint="GetLastError",SetLastError=false)]
+        static extern uint ReadNativeError();
+        [DllImport("kernel32.dll",EntryPoint="SetLastError",SetLastError=false)]
+        static extern void ClearNativeError(uint value);
         public IndiReadOnlyDispatch(object nativeControl) {
             if(nativeControl==null)throw new ArgumentNullException("nativeControl");
             if(!Marshal.IsComObject(nativeControl))throw new ArgumentException("An installed native Indi COM control is required.","nativeControl");
             dispatch=(IIndiReadOnlyDispatch)nativeControl;
+            ReadNativeError(); // Resolve the P/Invoke stub before capturing an actual request.
         }
         public bool Initialize(string starterPath) {
             if(string.IsNullOrWhiteSpace(starterPath)||!Path.IsPathRooted(starterPath)
@@ -71,7 +77,11 @@ namespace ShinhanNativeTrader {
                     if(!(args[1] is string))throw new ArgumentException("Read-only query input values must be strings.");
                     return dispatch.SetSingleData(Index(args[0]),args[1]);
                 case "GetQueryName":Count(args,0);return dispatch.GetQueryName();
-                case "RequestData":Count(args,0);return dispatch.RequestData();
+                case "RequestData":
+                    Count(args,0);ClearNativeError(0);
+                    short id=dispatch.RequestData();
+                    LastRequestNativeError=unchecked((int)ReadNativeError());
+                    return id;
                 case "GetSingleData":Count(args,1);return dispatch.GetSingleData(Index(args[0]));
                 case "GetMultiData":Count(args,2);return dispatch.GetMultiData(Index(args[0]),Index(args[1]));
                 case "GetMultiRowCount":Count(args,0);return dispatch.GetMultiRowCount();

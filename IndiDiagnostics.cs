@@ -13,7 +13,7 @@ namespace ShinhanNativeTrader {
     }
 
     public sealed class IndiDiagnosticSnapshot {
-        public int? CommState, ErrorState;
+        public int? CommState, ErrorState, NativeError;
         public string ErrorCode, Message, Unavailable;
     }
 
@@ -41,6 +41,7 @@ namespace ShinhanNativeTrader {
 
             var text = "Indi diagnostics: CommState=" + Number(snapshot.CommState)
                 + "; ErrorState=" + Number(snapshot.ErrorState)
+                + "; Win32Error=" + Number(snapshot.NativeError)
                 + "; ErrorCode=" + Value(snapshot.ErrorCode, "(empty)")
                 + "; Message=" + Value(snapshot.Message, "(empty)")
                 + "; Unavailable=" + Value(snapshot.Unavailable, "(none)");

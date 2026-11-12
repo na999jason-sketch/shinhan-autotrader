@@ -74,3 +74,12 @@ GitHub Actions
 - 첫 요청을 정상 UI 메시지 처리 순서로 넘긴다. 비시각컨트롤 VisibleFalse를 원인으로 단정하지 않는다.
 - 로컬 C#175 assertions 통과. 네이티브 COM 검증에 typed 호출/초기화/인자형 테스트 추가.
 - 실제 신한 수신 성공은 아직 미확인이다. Windows 실행 결과와 EXE 링크는 PR에 기록한다.
+
+1.4.0 공식 OCX 통신 경로 분석 및 Windows UIPI 대응 — 2026-11-12 KST
+- 공식IndiSetup.exe를HTTP공식배포주소에서확보, 실행없이InstallShield압축을추출했다.
+- 실제OCX RequestData는WM_COPYDATA SendMessageA가0이하이면GI004를설정한다.
+- 공식giexpertstarter.exe의manifest는requireAdministrator, 자식들은asInvoker이다.
+- 자체EXE도requireAdministratormanifest로맞추고 실제프로세스integrity/Win32오류를기록한다.
+- 실제고/저권한별도프로세스메시지전달테스트및PEmanifest검증을CI에추가했다.
+- 로컬175assertions통과. Mono는manifest를포함하지않으므로Windows산출물검증이필수다.
+- 사용자실제수신성공은미확인. 추출해시/분기주소/검증범위는docs/INDI_IPC_EVIDENCE.md참조.

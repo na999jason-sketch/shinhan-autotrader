@@ -33,7 +33,7 @@ jobs:
           New-Item -ItemType Directory -Force reports | Out-Null
           msbuild ShinhanNativeTrader.csproj /t:Rebuild /p:Configuration=Release /p:Platform=x86 /p:PlatformTarget=x86 /warnaserror /fl /flp:logfile=reports/msbuild.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python scripts/verify_x86.py bin/Release/ShinhanNativeTrader.exe
+          python scripts/verify_x86.py bin/Release/ShinhanNativeTrader.exe --require-admin
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: C# unit and paper lifecycle tests (no OCX or account required)
@@ -46,6 +46,9 @@ jobs:
 
       - name: Native COM connection point integration (production subscriptions, no Indi)
         run: ./tests/native-com/run.ps1
+
+      - name: Windows UIPI WM_COPYDATA privilege boundary
+        run: ./tests/uipi/run.ps1
 
       - name: Python regression and live order guard tests
         run: |

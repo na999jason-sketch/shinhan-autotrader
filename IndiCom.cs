@@ -141,6 +141,7 @@ namespace ShinhanNativeTrader {
                 // OCX instance. Follow the C# sample's per-control initialization call.
                 bool started=dispatch.Initialize(starter);
                 log("OCX StartIndi initialization invoked; result="+started+"; credentials supplied by this app: none.");
+                log(IndiProcessDiagnostics.Describe());
                 log(IndiDiagnosticFormatter.Format(ReadDiagnostics(),new string[0]));
             }catch{Dispose();throw;}
         }
@@ -199,7 +200,7 @@ namespace ShinhanNativeTrader {
             return method.ReturnType==VarEnum.VT_VARIANT||method.ReturnType==VarEnum.VT_BSTR||method.ReturnType==VarEnum.VT_I2||method.ReturnType==VarEnum.VT_I4;
         }
         public IndiDiagnosticSnapshot ReadDiagnostics() {
-            var result=new IndiDiagnosticSnapshot();var unavailable=new List<string>();
+            var result=new IndiDiagnosticSnapshot{NativeError=dispatch.LastRequestNativeError};var unavailable=new List<string>();
             // Read error state before other calls can alter it. Only installed zero-argument
             // diagnostic getters are callable; no guessed APIs or session-changing calls.
             foreach(var name in new[]{"GetErrorState","GetErrorCode","GetErrorMessage","GetCommState"}) {
@@ -368,7 +369,9 @@ namespace ShinhanNativeTrader {
                 Log("RequestData return type="+(raw==null?"null":raw.GetType().Name));
                 var id=RequestId(raw);
                 var diagnostic=Diagnose(current,"after RequestData rid="+id);
-                if(id<0)throw new InvalidOperationException("RequestData returned a negative request ID.");
+                // The official OCX's RequestData returns a positive ID on acceptance;
+                // connection/query/WM_COPYDATA failures return zero (GI004 included).
+                if(id<=0)throw new InvalidOperationException("RequestData did not return a positive accepted request ID.");
                 if(failed)return false;
                 if(diagnostic!=null&&diagnostic.ErrorState.HasValue&&diagnostic.ErrorState.Value>0) {
                     Halt("Indi reported a request error: GetErrorState="+diagnostic.ErrorState.Value+", rid="+id+". See sanitized INDI diagnostics.");return false;
