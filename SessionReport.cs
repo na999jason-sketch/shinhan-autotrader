@@ -6,6 +6,20 @@ using System.Linq;
 using System.Text;
 
 namespace ShinhanNativeTrader {
+    public sealed class ReportFileWriteException : IOException {
+        public string ReportPath { get; private set; }
+        public string FailureCode { get; private set; }
+
+        internal ReportFileWriteException(string reportPath,Exception cause)
+            :base("보고서 파일을 저장하지 못했습니다. 파일 열림 상태, 쓰기 권한 또는 디스크 상태를 확인하세요.",cause) {
+            ReportPath=reportPath;
+            var io=cause as IOException;
+            var nativeCode=io==null?0:io.HResult&0xffff;
+            FailureCode=cause is UnauthorizedAccessException?"AccessDenied"
+                :nativeCode==32||nativeCode==33?"SharingViolation":"IoFailure";
+        }
+    }
+
     // Reports broker snapshots and durable order evidence only. No credentials,
     // provider free-text descriptions, inferred executions or synthetic balances.
     public static class SessionReport {
@@ -65,6 +79,65 @@ namespace ShinhanNativeTrader {
             if(requested=="실주문 운영 시작됨"||requested=="실주문 미시작")return requested;
             return string.Equals(requested,LiveOrderSafety.BlockReason,StringComparison.Ordinal)
                 ?LiveOrderSafety.BlockReason:"실주문 상태 미확인";
+        }
+
+        sealed class ReportCandidate {
+            public string Path;
+            public DateTime WrittenUtc,ReportDate;
+        }
+        static bool IsAccountDirectory(string path) {
+            var name=Path.GetFileName(path);
+            return name.Length==64&&name.All(c=>c>='0'&&c<='9'||c>='a'&&c<='f'||c>='A'&&c<='F');
+        }
+        static bool IsPlainDirectory(string path) {
+            var attributes=File.GetAttributes(path);
+            return (attributes&FileAttributes.Directory)!=0&&(attributes&FileAttributes.ReparsePoint)==0;
+        }
+        static void CollectReports(string directory,List<ReportCandidate> candidates) {
+            string[] files;
+            try{files=Directory.GetFiles(directory,"account-report-*.csv",SearchOption.TopDirectoryOnly);}
+            catch(IOException){return;}
+            catch(UnauthorizedAccessException){return;}
+            catch(System.Security.SecurityException){return;}
+            foreach(var file in files)try {
+                var name=Path.GetFileName(file);
+                if(name.Length!=27||!name.StartsWith("account-report-",StringComparison.Ordinal)
+                    ||!name.EndsWith(".csv",StringComparison.Ordinal))continue;
+                var text=name.Substring(15,8);
+                DateTime day;
+                if(!text.All(c=>c>='0'&&c<='9')||!DateTime.TryParseExact(text,"yyyyMMdd",
+                    CultureInfo.InvariantCulture,DateTimeStyles.None,out day))continue;
+                var attributes=File.GetAttributes(file);
+                if((attributes&(FileAttributes.Directory|FileAttributes.ReparsePoint))!=0)continue;
+                candidates.Add(new ReportCandidate{Path=file,ReportDate=day,WrittenUtc=File.GetLastWriteTimeUtc(file)});
+            }catch(IOException){}catch(UnauthorizedAccessException){}catch(System.Security.SecurityException){}
+        }
+        // Finding a previous file never establishes an active account or order
+        // state. Only the standard report root and immediate account hashes are searched.
+        public static string FindLatestReport(string reportsRoot) {
+            if(string.IsNullOrWhiteSpace(reportsRoot))return null;
+            try {
+                var root=Path.GetFullPath(reportsRoot);
+                if(!Directory.Exists(root)||!IsPlainDirectory(root))return null;
+                var candidates=new List<ReportCandidate>();
+                CollectReports(root,candidates);
+                string[] directories;
+                try{directories=Directory.GetDirectories(root);}
+                catch(IOException){directories=new string[0];}
+                catch(UnauthorizedAccessException){directories=new string[0];}
+                catch(System.Security.SecurityException){directories=new string[0];}
+                foreach(var directory in directories)try {
+                    if(IsAccountDirectory(directory)&&IsPlainDirectory(directory))CollectReports(directory,candidates);
+                }catch(IOException){}catch(UnauthorizedAccessException){}catch(System.Security.SecurityException){}
+                return candidates.OrderByDescending(candidate=>candidate.WrittenUtc)
+                    .ThenByDescending(candidate=>candidate.ReportDate)
+                    .ThenBy(candidate=>candidate.Path,StringComparer.Ordinal)
+                    .Select(candidate=>candidate.Path).FirstOrDefault();
+            }catch(ArgumentException){return null;}
+            catch(NotSupportedException){return null;}
+            catch(IOException){return null;}
+            catch(UnauthorizedAccessException){return null;}
+            catch(System.Security.SecurityException){return null;}
         }
 
         public static string Write(string directory,DateTime koreaDate,DateTime writtenUtc,
@@ -154,11 +227,12 @@ namespace ShinhanNativeTrader {
                     EnumName(order.Status),Stamp(order.UpdatedUtc));
             }
 
-            var root=Path.GetFullPath(directory);
-            Directory.CreateDirectory(root);
-            var path=Path.Combine(root,"account-report-"+koreaDate.ToString("yyyyMMdd",CultureInfo.InvariantCulture)+".csv");
-            var temporary=path+".tmp-"+Guid.NewGuid().ToString("N");
+            var path=Path.Combine(directory,"account-report-"+koreaDate.ToString("yyyyMMdd",CultureInfo.InvariantCulture)+".csv");
+            string temporary=null;
             try {
+                path=Path.GetFullPath(path);
+                Directory.CreateDirectory(Path.GetDirectoryName(path));
+                temporary=path+".tmp-"+Guid.NewGuid().ToString("N");
                 using(var file=new FileStream(temporary,FileMode.CreateNew,FileAccess.Write,FileShare.None)) {
                     using(var writer=new StreamWriter(file,new UTF8Encoding(true),4096,true)) {
                         writer.Write(report.ToString());writer.Flush();
@@ -168,7 +242,14 @@ namespace ShinhanNativeTrader {
                 if(File.Exists(path))File.Replace(temporary,path,path+".bak");
                 else File.Move(temporary,path);
                 return path;
-            }finally{if(File.Exists(temporary))File.Delete(temporary);}
+            }catch(IOException ex){throw new ReportFileWriteException(path,ex);}
+            catch(UnauthorizedAccessException ex){throw new ReportFileWriteException(path,ex);}
+            finally {
+                // A failed write must preserve its original error and the preceding
+                // complete daily report even if temporary-file cleanup also fails.
+                if(temporary!=null)try{if(File.Exists(temporary))File.Delete(temporary);}
+                    catch(IOException){}catch(UnauthorizedAccessException){}
+            }
         }
     }
 }

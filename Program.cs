@@ -16,7 +16,7 @@ namespace ShinhanNativeTrader {
         public AccountUserActionException(string message):base(message){}
     }
     internal static class Program {
-        internal const string Version="2.1.1";
+        internal const string Version="2.1.2";
         [STAThread]
         static int Main(string[] args) {
             if(args.Contains("--selftest")) {
@@ -100,7 +100,8 @@ namespace ShinhanNativeTrader {
         readonly Panel nativeArea=new Panel();
         readonly TextBox logs=new TextBox(),account=new TextBox(),password=new TextBox(),code=new TextBox{Text="005930",Width=85};
         readonly NumericUpDown budget=Number(0,1000000000,0,0),orderQuantity=Number(1,1000000,1,0),orderPrice=Number(1,10000000,1,0);
-        readonly Label state=new Label{AutoSize=true},portfolio=new Label{AutoSize=true},cashLabel=new Label{AutoSize=true},orderGate=new Label{AutoSize=true,ForeColor=Color.DarkRed};
+        readonly Label state=new Label{AutoSize=true},portfolio=new Label{AutoSize=true},cashLabel=new Label{AutoSize=true},orderGate=new Label{AutoSize=true,ForeColor=Color.DarkRed},
+            reportStatus=new Label{AutoSize=true,Text="보고서: 계좌 조회 응답 후 자동 저장 (CSV)"};
         readonly DataGridView holdingsGrid=Grid("코드","종목명","수량","평균단가","현재가","매입금액","평가금액","평가손익","수익률(%)","시세 조회시각","매도판정"),
             ordersGrid=Grid("주문번호","종목","구분","주문수량","누적체결","미체결","주문단가","체결평균가","확인상태"),
             candidatesGrid=Grid("코드","종목명","신호 기준가","점수","조건","주문상태");
@@ -142,13 +143,16 @@ namespace ShinhanNativeTrader {
         string boundKey,lastReportKey;
         string gateDetail="실주문 미시작";
         string lastBasisDiagnostic;
+        string lastSavedReportPath;
+        DateTime? lastReportSavedUtc;
+        bool reportWriteFault,reportSaving,initialReportComplete;
 
         public MainForm() {
             Text="Shinhan Native Trader "+Program.Version+" | 실계좌 자동매매";
             Size=new Size(1370,860);MinimumSize=new Size(1120,730);Font=new Font("Malgun Gothic",9);
             holdingsGrid.Columns["매도판정"].FillWeight=170;
             var root=new TableLayoutPanel{Dock=DockStyle.Fill,ColumnCount=1,RowCount=6,Padding=new Padding(10)};
-            foreach(int height in new[]{35,100,30,40})root.RowStyles.Add(new RowStyle(SizeType.Absolute,height));
+            foreach(int height in new[]{35,100,52,40})root.RowStyles.Add(new RowStyle(SizeType.Absolute,height));
             root.RowStyles.Add(new RowStyle(SizeType.Percent,100));root.RowStyles.Add(new RowStyle(SizeType.Absolute,52));Controls.Add(root);
             UpdateOrderStatus();root.Controls.Add(orderGate,0,0);
             var buttons=new FlowLayoutPanel{Dock=DockStyle.Fill,WrapContents=true};root.Controls.Add(buttons,0,1);
@@ -162,7 +166,9 @@ namespace ShinhanNativeTrader {
             buttons.Controls.Add(new Label{Text="계좌암호",AutoSize=true});password.Width=95;password.UseSystemPasswordChar=true;buttons.Controls.Add(password);
             AddButton(buttons,"실계좌 조회·감시",AttachAccount);
             AddButton(buttons,"보고서 폴더",OpenReports);
-            state.Text="Indi 연결 후 계좌를 조회하고 부재중 운영을 시작하십시오.";root.Controls.Add(state,0,2);
+            state.Text="Indi 연결 후 계좌를 조회하고 부재중 운영을 시작하십시오.";
+            var statusArea=new FlowLayoutPanel{Dock=DockStyle.Fill,FlowDirection=FlowDirection.TopDown,WrapContents=false};
+            statusArea.Controls.Add(state);statusArea.Controls.Add(reportStatus);root.Controls.Add(statusArea,0,2);
             var summary=new FlowLayoutPanel{Dock=DockStyle.Fill};summary.Controls.Add(portfolio);summary.Controls.Add(cashLabel);root.Controls.Add(summary,0,3);
             var tabs=new TabControl{Dock=DockStyle.Fill};root.Controls.Add(tabs,0,4);
             AddTab(tabs,"실계좌 잔고·손익",holdingsGrid);
@@ -314,7 +320,7 @@ namespace ShinhanNativeTrader {
                 CreateGateway();EnsureRealtime(false);
             }
             catch{ReleaseAccount();throw;}
-            monitoring=true;nextAccountReadUtc=DateTime.UtcNow;nextReportUtc=DateTime.UtcNow.AddMinutes(5);QueueAccountRefresh();
+            monitoring=true;nextAccountReadUtc=DateTime.UtcNow;nextReportUtc=DateTime.UtcNow;QueueAccountRefresh();
             state.Text="실계좌 매매기준 잔고·주문가능금액·주문 조회 중";Log("실계좌 조회 세션 시작. 조회만으로 실주문을 시작하지 않습니다.");
         }
         void CreateGateway(){if(gateway!=null||journal==null)return;gateway=new LiveOrderGateway(journal,api.CreateLiveOrderWire());gateway.OrderChanged+=OnGatewayOrderChanged;}
@@ -345,13 +351,13 @@ namespace ShinhanNativeTrader {
             try{if(journal!=null&&journal.Snapshot.Orders.Any(LiveOrderJournal.IsUnresolved))Log("운영 중단은 증권사 미체결 주문을 취소하지 않습니다. 주문 상태를 별도로 확인하십시오.");}
             catch{Program.DiagnosticFile("Order journal is unavailable while stopping.");}
             CloseGateway();
-            if(boundKey!=null)try{WriteReport(MarketTime.NowKorea.Date);}catch(Exception ex){Log("보고서 저장 실패: "+ex.GetType().Name);storageFault=true;}
+            if(boundKey!=null&&!reportWriteFault)try{WriteReport(MarketTime.NowKorea.Date);}catch(Exception ex){Log("보고서 저장 실패: "+ex.GetType().Name);storageFault=true;}
             ReleaseAccount();password.Clear();UpdateOrderStatus();state.Text=closingForm?"종료 중":"운영 중단 / 실주문 시작 해제 / 최근 실계좌 조회값 표시";
             sellDecisions.Clear();RefreshAccount();
         }
         void CloseGateway(){if(gateway!=null){var previous=gateway;gateway=null;previous.OrderChanged-=OnGatewayOrderChanged;previous.Dispose();}orderAcknowledgementPending=false;}
         void ReleaseAccount(){authorization.Revoke();CloseGateway();DisposeRealtime();accountEvents=null;readiness=null;if(journal!=null){journal.Dispose();journal=null;}if(credentials!=null){credentials.Dispose();credentials=null;}boundKey=null;account.ReadOnly=false;}
-        void ClearAccountData(){holdings.Clear();priceReceivedUtc.Clear();quoteDue.Clear();sellDecisions.Clear();balanceSignatures.Clear();cash=null;brokerOrders=null;tradeHoldings=null;holdingsReceivedUtc=null;lastBasisDiagnostic=null;blockedSignals.Clear();RefreshAccount();RefreshOrders();}
+        void ClearAccountData(){holdings.Clear();priceReceivedUtc.Clear();quoteDue.Clear();sellDecisions.Clear();balanceSignatures.Clear();cash=null;brokerOrders=null;tradeHoldings=null;holdingsReceivedUtc=null;lastBasisDiagnostic=null;lastSavedReportPath=null;lastReportSavedUtc=null;initialReportComplete=false;if(!reportWriteFault)reportStatus.Text="보고서: 계좌 조회 응답 대기 (CSV)";blockedSignals.Clear();RefreshAccount();RefreshOrders();}
         void CloseSession() {
             DateTime day=session.SessionDateKorea??MarketTime.NowKorea.Date;string reason=session.CloseReason;
             authorization.Revoke();if(readiness!=null)readiness.SetAuthorization(false);UpdateOrderStatus();
@@ -364,6 +370,9 @@ namespace ShinhanNativeTrader {
         }
         void Schedule() {
             var now=DateTime.UtcNow;
+            // Persist the copied account state independently of TR queues and
+            // preflight work. A busy broker must not starve a due report.
+            SaveReportIfDue(now);
             if(gateway!=null) {
                 gateway.Timeout(now);
                 if(orderAcknowledgementPending&&!gateway.Busy) {
@@ -390,7 +399,6 @@ namespace ShinhanNativeTrader {
                 string kind=accountReads.Dequeue();
                 credentials.Use((number,secret)=>kind=="TRADEHOLDINGS"?api.TradeHoldings(number,secret):kind=="CASH"?api.Cash(number,secret):api.Orders(number,secret,MarketTime.ToKorea(now).ToString("yyyyMMdd",CultureInfo.InvariantCulture)));return;
             }
-            if(monitoring&&credentials!=null&&now>=nextReportUtc){WriteReport(MarketTime.ToKorea(now).Date);nextReportUtc=now.AddMinutes(5);}
             var due=monitoring?holdings.Where(x=>x.Quantity>0&&(!quoteDue.ContainsKey(x.Code)||quoteDue[x.Code]<=now)).OrderBy(x=>quoteDue.ContainsKey(x.Code)?quoteDue[x.Code]:DateTime.MinValue).FirstOrDefault():null;
             bool research=buyQuotes.Count>0||(scanning&&scans.Count>0);
             if(due!=null&&(holdingRequests<3||!research)) {
@@ -429,6 +437,11 @@ namespace ShinhanNativeTrader {
             if(scanning&&entry==null&&buyQuotes.Count==0){scanning=false;session.ScanCompleted(now);state.Text="전체 검색 완료 / 후보 "+candidatesGrid.Rows.Count+"개 / 실계좌 감시 계속";Log("전체 검색 완료. 다음 검색은 완료 후20분 간격입니다.");if(boundKey!=null)WriteReport(MarketTime.ToKorea(now).Date);}
         }
         void Reply(IndiReply reply) {
+            ApplyReply(reply);
+            if(!initialReportComplete&&(reply.Kind=="TRADEHOLDINGS"||reply.Kind=="HOLDINGS"||reply.Kind=="CASH"||reply.Kind=="ORDERS"))
+                WriteReport(MarketTime.NowKorea.Date);
+        }
+        void ApplyReply(IndiReply reply) {
             var now=DateTime.UtcNow;bool stamped=reply.RequestStartedUtc.Kind==DateTimeKind.Utc&&reply.ReceivedUtc.Kind==DateTimeKind.Utc&&reply.RequestStartedUtc<=reply.ReceivedUtc;
             if(reply.Kind=="STOCKS") {
                 symbols.Clear();symbols.AddRange(reply.Stocks);instruments.Clear();foreach(var instrument in reply.Instruments)instruments[instrument.Code]=instrument;
@@ -709,13 +722,51 @@ namespace ShinhanNativeTrader {
             }
             state.Text="신규주문 종료 · 증권사 미체결 "+open.Count(x=>x.Value>0)+"건 감시 중 / 다음 실주문은 시작 버튼 필요";
         }
-        string ReportDirectory {get{return lastReportKey==null?Path.Combine(Program.DataDir,"reports"):Path.Combine(Program.DataDir,"reports",lastReportKey);}}
-        void WriteReport(DateTime koreaDate) {
-            if(boundKey==null)return;
-            SessionReport.Write(ReportDirectory,koreaDate,DateTime.UtcNow,holdings,holdingsReceivedUtc,cash,brokerOrders,
-                journal==null?(IEnumerable<LiveOrderRecord>)new LiveOrderRecord[0]:journal.Snapshot.Orders,authorization.Active?"실주문 운영 시작됨":"실주문 미시작",priceReceivedUtc,tradeHoldings);
+        string ReportDirectory {get{string key=boundKey??lastReportKey;return key==null?Path.Combine(Program.DataDir,"reports"):Path.Combine(Program.DataDir,"reports",key);}}
+        bool HasReportSnapshot {get{return holdingsReceivedUtc.HasValue||tradeHoldings!=null||cash!=null||brokerOrders!=null;}}
+        void SaveReportIfDue(DateTime now) {
+            if(!monitoring||boundKey==null||!HasReportSnapshot||reportWriteFault||reportSaving||now<nextReportUtc)return;
+            WriteReport(MarketTime.ToKorea(now).Date);
         }
-        void OpenReports(){string path=ReportDirectory;Directory.CreateDirectory(path);Process.Start(new ProcessStartInfo{FileName=path,UseShellExecute=true});}
+        string WriteReport(DateTime koreaDate) {
+            if(boundKey==null||!HasReportSnapshot||reportSaving)return null;
+            reportSaving=true;
+            try {
+                var writtenUtc=DateTime.UtcNow;
+                var path=SessionReport.Write(ReportDirectory,koreaDate,writtenUtc,holdings,holdingsReceivedUtc,cash,brokerOrders,
+                    journal==null?(IEnumerable<LiveOrderRecord>)new LiveOrderRecord[0]:journal.Snapshot.Orders,authorization.Active?"실주문 운영 시작됨":"실주문 미시작",priceReceivedUtc,tradeHoldings);
+                lastSavedReportPath=path;lastReportSavedUtc=writtenUtc;nextReportUtc=writtenUtc.AddMinutes(5);
+                initialReportComplete=holdingsReceivedUtc.HasValue&&cash!=null&&brokerOrders!=null;
+                reportStatus.Text="보고서 저장: "+MarketTime.ToKorea(lastReportSavedUtc.Value).ToString("MM-dd HH:mm:ss",CultureInfo.InvariantCulture)+" / "+Path.GetFileName(lastSavedReportPath);
+                reportStatus.ForeColor=Color.DarkGreen;
+                Log("보고서 저장 완료: "+path);return path;
+            }catch(Exception ex) {
+                reportWriteFault=true;storageFault=true;
+                var fileFailure=ex as ReportFileWriteException;
+                string reason=fileFailure==null?ex.GetType().Name:fileFailure.FailureCode=="AccessDenied"?"폴더·파일 쓰기 권한 확인":
+                    fileFailure.FailureCode=="SharingViolation"?"엑셀 등에서 열린 CSV를 닫으십시오":"쓰기 실패: 파일 열림·디스크 상태 확인";
+                reportStatus.Text="보고서 저장 실패 ("+reason+")"
+                    +(lastReportSavedUtc.HasValue?" / 마지막 성공 "+MarketTime.ToKorea(lastReportSavedUtc.Value).ToString("MM-dd HH:mm:ss",CultureInfo.InvariantCulture):" / 저장된 파일 없음")+" / 진단 로그에서 경로 확인";
+                reportStatus.ForeColor=Color.DarkRed;
+                Log("보고서 저장 실패: "+ex.GetType().Name+" / "+ReportDirectory+" / 기존 파일은 보존합니다.");
+                throw;
+            }finally{reportSaving=false;}
+        }
+        string PrepareReports() {
+            if(boundKey!=null&&HasReportSnapshot)WriteReport(MarketTime.NowKorea.Date);
+            string path=ReportDirectory;
+            if(boundKey==null&&lastReportKey==null) {
+                string previous=SessionReport.FindLatestReport(Path.Combine(Program.DataDir,"reports"));
+                if(previous!=null){path=Path.GetDirectoryName(previous);reportStatus.Text="이전 보고서: "+Path.GetFileName(previous)+" / 현재 계좌 미조회";}
+                else reportStatus.Text="저장된 보고서 없음 / 실계좌 조회·감시를 먼저 실행하십시오.";
+            } else if(boundKey!=null&&!HasReportSnapshot)reportStatus.Text="보고서 저장 대기: 잔고·현금·주문 응답을 먼저 수신해야 합니다.";
+            return path;
+        }
+        void OpenReports(){
+            string path=PrepareReports();
+            try{Directory.CreateDirectory(path);Process.Start(new ProcessStartInfo{FileName=path,UseShellExecute=true});}
+            catch(Exception ex){state.Text="보고서 폴더 열기 실패 ("+ex.GetType().Name+"): "+path;Log("보고서 폴더 열기 실패: "+ex.GetType().Name+" / "+path);}
+        }
         int BarCount(){return Math.Max(45,Math.Max(configuration.Strategy.SlowPeriod,configuration.Strategy.BreakoutPeriod)+2);}
         static bool IsRatio(string key){return key=="AllocationFraction"||key=="FeeRate";}
         void LoadSettings(){foreach(var pair in options){var field=typeof(StrategySettings).GetField(pair.Key);decimal value=Convert.ToDecimal(field.GetValue(configuration.Strategy),CultureInfo.InvariantCulture);if(IsRatio(pair.Key))value*=100;pair.Value.Value=Math.Min(pair.Value.Maximum,Math.Max(pair.Value.Minimum,value));}budget.Value=configuration.BudgetLimit;}

@@ -13,6 +13,89 @@ namespace ShinhanNativeTrader {
             bool rejected=false;try{action();}catch(ArgumentException){rejected=true;}
             Check(rejected,name);
         }
+        static string ReportFixture(string directory,string name,DateTime modifiedUtc) {
+            Directory.CreateDirectory(directory);
+            var path=Path.Combine(directory,name);
+            File.WriteAllText(path,"complete previous report");
+            File.SetLastWriteTimeUtc(path,modifiedUtc);
+            return path;
+        }
+        static void TestReportDiscovery(string directory,DateTime utc) {
+            var root=Path.Combine(directory,"lookup");
+            Check(SessionReport.FindLatestReport(null)==null&&SessionReport.FindLatestReport(" ")==null
+                &&SessionReport.FindLatestReport(root)==null,"missing or unspecified report roots have no previous report");
+            Check(SessionReport.FindLatestReport("invalid\0path")==null,"invalid report lookup path is safely ignored");
+            Directory.CreateDirectory(root);
+            Check(SessionReport.FindLatestReport(root)==null,"an empty report root has no previous report");
+            var direct=ReportFixture(root,"account-report-20261113.csv",utc);
+            var account=Path.Combine(root,new string('a',64));
+            var accountReport=ReportFixture(account,"account-report-20261112.csv",utc.AddMinutes(1));
+            Check(SessionReport.FindLatestReport(root)==accountReport,"latest save timestamp wins across root and one account-hash directory");
+            Check(SessionReport.FindLatestReport(direct)==null,"a regular file cannot be used as a report directory");
+
+            var ignoredNames=new[]{"account-report-20260230.csv","account-report-20261113.csv.bak",
+                "account-report-20261113.csv.tmp-test","account-report-2026111.csv","account-report-20261114.CSV",
+                "other-20261114.csv"};
+            foreach(var name in ignoredNames)ReportFixture(root,name,utc.AddHours(1));
+            ReportFixture(Path.Combine(root,"another-account"),"account-report-20261114.csv",utc.AddHours(1));
+            ReportFixture(Path.Combine(root,new string('g',64)),"account-report-20261114.csv",utc.AddHours(1));
+            ReportFixture(Path.Combine(root,new string('a',63)),"account-report-20261114.csv",utc.AddHours(1));
+            ReportFixture(Path.Combine(account,new string('b',64)),"account-report-20261114.csv",utc.AddHours(1));
+            Check(SessionReport.FindLatestReport(root)==accountReport,"backups, temporaries, invalid dates, non-hash and deeper directories are excluded");
+
+            File.SetLastWriteTimeUtc(direct,utc.AddMinutes(1));
+            Check(SessionReport.FindLatestReport(root)==direct,"equal save timestamps are ordered by valid report date");
+            var tied=ReportFixture(Path.Combine(root,new string('b',64)),"account-report-20261113.csv",utc.AddMinutes(1));
+            var expected=new[]{direct,tied}.OrderBy(value=>value,StringComparer.Ordinal).First();
+            Check(SessionReport.FindLatestReport(root)==expected&&SessionReport.FindLatestReport(root)==expected,
+                "equal dates and timestamps have deterministic ordinal path ordering");
+
+            if(Environment.OSVersion.Platform==PlatformID.Win32NT) {
+                var unreadable=Path.Combine(directory,"windows-unreadable");
+                ReportFixture(unreadable,"account-report-20261113.csv",utc);
+                var original=Directory.GetAccessControl(unreadable);
+                var denied=new System.Security.AccessControl.DirectorySecurity();
+                denied.SetSecurityDescriptorBinaryForm(original.GetSecurityDescriptorBinaryForm());
+                using(var identity=System.Security.Principal.WindowsIdentity.GetCurrent()) {
+                    denied.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(identity.User,
+                        System.Security.AccessControl.FileSystemRights.ListDirectory,System.Security.AccessControl.AccessControlType.Deny));
+                    try {
+                        Directory.SetAccessControl(unreadable,denied);
+                        Check(SessionReport.FindLatestReport(unreadable)==null,"an actual Windows directory-listing denial safely yields no previous report");
+                    }finally{Directory.SetAccessControl(unreadable,original);}
+                }
+            }
+        }
+        static void TestWriteFailures(string directory,DateTime day,DateTime utc) {
+            var blockedDirectory=Path.Combine(directory,"not-a-directory");
+            File.WriteAllText(blockedDirectory,"must remain unchanged");
+            ReportFileWriteException error=null;
+            try{SessionReport.Write(blockedDirectory,day,utc,null,null,null,null,null,"");}
+            catch(ReportFileWriteException ex){error=ex;}
+            var intended=Path.Combine(Path.GetFullPath(blockedDirectory),"account-report-20261113.csv");
+            Check(error!=null&&error.ReportPath==intended&&error.InnerException is IOException
+                &&error.FailureCode=="IoFailure","directory creation failure carries the actual intended report path and fixed failure code");
+            Check(File.ReadAllText(blockedDirectory)=="must remain unchanged"&&!error.Message.Contains(error.InnerException.Message),
+                "owned failure leaves existing data untouched and does not echo arbitrary filesystem exception text");
+            Check(SessionReport.FindLatestReport(blockedDirectory)==null,"unusable report directory has no readable previous report");
+
+            // File replacement honours Windows share modes. Linux rename semantics
+            // do not reproduce an Excel lock, so only Windows proves this case.
+            if(Environment.OSVersion.Platform==PlatformID.Win32NT) {
+                var lockedRoot=Path.Combine(directory,"windows-lock");
+                var path=SessionReport.Write(lockedRoot,day,utc,null,null,null,null,null,"");
+                var original=File.ReadAllBytes(path);
+                error=null;
+                using(var held=new FileStream(path,FileMode.Open,FileAccess.Read,FileShare.None)) {
+                    try{SessionReport.Write(lockedRoot,day,utc.AddSeconds(1),null,null,null,null,null,"");}
+                    catch(ReportFileWriteException ex){error=ex;}
+                    Check(error!=null&&error.ReportPath==path&&error.FailureCode=="SharingViolation",
+                        "a real Windows exclusive file lock produces a path-aware sharing failure");
+                }
+                Check(original.SequenceEqual(File.ReadAllBytes(path))&&!Directory.GetFiles(lockedRoot,"*.tmp-*").Any()
+                    &&!File.Exists(path+".bak"),"a locked report is never overwritten and its unsuccessful temporary snapshot is removed");
+            }
+        }
         public static int Run() {
             checks=0;
             var directory=Path.Combine(Path.GetTempPath(),"ShinhanAccountReport-"+Guid.NewGuid().ToString("N"));
@@ -113,6 +196,8 @@ namespace ShinhanNativeTrader {
                 Reject(()=>SessionReport.Write(directory,day,utc,null,null,null,null,null,"",null,tradeHoldings),"realized-profit request timestamp requires UTC when provided");
                 tradeHoldings.RequestStartedUtc=default(DateTime);tradeHoldings.ReceivedUtc=day;
                 Reject(()=>SessionReport.Write(directory,day,utc,null,null,null,null,null,"",null,tradeHoldings),"realized-profit response timestamp requires UTC");
+                TestReportDiscovery(directory,utc);
+                TestWriteFailures(directory,day,utc);
             }finally{if(Directory.Exists(directory))Directory.Delete(directory,true);}
             return checks;
         }

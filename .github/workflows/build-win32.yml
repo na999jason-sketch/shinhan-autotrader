@@ -44,6 +44,9 @@ jobs:
           else { throw 'Native test runner did not create a report.' }
           if ($process.ExitCode -ne 0) { throw "Native tests failed (exit $($process.ExitCode))." }
 
+      - name: Windows report UI persistence regression (synthetic data, no Indi)
+        run: ./tests/report-ui/run.ps1
+
       - name: Native COM connection point integration (production subscriptions, no Indi)
         run: ./tests/native-com/run.ps1
 
