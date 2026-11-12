@@ -44,6 +44,9 @@ jobs:
           else { throw 'Native test runner did not create a report.' }
           if ($process.ExitCode -ne 0) { throw "Native tests failed (exit $($process.ExitCode))." }
 
+      - name: Native COM connection point integration (production subscriptions, no Indi)
+        run: ./tests/native-com/run.ps1
+
       - name: Python regression and live order guard tests
         run: |
           python -m unittest discover -s tests -v 2>&1 | Tee-Object -FilePath reports/python-tests.txt

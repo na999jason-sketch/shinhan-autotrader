@@ -55,3 +55,14 @@ GitHub Actions
 
 실제 주문: 비활성화. 실제 계좌/암호/Indi 서버/금전 주문을 사용한 검증 없음.
 상세 공식 자료 확인 경계: docs/INDI_API_VERIFICATION.md
+
+1.2.0 실제 Windows 수신 실패 후 수정 — 2026-11-12 KST
+- 사용자 실제 로그: stock_mst rid=0 이후 ReceiveData 없이20초 타임아웃.
+  같은 PC의 Indi/Helper 정상 조회 확인. 원래 CI 성공을 실제 수신 성공으로 간주하지 않는다.
+- 이벤트 구독을 AxHost AttachInterfaces/CreateSink/DetachSink 수명 단계로 이동.
+- 설치형 서명이 확인되는 진단 getter만 조회, 공급자 오류 즉시 처리, 민감정보 마스킹.
+- 원래 RequestData 반환 형식 검증, 정수0 지원/명시 오류 구분, 대기 상태 덮어쓰기 수정.
+- 로컬 C#153 assertions 통과, Python17 tests 통과, 경고 없는 x86 컴파일.
+- Windows CI에 생산 ComEventSubscriptions를 직접 링크한 실제 네이티브 COM24검증 추가.
+  이 검증은 신한 OCX/서버의 실제 수신 성공을 입증하지 않는다. 실행 결과는 PR 참조.
+- 수정본 창 제목: Shinhan Native Trader1.2.0. 실제 Indi 수신 성공은 미확인이다.

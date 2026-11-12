@@ -4,11 +4,15 @@ using System.Globalization;
 
 namespace ShinhanNativeTrader {
     public static class IndiTests {
-        sealed class FakeIndi : IIndiTransport {
+        sealed class FakeIndi : IIndiTransport,IIndiDiagnostics {
             public event Action<int> ReceiveData;
             public event Action<int> ReceiveSysMsg;
             public event Action<string> Error;
             public int Id=7,Rows,RequestCount;
+            public bool OverrideRequestReturn,DiagnosticThrows,ErrorAfterRequest;
+            public object RequestReturn;
+            public int DiagnosticReads;
+            public readonly IndiDiagnosticSnapshot Diagnostic=new IndiDiagnosticSnapshot{CommState=0,ErrorState=0,ErrorCode="0",Message=""};
             public bool SetQueryAccepted=true,SetFieldAccepted=true;
             public string ThrowMethod;
             public Action DuringRequest;
@@ -18,7 +22,7 @@ namespace ShinhanNativeTrader {
                 switch(method) {
                     case "SetQueryName":return SetQueryAccepted;
                     case "SetSingleData":return SetFieldAccepted;
-                    case "RequestData":RequestCount++;if(DuringRequest!=null)DuringRequest();return Id;
+                    case "RequestData":RequestCount++;if(DuringRequest!=null)DuringRequest();if(ErrorAfterRequest)Diagnostic.ErrorState=2;return OverrideRequestReturn?RequestReturn:Id;
                     case "GetMultiRowCount":return Rows;
                     case "GetSingleData":return Field("s:"+args[0]);
                     case "GetMultiData":return Field("m:"+args[0]+":"+args[1]);
@@ -30,6 +34,7 @@ namespace ShinhanNativeTrader {
             public void Fail(string reason){if(Error!=null)Error(reason);}
             public void Sys(int id){if(ReceiveSysMsg!=null)ReceiveSysMsg(id);}
             public void Dispose(){}
+            public IndiDiagnosticSnapshot ReadDiagnostics(){DiagnosticReads++;if(DiagnosticThrows)throw new InvalidOperationException("account-123-password-SECRET");return Diagnostic;}
             public void Quote(string code="005930",string price="70,000",string clock="091530") {
                 Fields["s:1"]=code;Fields["s:3"]=price;Fields["s:2"]=clock;
             }
@@ -83,6 +88,33 @@ namespace ShinhanNativeTrader {
 
             fake=new FakeIndi{Id=-1};requests=new IndiRequestCoordinator(fake);
             Check(!BeginQuote(requests)&&requests.Failed,"negative request id halts");requests.Dispose();
+            fake=new FakeIndi{Id=0};fake.Quote();requests=new IndiRequestCoordinator(fake);received=0;
+            requests.Done+=value=>received++;
+            Check(BeginQuote(requests)&&requests.Busy&&!requests.Failed,"zero integer id remains pending without an explicit Indi error");
+            fake.Data(0);Check(received==1&&!requests.Busy,"zero request id can match an actual response");requests.Dispose();
+            fake=new FakeIndi{OverrideRequestReturn=true,RequestReturn=(short)0};fake.Quote();requests=new IndiRequestCoordinator(fake);received=0;
+            requests.Done+=value=>received++;fake.DuringRequest=()=>fake.Data(0);
+            Check(BeginQuote(requests)&&received==1,"native Int16 zero id supports reentrant response");requests.Dispose();
+            foreach(object invalid in new object[]{null,DBNull.Value,false,true,7.0,7.0m,"7"}) {
+                fake=new FakeIndi{OverrideRequestReturn=true,RequestReturn=invalid};requests=new IndiRequestCoordinator(fake);
+                Check(!BeginQuote(requests)&&requests.Failed&&!requests.Busy,"non-integer and null returns never become a request id");requests.Dispose();
+            }
+            fake=new FakeIndi{Id=0,ErrorAfterRequest=true};requests=new IndiRequestCoordinator(fake);fatal=0;
+            requests.Fatal+=reason=>fatal++;
+            Check(!BeginQuote(requests)&&requests.Failed&&!requests.Busy&&fatal==1,"explicit provider error after rid0 stops immediately without a timeout");
+            requests.Timeout();Check(fatal==1,"failed submit cannot produce a second timeout failure");requests.Dispose();
+            fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);BeginQuote(requests);
+            int diagnosticReads=fake.DiagnosticReads;requests.Timeout();
+            Check(fake.DiagnosticReads>diagnosticReads,"timeout captures actual Indi diagnostic getters");requests.Dispose();
+            fake=new FakeIndi{DiagnosticThrows=true};fake.Quote();requests=new IndiRequestCoordinator(fake);received=0;
+            requests.Done+=value=>received++;
+            Check(BeginQuote(requests),"diagnostic getter failure does not replace a valid request");fake.Data(7);
+            Check(received==1,"diagnostics failure does not discard a matching receive");requests.Dispose();
+            fake=new FakeIndi{ErrorAfterRequest=true};fake.Diagnostic.ErrorCode="1234567890";
+            fake.Diagnostic.Message="계좌1234567890 암호4321 요청 오류";requests=new IndiRequestCoordinator(fake);
+            var privateLog="";requests.Trace+=value=>privateLog+=value;requests.Fatal+=value=>privateLog+=value;
+            Check(!requests.Begin("HOLDINGS","SABA200QB",new Dictionary<int,string>{{0,"1234567890"},{1,"01"},{2,"4321"}},""),"holding provider error stops immediately");
+            Check(!privateLog.Contains("1234567890")&&!privateLog.Contains("4321")&&privateLog.Contains("오류"),"actual provider diagnostics retain reason while redacting credentials");requests.Dispose();
             fake=new FakeIndi{SetQueryAccepted=false};requests=new IndiRequestCoordinator(fake);
             Check(!BeginQuote(requests)&&requests.Failed&&fake.RequestCount==0,"SetQueryName failure prevents request");requests.Dispose();
             fake=new FakeIndi{SetFieldAccepted=false};requests=new IndiRequestCoordinator(fake);

@@ -1,0 +1,4 @@
+LIBRARY NativeComFixture
+EXPORTS
+    CreateFixture=_CreateFixture
+    GetLiveFixtureCount=_GetLiveFixtureCount

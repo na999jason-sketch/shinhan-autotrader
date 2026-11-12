@@ -2,6 +2,18 @@
 
 신한투자증권 Indi ActiveX를 사용하는 **C# .NET Framework 4.8 / x86 Windows 프로그램**입니다. 종목·일봉·현재가·잔고 조회와 실제 시세 기반 모의 자동매매를 제공합니다. **실주문은 C# 및 기존 Python API 모두 차단됩니다.** 현재 공식 주문 명세와 실제 Windows Indi 서버 검증이 확보되지 않았으므로 실계좌 자동매매 완성판으로 배포하지 않습니다.
 
+## 1.2.0 — 실제 Windows 수신 실패에 대한 수정
+
+사용자의 Windows 실행에서 `stock_mst rid=0` 뒤 `ReceiveData`가 없고 20초 후 중단되는 문제가 재현됐습니다. 같은 PC의 Indi/Helper 조회는 정상이라는 확인을 반영했습니다. 이전 CI 성공은 이 실제 수신 문제의 해결 증거가 아닙니다.
+
+- 이벤트 연결을 초기화 이후의 호출에서 `AxHost.AttachInterfaces/CreateSink/DetachSink` 수명 단계로 옮깁니다. 생성된 AxInterop 래퍼와 같은 단계에서 구독·해제를 수행합니다.
+- 설치 typelib에서 확인한 `GetCommState/GetErrorState/GetErrorCode/GetErrorMessage`만 조회해 요청 직후·실패·타임아웃의 원인을 기록합니다. 계좌·암호는 로그에서 가립니다. 통신상태 숫자만으로 로그인 실패라고 단정하지 않습니다.
+- null·bool·소수·문자열을 요청번호 0으로 변환하지 않습니다. 정수 ID 0의 공식 의미는 미확인이라 실제 콜백 또는 명시적 공급자 오류로 판정합니다.
+- 첫 정상 응답 전에는 연결 완료로 표시하지 않으며, 재진입 성공/즉시 실패 상태를 대기 문구로 덮어쓰지 않습니다. 창 제목에 `1.2.0`을 표시합니다.
+- CI에 생산 구독 코드를 직접 사용하는 네이티브 C++ COM 이벤트 테스트를 추가합니다. 이는 실제 COM 콜백을 검증하며 신한 OCX/서버 수신을 대신하지 않습니다.
+
+근거와 남은 검증은 [수신 장애 분석](docs/INDI_RECEIVE_DIAGNOSIS.md)에 기록했습니다. **이 수정본의 실제 신한 수신 성공은 아직 확인되지 않았습니다.**
+
 ## 실행과 빌드
 
 1. GitHub Actions의 성공한 `Build and test Shinhan Native Win32` 실행에서 `ShinhanNativeTrader-Win32` 아티팩트를 내려받습니다. 검증 기록은 `validation-reports`에 있습니다.

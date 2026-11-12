@@ -9,6 +9,7 @@ using System.Windows.Forms;
 
 namespace ShinhanNativeTrader {
     internal static class Program {
+        internal const string Version="1.2.0";
         [STAThread]
         static int Main(string[] args) {
             if (args.Contains("--selftest")) {
@@ -65,7 +66,7 @@ namespace ShinhanNativeTrader {
         bool scanning, trading, halted, requestedScan; int scanned, holdingRequests;
 
         public MainForm() {
-            Text = "Shinhan Native Trader | .NET 4.8 x86 | 실주문 잠금";
+            Text = "Shinhan Native Trader "+Program.Version+" | .NET 4.8 x86 | 실주문 잠금";
             Size = new Size(1240, 830); MinimumSize = new Size(1050, 700); Font = new Font("Malgun Gothic", 9);
             var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5, Padding = new Padding(10) };
             foreach (var height in new[] {35, 90, 35}) root.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
@@ -109,6 +110,7 @@ namespace ShinhanNativeTrader {
             var footer = new FlowLayoutPanel { Dock = DockStyle.Fill };
             footer.Controls.Add(new Label { AutoSize = true, Text = "스캔 완료 후에도 모의 보유 감시는 계속됩니다. 수신 오류·응답 지연 시 자동 처리를 중단합니다.\nWindows Indi COM·서버 검증과 공식 주문 명세 확인이 필요합니다. 계좌 암호는 저장하지 않습니다." });
             nativeArea.Size = new Size(12, 12); footer.Controls.Add(nativeArea); root.Controls.Add(footer, 0, 4);
+            Log("앱 "+Program.Version+"; x"+(IntPtr.Size*8)+"; 실제 Indi 수신은 첫 응답 전까지 미확인입니다.");
             try { engine = new PaperTradingEngine(Path.Combine(Program.DataDir, "paper-v2.xml"), 1000000m); LoadSettings(); RefreshPaper(); Log("모의 상태 복원. 미체결은 복구 전 거래 차단. 실주문 DISABLED."); }
             catch (Exception ex) { halted = true; Log("모의 상태 열기 실패. 파일을 보존하고 거래를 차단합니다: " + ex.GetType().Name); }
             scheduler.Tick += (s, e) => Safe(Schedule); scheduler.Start();
@@ -122,7 +124,7 @@ namespace ShinhanNativeTrader {
         void Setting(Control parent, string name, string label, decimal min, decimal max, decimal value, int decimals = 0) { var n = Number(min, max, value, decimals); options.Add(name, n); AddSetting(parent, label, n); }
         void Safe(Action action) {
             try { action(); } catch (Exception ex) {
-                Halt(); Log("작업 중단: " + ex.GetType().Name);
+                Halt(); Log("작업 중단: " + ex.GetBaseException().GetType().Name+" HRESULT=0x"+ex.GetBaseException().HResult.ToString("X8"));
                 // Vendor exceptions can echo request fields; never persist their text.
                 state.Text = "작업 오류로 자동 처리 중단. 입력·상태 확인 (" + ex.GetType().Name + ")";
             }
@@ -133,8 +135,12 @@ namespace ShinhanNativeTrader {
         void RequireIdle() { RequireConnected(); if (api.Busy) throw new InvalidOperationException("조회 대기 중"); }
         string ValidCode() { var value = Rules.Code(code.Text); if (value == "") throw new ArgumentException("6자리 종목코드 필요"); return value; }
         void Connect() {
-            if (api == null) { api = new IndiApi(nativeArea); api.Trace += Log; api.Done += reply => Safe(() => Reply(reply)); api.Fatal += message => { Halt(); state.Text = "Indi 연결 오류. 자동 처리 중단"; Log(message); }; }
-            api.Connect(); RequireIdle(); api.Stocks(); state.Text = "stock_mst 실제 응답 대기";
+            if (api == null) { api = new IndiApi(nativeArea); api.Trace += Log; api.Done += reply => Safe(() => Reply(reply)); api.Fatal += message => { Halt(); state.Text = "Indi 응답 실패. 진단 로그의 INDI 오류 정보를 확인하십시오."; }; }
+            if(api.Busy)return;
+            // Set waiting text first: RequestData may call Done or Fatal synchronously.
+            state.Text = "OCX 준비 및 stock_mst 응답 확인 중 (수신 전에는 연결 성공 아님)";
+            api.Connect();
+            if(!api.Stocks()&&api.TransportReady)state.Text="종목 요청을 보내지 못했습니다. 진단 로그를 확인하십시오.";
         }
         void StartScan() {
             RequireIdle(); RequireEngine(); if (symbols.Count == 0) throw new InvalidOperationException("종목조회 필요"); if (scanning) return;

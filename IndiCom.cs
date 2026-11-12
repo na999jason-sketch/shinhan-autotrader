@@ -16,16 +16,36 @@ namespace ShinhanNativeTrader {
 
     // AxHost provides the ActiveX site. It must live on the UI STA with a running message pump.
     public sealed class IndiHost : AxHost {
-        public IndiHost(string progId) : base(Type.GetTypeFromProgID(progId, true).GUID.ToString("B")) {
+        readonly Action<object> attachInterfaces, createSink;
+        readonly Action detachSink;
+        public IndiHost(string progId,Action<object> attachInterfaces,Action<object> createSink,Action detachSink)
+            : base(Type.GetTypeFromProgID(progId, true).GUID.ToString("B")) {
+            this.attachInterfaces=attachInterfaces;this.createSink=createSink;this.detachSink=detachSink;
             Size=new System.Drawing.Size(8,8);
         }
         public object ComObject { get { return GetOcx(); } }
+        // Use the same activation stages as the generated AxInterop control. Attaching
+        // only after CreateControl has completed misses the control's CreateSink stage.
+        protected override void AttachInterfaces() {
+            base.AttachInterfaces();attachInterfaces(GetOcx());
+        }
+        protected override void CreateSink() {
+            base.CreateSink();createSink(GetOcx());
+        }
+        protected override void DetachSink() {
+            try{detachSink();}finally{base.DetachSink();}
+        }
     }
 
+    internal sealed class ComMethodInfo {
+        public int Parameters;
+        public VarEnum ReturnType;
+    }
     internal sealed class ComEventInfo {
         public Guid SourceInterface;
         public readonly Dictionary<string,int> DispIds=new Dictionary<string,int>(StringComparer.OrdinalIgnoreCase);
         public readonly Dictionary<string,VarEnum> ArgumentTypes=new Dictionary<string,VarEnum>(StringComparer.OrdinalIgnoreCase);
+        public readonly Dictionary<string,ComMethodInfo> Methods=new Dictionary<string,ComMethodInfo>(StringComparer.OrdinalIgnoreCase);
     }
     internal static class ComTypeDiscovery {
         public static ComEventInfo Discover(object com) {
@@ -38,9 +58,11 @@ namespace ShinhanNativeTrader {
                 ComTypes.TYPEATTR attr;
                 try {attr=(ComTypes.TYPEATTR)Marshal.PtrToStructure(ptr,typeof(ComTypes.TYPEATTR));}
                 finally {coclass.ReleaseTypeAttr(ptr);}
+                ComEventInfo result=null;
+                var methods=new Dictionary<string,ComMethodInfo>(StringComparer.OrdinalIgnoreCase);
                 for(int i=0;i<attr.cImplTypes;i++) {
                     ComTypes.IMPLTYPEFLAGS flags;coclass.GetImplTypeFlags(i,out flags);
-                    if((flags & ComTypes.IMPLTYPEFLAGS.IMPLTYPEFLAG_FSOURCE)==0)continue;
+                    bool events=(flags & ComTypes.IMPLTYPEFLAGS.IMPLTYPEFLAG_FSOURCE)!=0;
                     int href;coclass.GetRefTypeOfImplType(i,out href);
                     ComTypes.ITypeInfo source;coclass.GetRefTypeInfo(href,out source);
                     try {
@@ -55,6 +77,10 @@ namespace ShinhanNativeTrader {
                                 string name,desc,helpfile;int context;
                                 source.GetDocumentation(f.memid,out name,out desc,out context,out helpfile);
                                 if(string.IsNullOrWhiteSpace(name))continue;
+                                if(!events) {
+                                    methods[name]=new ComMethodInfo{Parameters=f.cParams,ReturnType=(VarEnum)f.elemdescFunc.tdesc.vt};
+                                    continue;
+                                }
                                 e.DispIds[name]=f.memid;
                                 if(f.cParams==1) {
                                     var arg=(ComTypes.ELEMDESC)Marshal.PtrToStructure(f.lprgelemdescParam,typeof(ComTypes.ELEMDESC));
@@ -62,9 +88,10 @@ namespace ShinhanNativeTrader {
                                 }
                             } finally {source.ReleaseFuncDesc(ptr);}
                         }
-                        if(e.DispIds.ContainsKey("ReceiveData"))return e;
+                        if(e.DispIds.ContainsKey("ReceiveData"))result=e;
                     } finally {Marshal.ReleaseComObject(source);}
                 }
+                if(result!=null){foreach(var method in methods)result.Methods[method.Key]=method.Value;return result;}
             } finally {Marshal.ReleaseComObject(coclass);}
             throw new InvalidOperationException("No outgoing Indi interface exposing ReceiveData in installed typelib.");
         }
@@ -78,44 +105,53 @@ namespace ShinhanNativeTrader {
         object Invoke(string method,params object[] args);
     }
 
-    internal sealed class ComIndiTransport : IIndiTransport {
+    internal sealed class ComIndiTransport : IIndiTransport,IIndiDiagnostics {
         readonly Control surface;
         readonly int ownerThread;
-        readonly List<KeyValuePair<int,Delegate>> handlers=new List<KeyValuePair<int,Delegate>>();
+        readonly Action<string> log;
+        ComEventSubscriptions subscriptions;
         IndiHost host;object com;ComEventInfo source;bool disposed;
         public event Action<int> ReceiveData;
         public event Action<int> ReceiveSysMsg;
         public event Action<string> Error;
         public ComIndiTransport(Control surface,Action<string> log) {
-            this.surface=surface;ownerThread=Thread.CurrentThread.ManagedThreadId;
+            this.surface=surface;this.log=log;ownerThread=Thread.CurrentThread.ManagedThreadId;
             if(IntPtr.Size!=4)throw new InvalidOperationException("Indi requires an x86 (32 bit) process.");
             if(Thread.CurrentThread.GetApartmentState()!=ApartmentState.STA)throw new InvalidOperationException("Indi requires the UI STA.");
             if(surface.InvokeRequired)throw new InvalidOperationException("Connect Indi on the control's UI thread.");
             try {
-                host=new IndiHost("GIEXPERTCONTROL.GiExpertControlCtrl.1");
+                host=new IndiHost("GIEXPERTCONTROL.GiExpertControlCtrl.1",AttachInterfaces,CreateSink,DetachSink);
                 ((ISupportInitialize)host).BeginInit();surface.Controls.Add(host);((ISupportInitialize)host).EndInit();
                 host.CreateControl();
                 if(!host.IsHandleCreated)throw new InvalidOperationException("ActiveX native handle creation failed.");
-                com=host.ComObject;
                 if(com==null)throw new InvalidOperationException("Indi OCX was not loaded.");
-                source=ComTypeDiscovery.Discover(com);
-                Bind("ReceiveData",OnData);Bind("ReceiveSysMsg",OnSys);
-                log("COM outgoing IID="+source.SourceInterface+" ReceiveData DISPID="+source.DispIds["ReceiveData"]+
-                    " ReceiveSysMsg DISPID="+source.DispIds["ReceiveSysMsg"]+"; handlers attached on STA.");
+                if(subscriptions==null||subscriptions.Count!=2)throw new InvalidOperationException("AxHost did not complete its event CreateSink stage.");
+                log("ActiveX site ready; handleCreated="+host.IsHandleCreated+" visible="+host.Visible+
+                    "; server response NOT YET VERIFIED.");
             }catch{Dispose();throw;}
+        }
+        void AttachInterfaces(object control){com=control;source=ComTypeDiscovery.Discover(control);}
+        void CreateSink(object control) {
+            DetachSink();
+            if(source==null)AttachInterfaces(control);
+            subscriptions=new ComEventSubscriptions(control,source.SourceInterface);
+            try {
+                Bind("ReceiveData",OnData);Bind("ReceiveSysMsg",OnSys);
+                log("AxHost.CreateSink outgoing IID="+source.SourceInterface+" ReceiveData DISPID="+source.DispIds["ReceiveData"]+
+                    " arg="+source.ArgumentTypes["ReceiveData"]+" ReceiveSysMsg DISPID="+source.DispIds["ReceiveSysMsg"]+
+                    "; native subscriptions="+subscriptions.Count+"; receipt not yet verified.");
+            }catch{DetachSink();throw;}
+        }
+        void DetachSink() {
+            if(subscriptions==null)return;
+            try{subscriptions.Dispose();}catch(Exception ex){log("COM detach failed ("+ex.GetType().Name+"); ActiveX disposal follows.");}
+            subscriptions=null;
         }
         void Bind(string name,Action<int> callback) {
             int dispid;VarEnum type;
             if(!source.DispIds.TryGetValue(name,out dispid)||!source.ArgumentTypes.TryGetValue(name,out type))
                 throw new InvalidOperationException(name+" must have one parameter in installed typelib.");
-            Delegate handler;
-            if(type==VarEnum.VT_I4||type==VarEnum.VT_INT)handler=new Action<int>(callback);
-            else if(type==VarEnum.VT_I2)handler=new Action<short>(value=>callback(value));
-            else throw new InvalidOperationException(name+" unsupported installed argument type "+type+"; inspect typelib before using Indi.");
-            // ComEventsHelper advises the discovered source IID and supplies a runtime IDispatch sink.
-            // Keep the exact delegates rooted until Remove; no vendor IID or DISPID is compiled in.
-            ComEventsHelper.Combine(com,source.SourceInterface,dispid,handler);
-            handlers.Add(new KeyValuePair<int,Delegate>(dispid,handler));
+            subscriptions.AddInt32Callback(dispid,type,callback);
         }
         void Callback(Action action) {
             if(disposed)return;
@@ -126,24 +162,49 @@ namespace ShinhanNativeTrader {
             }
             try {action();}catch(Exception ex){if(Error!=null)Error("Indi callback failed ("+ex.GetBaseException().GetType().Name+"); requests halted.");}
         }
-        void OnData(int id){Callback(()=>{if(ReceiveData!=null)ReceiveData(id);});}
+        void OnData(int id){Callback(()=>{log("NATIVE ReceiveData rid="+id);if(ReceiveData!=null)ReceiveData(id);});}
         void OnSys(int id){Callback(()=>{if(ReceiveSysMsg!=null)ReceiveSysMsg(id);});}
         public object Invoke(string method,params object[] args) {
             if(disposed)throw new ObjectDisposedException("ComIndiTransport");
             if(Thread.CurrentThread.ManagedThreadId!=ownerThread)throw new InvalidOperationException("Indi call must use its owning STA.");
             // This control is reserved for read-only requests, even if another caller gets this boundary.
             if(method!="SetQueryName"&&method!="SetSingleData"&&method!="RequestData"&&method!="GetSingleData"&&
-                method!="GetMultiData"&&method!="GetMultiRowCount")throw new InvalidOperationException("Read-only Indi method not allowed: "+method);
+                method!="GetMultiData"&&method!="GetMultiRowCount"&&!DiagnosticMethod(method))throw new InvalidOperationException("Read-only Indi method not allowed: "+method);
+            if(DiagnosticMethod(method)&&(!SupportsDiagnostic(method)||args.Length!=0))throw new InvalidOperationException("Installed Indi diagnostic signature is unavailable.");
             if(method=="SetQueryName"&&(args.Length!=1||!new[]{"stock_mst","TR_SCHART","SC","SABA200QB"}.Contains(Convert.ToString(args[0]))))
                 throw new InvalidOperationException("Read-only Indi query not allowed.");
             return com.GetType().InvokeMember(method,BindingFlags.InvokeMethod,null,com,args,CultureInfo.InvariantCulture);
         }
+        static bool DiagnosticMethod(string name) {
+            return name=="GetCommState"||name=="GetErrorState"||name=="GetErrorCode"||name=="GetErrorMessage";
+        }
+        bool SupportsDiagnostic(string name) {
+            ComMethodInfo method;
+            if(source==null||!source.Methods.TryGetValue(name,out method)||method.Parameters!=0)return false;
+            if(name=="GetCommState"||name=="GetErrorState")return method.ReturnType==VarEnum.VT_I2||method.ReturnType==VarEnum.VT_I4||method.ReturnType==VarEnum.VT_INT;
+            return method.ReturnType==VarEnum.VT_VARIANT||method.ReturnType==VarEnum.VT_BSTR||method.ReturnType==VarEnum.VT_I2||method.ReturnType==VarEnum.VT_I4;
+        }
+        public IndiDiagnosticSnapshot ReadDiagnostics() {
+            var result=new IndiDiagnosticSnapshot();var unavailable=new List<string>();
+            // Read error state before other calls can alter it. Only installed zero-argument
+            // diagnostic getters are callable; no guessed APIs or session-changing calls.
+            foreach(var name in new[]{"GetErrorState","GetErrorCode","GetErrorMessage","GetCommState"}) {
+                if(!SupportsDiagnostic(name)){unavailable.Add(name+":not-exported");continue;}
+                try {
+                    object value=Invoke(name);
+                    if(name=="GetCommState"||name=="GetErrorState") {
+                        if(!(value is short)&&!(value is int))throw new InvalidOperationException("Unexpected diagnostic state type.");
+                        int number=Convert.ToInt32(value,CultureInfo.InvariantCulture);
+                        if(name=="GetCommState")result.CommState=number;else result.ErrorState=number;
+                    } else if(name=="GetErrorCode")result.ErrorCode=Convert.ToString(value,CultureInfo.InvariantCulture);
+                    else result.Message=Convert.ToString(value,CultureInfo.InvariantCulture);
+                }catch(Exception ex){unavailable.Add(name+":"+ex.GetBaseException().GetType().Name);}
+            }
+            result.Unavailable=string.Join(",",unavailable);return result;
+        }
         public void Dispose() {
             if(disposed)return;disposed=true;
-            if(com!=null&&source!=null)foreach(var h in handlers) {
-                try{ComEventsHelper.Remove(com,source.SourceInterface,h.Key,h.Value);}catch{}
-            }
-            handlers.Clear();
+            DetachSink();
             if(host!=null){host.Dispose();host=null;}
             // AxHost owns its RCW; do not FinalReleaseComObject behind the ActiveX site.
             com=null;
@@ -233,6 +294,7 @@ namespace ShinhanNativeTrader {
         sealed class Pending {
             public string Kind,Code;public int? Id;
             public readonly List<Snapshot> Early=new List<Snapshot>();
+            public string[] Sensitive=new string[0];
         }
         readonly IIndiTransport io;Pending pending;bool failed,disposed;
         public event Action<string> Trace;
@@ -244,6 +306,21 @@ namespace ShinhanNativeTrader {
             io=transport;io.ReceiveData+=OnData;io.Error+=Halt;
         }
         void Log(string message){if(Trace!=null)Trace(message);}
+        IndiDiagnosticSnapshot Diagnose(Pending current,string stage) {
+            var diagnostic=io as IIndiDiagnostics;
+            if(diagnostic==null){Log("INDI "+stage+": diagnostic getters unavailable.");return null;}
+            try {
+                var snapshot=diagnostic.ReadDiagnostics();
+                Log("INDI "+stage+": "+IndiDiagnosticFormatter.Format(snapshot,current==null?new string[0]:current.Sensitive));
+                return snapshot;
+            } catch(Exception ex) {Log("INDI "+stage+": diagnostics unavailable ("+ex.GetBaseException().GetType().Name+").");return null;}
+        }
+        static int RequestId(object raw) {
+            // Null and bool both become 0 via Convert.ToInt32. They are not request IDs.
+            if(raw is short)return (short)raw;
+            if(raw is int)return (int)raw;
+            throw new InvalidOperationException("RequestData must return an integer request identifier.");
+        }
         static void Accepted(object result,string method) {
             if(result is bool&&!(bool)result)throw new InvalidOperationException(method+" returned false.");
             if(result!=null&&!(result is bool)&&result is IConvertible&&Convert.ToString(result,CultureInfo.InvariantCulture)=="0")
@@ -254,22 +331,30 @@ namespace ShinhanNativeTrader {
             if(failed)throw new InvalidOperationException("Indi requests halted after an earlier error; reconnect required.");
             if(Busy){Log("Rejected request while another TR is pending.");return false;}
             var current=new Pending{Kind=kind,Code=code};pending=current;
+            if(kind=="HOLDINGS"&&input!=null)current.Sensitive=input.Where(x=>x.Key==0||x.Key==2).Select(x=>x.Value).ToArray();
             var stage="SetQueryName";
             try {
+                Diagnose(current,"before "+query);
                 Accepted(io.Invoke("SetQueryName",query),"SetQueryName");
                 stage="SetSingleData";
                 if(input!=null)foreach(var field in input.OrderBy(x=>x.Key))Accepted(io.Invoke("SetSingleData",field.Key,field.Value),"SetSingleData");
                 stage="RequestData";
-                var id=Convert.ToInt32(io.Invoke("RequestData"),CultureInfo.InvariantCulture);
+                object raw=io.Invoke("RequestData");
+                Log("RequestData return type="+(raw==null?"null":raw.GetType().Name));
+                var id=RequestId(raw);
+                var diagnostic=Diagnose(current,"after RequestData rid="+id);
                 if(id<0)throw new InvalidOperationException("RequestData returned a negative request ID.");
                 if(failed)return false;
-                current.Id=id;Log("REQUEST "+query+" rid="+id);
+                if(diagnostic!=null&&diagnostic.ErrorState.HasValue&&diagnostic.ErrorState.Value>0) {
+                    Halt("Indi reported a request error: GetErrorState="+diagnostic.ErrorState.Value+", rid="+id+". See sanitized INDI diagnostics.");return false;
+                }
+                current.Id=id;Log("REQUEST "+query+" rid="+id+"; awaiting actual ReceiveData.");
                 // ReceiveData can be raised before RequestData returns. Its buffer was copied in OnData.
                 var match=current.Early.FirstOrDefault(x=>x.Id==id);
                 current.Early.Clear();
                 if(match!=null)Complete(current,match);
                 return !failed;
-            }catch(Exception ex){Halt("Indi "+stage+" failed ("+ex.GetBaseException().GetType().Name+"); request values and provider error text omitted.");return false;}
+            }catch(Exception ex){Diagnose(current,"failed "+stage);Halt("Indi "+stage+" failed ("+ex.GetBaseException().GetType().Name+"); request values and exception text omitted.");return false;}
         }
         void OnData(int id) {
             if(disposed||failed)return;
@@ -287,11 +372,11 @@ namespace ShinhanNativeTrader {
         }
         void Complete(Pending current,Snapshot snapshot) {
             if(pending!=current||failed)return;
-            if(snapshot.Error!=null){Halt("Indi response parse failed ("+snapshot.Error.GetBaseException().GetType().Name+"); verify installed field layout. Provider error text omitted.");return;}
+            if(snapshot.Error!=null){Diagnose(current,"response error rid="+snapshot.Id);Halt("Indi response parse failed ("+snapshot.Error.GetBaseException().GetType().Name+"); verify installed field layout. Exception text omitted.");return;}
             pending=null;Log("RECEIVED "+current.Kind+" rid="+snapshot.Id+" rows="+snapshot.Reply.Count);
             if(Done!=null)Done(snapshot.Reply);
         }
-        public void Timeout(){if(Busy)Halt("Indi TR timed out after 20 seconds; requests and automated trading halted.");}
+        public void Timeout(){if(Busy){var current=pending;Diagnose(current,"timeout rid="+(current.Id.HasValue?current.Id.Value.ToString():"unknown"));Halt("Indi TR timed out after 20 seconds without matching ReceiveData; rid="+(current.Id.HasValue?current.Id.Value.ToString():"unknown")+". Requests and automated trading halted.");}}
         public void Halt(string reason) {
             if(disposed||failed)return;
             pending=null;failed=true;Log("HALT: "+reason);if(Fatal!=null)Fatal(reason);
@@ -301,11 +386,12 @@ namespace ShinhanNativeTrader {
 
     public sealed class IndiApi : IDisposable {
         readonly Control surface;readonly System.Windows.Forms.Timer timeout;
-        ComIndiTransport transport;IndiRequestCoordinator requests;bool disposed;
+        ComIndiTransport transport;IndiRequestCoordinator requests;bool disposed,hasReceivedData;
         public event Action<string> Trace;
         public event Action<IndiReply> Done;
         public event Action<string> Fatal;
-        public bool Connected{get{return !disposed&&requests!=null&&!requests.Failed;}}
+        public bool TransportReady{get{return !disposed&&requests!=null&&!requests.Failed;}}
+        public bool Connected{get{return TransportReady&&hasReceivedData;}}
         public bool Busy{get{return requests!=null&&requests.Busy;}}
         public IndiApi(Control surface) {
             this.surface=surface;timeout=new System.Windows.Forms.Timer{Interval=20000};
@@ -314,13 +400,14 @@ namespace ShinhanNativeTrader {
         void Log(string message){if(Trace!=null)Trace(message);}
         public void Connect() {
             if(disposed)throw new ObjectDisposedException("IndiApi");
-            if(Connected)return;
+            if(TransportReady)return;
             timeout.Stop();
+            hasReceivedData=false;
             if(requests!=null){requests.Dispose();requests=null;}
             if(transport!=null){transport.Dispose();transport=null;}
             transport=new ComIndiTransport(surface,Log);
             requests=new IndiRequestCoordinator(transport);requests.Trace+=Log;
-            requests.Done+=reply=>{timeout.Stop();if(Done!=null)Done(reply);};
+            requests.Done+=reply=>{timeout.Stop();hasReceivedData=true;if(Done!=null)Done(reply);};
             requests.Fatal+=reason=>{timeout.Stop();if(Fatal!=null)Fatal(reason);};
             transport.ReceiveSysMsg+=id=>Log("Indi ReceiveSysMsg="+id+"; no assumption of account/login readiness.");
         }
@@ -337,7 +424,7 @@ namespace ShinhanNativeTrader {
             return Request("HOLDINGS","SABA200QB",new Dictionary<int,string>{{0,account.Trim()},{1,"01"},{2,password}},"");
         }
         bool Request(string kind,string query,IDictionary<int,string> input,string code) {
-            if(!Connected)throw new InvalidOperationException("Indi is not connected or requests are halted.");
+            if(!TransportReady)throw new InvalidOperationException("Indi OCX is not attached or requests are halted.");
             if(Busy)return false;
             var accepted=requests.Begin(kind,query,input,code);
             if(requests.Busy)timeout.Start();
