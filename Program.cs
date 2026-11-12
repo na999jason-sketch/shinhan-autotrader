@@ -86,11 +86,12 @@ namespace ShinhanNativeTrader {
 
     public sealed class MainForm : Form {
         sealed class EntryRequest {public Candidate Candidate;public IndiReply Quote;public DateTime QuoteUtc;public AccountOrderCapacity Capacity;public bool CapacityRequested,CashRequested;}
+        sealed class HoldingSellDecision {public decimal AveragePrice,Quantity,CreditQuantity;public string Reason;}
         readonly Panel nativeArea=new Panel();
         readonly TextBox logs=new TextBox(),account=new TextBox(),password=new TextBox(),code=new TextBox{Text="005930",Width=85};
         readonly NumericUpDown budget=Number(0,1000000000,0,0),orderQuantity=Number(1,1000000,1,0),orderPrice=Number(1,10000000,1,0);
         readonly Label state=new Label{AutoSize=true},portfolio=new Label{AutoSize=true},cashLabel=new Label{AutoSize=true},orderGate=new Label{AutoSize=true,ForeColor=Color.DarkRed};
-        readonly DataGridView holdingsGrid=Grid("코드","종목명","수량","평균단가","현재가","매입금액","평가금액","평가손익","수익률(%)","시세 조회시각"),
+        readonly DataGridView holdingsGrid=Grid("코드","종목명","수량","평균단가","현재가","매입금액","평가금액","평가손익","수익률(%)","시세 조회시각","매도판정"),
             ordersGrid=Grid("주문번호","종목","구분","주문수량","누적체결","미체결","주문단가","체결평균가","확인상태"),
             candidatesGrid=Grid("코드","종목명","신호 기준가","점수","조건","주문상태");
         readonly Dictionary<string,NumericUpDown> options=new Dictionary<string,NumericUpDown>();
@@ -103,6 +104,7 @@ namespace ShinhanNativeTrader {
         readonly Queue<Candidate> buyQuotes=new Queue<Candidate>();
         readonly Queue<string> accountReads=new Queue<string>();
         readonly Dictionary<string,DateTime> quoteDue=new Dictionary<string,DateTime>(),priceReceivedUtc=new Dictionary<string,DateTime>();
+        readonly Dictionary<string,HoldingSellDecision> sellDecisions=new Dictionary<string,HoldingSellDecision>(StringComparer.Ordinal);
         readonly HashSet<string> blockedSignals=new HashSet<string>(StringComparer.Ordinal);
         IndiApi api;
         AccountAppSettingsStore settingsStore;
@@ -124,6 +126,7 @@ namespace ShinhanNativeTrader {
         public MainForm() {
             Text="Shinhan Native Trader "+Program.Version+" | 실계좌 | 실주문 검증 잠금";
             Size=new Size(1370,860);MinimumSize=new Size(1120,730);Font=new Font("Malgun Gothic",9);
+            holdingsGrid.Columns["매도판정"].FillWeight=170;
             var root=new TableLayoutPanel{Dock=DockStyle.Fill,ColumnCount=1,RowCount=6,Padding=new Padding(10)};
             foreach(int height in new[]{35,100,30,40})root.RowStyles.Add(new RowStyle(SizeType.Absolute,height));
             root.RowStyles.Add(new RowStyle(SizeType.Percent,100));root.RowStyles.Add(new RowStyle(SizeType.Absolute,52));Controls.Add(root);
@@ -219,15 +222,17 @@ namespace ShinhanNativeTrader {
             CloseGateway();
             if(boundKey!=null)try{WriteReport(MarketTime.NowKorea.Date);}catch(Exception ex){Log("보고서 저장 실패: "+ex.GetType().Name);storageFault=true;}
             ReleaseAccount();password.Clear();state.Text=closingForm?"종료 중":"운영 중단 / 최근 실계좌 조회값 표시 / 실주문 잠금";
+            sellDecisions.Clear();RefreshAccount();
         }
         void CloseGateway(){if(gateway!=null){gateway.Dispose();gateway=null;}orderAcknowledgementPending=false;}
         void ReleaseAccount(){CloseGateway();if(journal!=null){journal.Dispose();journal=null;}if(credentials!=null){credentials.Dispose();credentials=null;}boundKey=null;account.ReadOnly=false;}
-        void ClearAccountData(){holdings.Clear();priceReceivedUtc.Clear();quoteDue.Clear();cash=null;brokerOrders=null;holdingsReceivedUtc=null;blockedSignals.Clear();RefreshAccount();RefreshOrders();}
+        void ClearAccountData(){holdings.Clear();priceReceivedUtc.Clear();quoteDue.Clear();sellDecisions.Clear();cash=null;brokerOrders=null;holdingsReceivedUtc=null;blockedSignals.Clear();RefreshAccount();RefreshOrders();}
         void CloseSession() {
             DateTime day=session.SessionDateKorea??MarketTime.NowKorea.Date;string reason=session.CloseReason;
             ClearWork();if(api!=null)api.CancelPending();
             CloseGateway();
             WriteReport(day);session.SessionClosed();Log("장중 운영 종료·보고서 저장: "+day.ToString("yyyy-MM-dd",CultureInfo.InvariantCulture)+" / "+reason);
+            sellDecisions.Clear();RefreshAccount();
             nextAccountReadUtc=DateTime.UtcNow;state.Text="장중 운영 종료 / 실계좌 조회 감시 계속 / 다음 평일 예약";
         }
         void Schedule() {
@@ -272,7 +277,7 @@ namespace ShinhanNativeTrader {
             var now=DateTime.UtcNow;
             if(reply.Kind=="STOCKS"){symbols.Clear();symbols.AddRange(reply.Stocks);state.Text="종목 응답 "+reply.Count+"건 / 일반주식 "+symbols.Count+"개";if(pendingSessionScan&&ActiveSession){pendingSessionScan=false;QueueAccountRefresh();StartScanCore();}return;}
             if(reply.Kind=="HOLDINGS") {
-                holdings.Clear();holdings.AddRange(reply.Holdings);holdingsReceivedUtc=now;
+                sellDecisions.Clear();holdings.Clear();holdings.AddRange(reply.Holdings);holdingsReceivedUtc=now;
                 foreach(var holding in holdings)if(holding.Price>0)priceReceivedUtc[holding.Code]=now;
                 if(settingsStore!=null&&boundKey!=null){settingsStore.RefreshPositions(boundKey,holdings);configuration=settingsStore.Snapshot;}
                 RefreshAccount();state.Text="실계좌 잔고 "+holdings.Count+"종목 조회 / 평가손익은 비용 제외";return;
@@ -288,14 +293,14 @@ namespace ShinhanNativeTrader {
             }
             if(reply.Kind!="QUOTE")return;
             var intent=requestedBuy;requestedBuy=null;var held=holdings.SingleOrDefault(x=>x.Code==reply.Code);
-            if(held!=null){held.Price=reply.Price;priceReceivedUtc[held.Code]=now;RefreshAccount();}
+            if(held!=null){held.Price=reply.Price;priceReceivedUtc[held.Code]=now;}
             state.Text="현재가 "+reply.Code+" "+reply.Price.ToString("N0",CultureInfo.CurrentCulture)+"원 / "+(reply.HasTradeClock?"체결시각 "+reply.Clock:"거래시각 미확인 · 주문 사용 제외");
             Log("현재가 "+reply.Code+" "+reply.Price.ToString(CultureInfo.InvariantCulture)+" / 거래시각="+(reply.HasTradeClock?reply.Clock:"미확인"));
+            string sellReason=held==null?null:EvaluateHoldingSell(held,reply,now);
+            if(held!=null)RefreshAccount();
             if(!ActiveSession||credentials==null||!MarketTime.CanUseQuote(reply,now))return;
             if(held!=null&&held.Quantity>0&&held.AvgPrice>0&&held.CreditQty==0) {
-                settingsStore.ObserveHigh(boundKey,held,reply,now);
-                string reason=Rules.Exit(new PositionRiskState{Code=held.Code,Qty=checked((int)held.Quantity),Entry=held.AvgPrice,High=settingsStore.High(boundKey,held.Code,held.AvgPrice)},reply.Price,configuration.Strategy);
-                if(!string.IsNullOrEmpty(reason))TryOrder(new LiveOrderIntent{Kind=LiveOrderKind.Sell,Code=held.Code,Quantity=checked((int)held.Quantity),LimitPrice=reply.Price,ClientKey="exit-"+MarketTime.ToKorea(now).ToString("yyyyMMdd",CultureInfo.InvariantCulture)+"-"+held.Code},reply,null,now);
+                if(!string.IsNullOrEmpty(sellReason))TryOrder(new LiveOrderIntent{Kind=LiveOrderKind.Sell,Code=held.Code,Quantity=checked((int)held.Quantity),LimitPrice=reply.Price,ClientKey="exit-"+MarketTime.ToKorea(now).ToString("yyyyMMdd",CultureInfo.InvariantCulture)+"-"+held.Code},reply,null,now);
             } else if(intent!=null&&intent.Code==reply.Code&&entry==null&&held==null&&ProjectedPositionCount()<configuration.Strategy.MaxPositions
                 &&intent.SignalDate==MarketTime.ToKorea(now).ToString("yyyyMMdd",CultureInfo.InvariantCulture)&&reply.Price>=configuration.Strategy.MinPrice&&reply.Price<=configuration.Strategy.MaxPrice
                 &&reply.Price>=intent.Price*0.97m&&reply.Price<=intent.Price*1.03m)entry=new EntryRequest{Candidate=intent,Quote=reply,QuoteUtc=now};
@@ -342,11 +347,42 @@ namespace ShinhanNativeTrader {
             TryOrder(intent,null,null,DateTime.UtcNow);
         }
         static string Amount(decimal? value){return value.HasValue?value.Value.ToString("N0",CultureInfo.CurrentCulture):"미확인";}
+        string HoldingDecision(Holding held) {
+            HoldingSellDecision decision;
+            if(sellDecisions.TryGetValue(held.Code,out decision)) {
+                if(decision.AveragePrice==held.AvgPrice&&decision.Quantity==held.Quantity&&decision.CreditQuantity==held.CreditQty)return decision.Reason;
+                sellDecisions.Remove(held.Code);
+            }
+            if(held.Quantity<=0)return "보유수량 없음";
+            if(held.AvgPrice<=0)return "평균단가 확인 대기";
+            if(held.CreditQty!=0)return "신용·매도수량 검증 대기";
+            return ActiveSession?"최신 시세 확인 대기":"장중 감시 대기";
+        }
+        void SetHoldingDecision(Holding held,string reason) {
+            string previous=HoldingDecision(held);
+            sellDecisions[held.Code]=new HoldingSellDecision{AveragePrice=held.AvgPrice,Quantity=held.Quantity,CreditQuantity=held.CreditQty,Reason=reason};
+            if(previous!=reason)Log("매도 판정 "+held.Code+" / "+reason);
+        }
+        string EvaluateHoldingSell(Holding held,IndiReply quote,DateTime utc) {
+            string pending=null;
+            if(held.Quantity<=0)pending="보유수량 없음";
+            else if(held.AvgPrice<=0)pending="평균단가 확인 대기";
+            else if(held.CreditQty!=0)pending="신용·매도수량 검증 대기";
+            else if(!ActiveSession)pending="장중 감시 대기";
+            else if(quote==null||quote.Code!=held.Code)pending="종목·시세 확인 대기";
+            else if(!MarketTime.CanUseQuote(quote,utc))pending="최신 체결시각 확인 대기";
+            else if(credentials==null||boundKey==null||settingsStore==null)pending="실계좌 확인 대기";
+            if(pending!=null){SetHoldingDecision(held,pending);return null;}
+            settingsStore.ObserveHigh(boundKey,held,quote,utc);
+            string reason=Rules.Exit(new PositionRiskState{Code=held.Code,Qty=checked((int)held.Quantity),Entry=held.AvgPrice,
+                High=settingsStore.High(boundKey,held.Code,held.AvgPrice)},quote.Price,configuration.Strategy);
+            SetHoldingDecision(held,string.IsNullOrEmpty(reason)?"보유":reason);return reason;
+        }
         void RefreshAccount() {
             holdingsGrid.Rows.Clear();
             foreach(var held in holdings) {
                 var value=HoldingValuation.From(held);DateTime stamp;
-                holdingsGrid.Rows.Add(value.Code,value.Name,value.Quantity,Amount(value.AveragePrice>0?(decimal?)value.AveragePrice:null),Amount(value.CurrentPrice>0?(decimal?)value.CurrentPrice:null),Amount(value.CostBasis),Amount(value.MarketValue),Amount(value.UnrealizedProfit),value.ReturnPercent.HasValue?value.ReturnPercent.Value.ToString("N2",CultureInfo.CurrentCulture):"미확인",priceReceivedUtc.TryGetValue(held.Code,out stamp)?MarketTime.ToKorea(stamp).ToString("MM-dd HH:mm:ss",CultureInfo.InvariantCulture):"미조회");
+                holdingsGrid.Rows.Add(value.Code,value.Name,value.Quantity,Amount(value.AveragePrice>0?(decimal?)value.AveragePrice:null),Amount(value.CurrentPrice>0?(decimal?)value.CurrentPrice:null),Amount(value.CostBasis),Amount(value.MarketValue),Amount(value.UnrealizedProfit),value.ReturnPercent.HasValue?value.ReturnPercent.Value.ToString("N2",CultureInfo.CurrentCulture):"미확인",priceReceivedUtc.TryGetValue(held.Code,out stamp)?MarketTime.ToKorea(stamp).ToString("MM-dd HH:mm:ss",CultureInfo.InvariantCulture):"미조회",HoldingDecision(held));
             }
             if(holdingsReceivedUtc.HasValue){var total=AccountValuation.From(holdings);portfolio.Text="매입 "+Amount(total.CostBasis)+"원 / 평가 "+Amount(total.MarketValue)+"원 / 평가손익 "+Amount(total.UnrealizedProfit)+"원 (비용 제외)";}
             else portfolio.Text="실계좌 잔고·평가손익: 미조회";
