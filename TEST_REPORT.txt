@@ -22,6 +22,9 @@
   Windows targeting pack을 이용한 정식 .NET4.8 빌드의 대체 결과는 아니다.
 - C# 118 assertions 통과: 기존 전략 11 + 수신/파서 38 + 모의 엔진/전략 69.
 - Python unittest 17 tests 통과: 기존 엔진/전체 사이클 14 + 실주문 잠금 3.
+- Linux Mono/Xvfb UI 기능 검증 15 assertions 통과: 화면/탭/전략 입력,
+  비율 단위 변환, 원금·전략 저장 및 재시작 복원. 격리된 /tmp 계정 사용,
+  주문/포지션 생성 0건. Windows 검증이나 화면 외관 검증을 의미하지 않는다.
 - PE 검증: I386 PE32 + CLR 32BITREQUIRED 확인.
 - 로컬 Mono 실행 pointerBytes=8: Linux 런타임은 x86 프로세스 실행 증거가 아니다.
 - git diff --check 통과.
@@ -30,6 +33,9 @@ GitHub Actions
 - Windows 2022: .NET Framework4.8 MSBuild /platform:x86 /warnaserror,
   EXE PE32/32BITREQUIRED 검증, C# --selftest, Python regression을 설정했다.
 - 실행 결과 및 링크는 PR/최종 작업 보고에서 실제 Actions 결과를 기준으로 기록한다.
+- 이번 세션은 GitHub 연결 도구, git push, gh REST 브랜치 생성이 모두 HTTP403으로
+  거절되어 원격 브랜치/PR를 만들지 못했다. 따라서 수정 코드의 Windows Actions는
+  미실행이며 Windows 빌드 성공으로 보고하지 않는다. 저장소 쓰기/워크플로 권한 필요.
 - validation-reports 아티팩트에 빌드 로그와 테스트 보고서가 저장된다.
 - 성공한 실행만 ShinhanNativeTrader-Win32 EXE 아티팩트를 업로드한다.
 
