@@ -36,7 +36,7 @@ jobs:
           python scripts/verify_x86.py bin/Release/ShinhanNativeTrader.exe --require-admin
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: C# unit and paper lifecycle tests (no OCX or account required)
+      - name: C# account, order and unattended lifecycle tests (no OCX or account required)
         run: |
           $report = Join-Path $PWD 'reports/native-tests.txt'
           $process = Start-Process -FilePath (Join-Path $PWD 'bin/Release/ShinhanNativeTrader.exe') -ArgumentList @('--selftest', '--selftest-report', ('"' + $report + '"')) -Wait -PassThru

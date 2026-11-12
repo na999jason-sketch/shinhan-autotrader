@@ -115,6 +115,9 @@ namespace ShinhanNativeTrader {
         readonly Action<string> log;
         ComEventSubscriptions subscriptions;
         IndiHost host;object com;ComEventInfo source;IndiReadOnlyDispatch dispatch;bool disposed;
+        // Exposed only to the separate owned order connection below. Ordinary
+        // query callers cannot obtain the native RCW or widen the read allowlist.
+        internal object NativeControl {get{if(disposed)throw new ObjectDisposedException("ComIndiTransport");return com;}}
         public event Action<int> ReceiveData;
         public event Action<int> ReceiveSysMsg;
         public event Action<string> Error;
@@ -186,7 +189,7 @@ namespace ShinhanNativeTrader {
             if(method!="SetQueryName"&&method!="GetQueryName"&&method!="SetSingleData"&&method!="RequestData"&&method!="GetSingleData"&&
                 method!="GetMultiData"&&method!="GetMultiRowCount"&&!DiagnosticMethod(method))throw new InvalidOperationException("Read-only Indi method not allowed: "+method);
             if(DiagnosticMethod(method)&&(!SupportsDiagnostic(method)||args.Length!=0))throw new InvalidOperationException("Installed Indi diagnostic signature is unavailable.");
-            if(method=="SetQueryName"&&(args.Length!=1||!new[]{"stock_mst","TR_SCHART","SC","TR_1110_11","SABA200QB"}.Contains(Convert.ToString(args[0]))))
+            if(method=="SetQueryName"&&(args.Length!=1||!new[]{"stock_mst","TR_SCHART","SC","TR_1110_11","SABA200QB","SABA602Q1","SABA415Q1","SABA231Q1"}.Contains(Convert.ToString(args[0]))))
                 throw new InvalidOperationException("Read-only Indi query not allowed.");
             return dispatch.Invoke(method,args);
         }
@@ -234,6 +237,9 @@ namespace ShinhanNativeTrader {
         public List<Holding> Holdings=new List<Holding>();
         public decimal Price;
         public bool HasTradeClock;
+        public AccountCashSnapshot Cash;
+        public BrokerOrdersSnapshot BrokerOrders;
+        public AccountOrderCapacity Capacity;
         public string Clock,Message,OrderNo;
     }
 
@@ -245,7 +251,7 @@ namespace ShinhanNativeTrader {
             public FieldFailure(string context,Exception inner=null):base(context,inner){Context=context;}
         }
         internal static string FailureContext(Exception error) {
-            var failure=error as FieldFailure;return failure==null?"unclassified provider/validation error":failure.Context;
+            var failure=error as FieldFailure;return failure==null?(AccountQueries.FailureContext(error)??"unclassified provider/validation error"):failure.Context;
         }
         static readonly Regex Number=new Regex(@"^[+-]?(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)(?:\.[0-9]+)?$",RegexOptions.CultureInvariant);
         public static decimal RequiredNumber(object raw,string label,bool signed=false,bool optional=false) {
@@ -261,7 +267,7 @@ namespace ShinhanNativeTrader {
             if(count!=decimal.Truncate(count)||count>limit)throw new InvalidOperationException("Indi row count outside supported range.");
             return (int)count;
         }
-        public static IndiReply Read(IIndiTransport io,string kind,string code,Action<string,string,string> quoteTrace=null) {
+        public static IndiReply Read(IIndiTransport io,string kind,string code,Action<string,string,string> quoteTrace=null,decimal? requestedPrice=null) {
             Func<int,string> single=col=>{
                 try{return Convert.ToString(io.Invoke("GetSingleData",col),CultureInfo.InvariantCulture)??"";}
                 catch(Exception ex){throw new FieldFailure("GetSingleData index="+col+" failed",ex);}
@@ -321,6 +327,13 @@ namespace ShinhanNativeTrader {
                 if(reply.Price<=0)throw new FieldFailure("TR_1110_11 price single[24] must be positive");
                 reply.Clock="";reply.HasTradeClock=false;
                 reply.Message="조회 가격: 거래시각 미제공, 자동매매 사용 제외";
+            }else if(kind=="CASH") {
+                reply.Cash=AccountQueries.ReadCash(io,DateTime.UtcNow);reply.Count=1;
+            }else if(kind=="CAPACITY") {
+                if(!requestedPrice.HasValue||requestedPrice.Value<=0)throw new FieldFailure("Capacity request price is missing");
+                reply.Capacity=AccountQueries.ReadCapacity(io,code,requestedPrice.Value,DateTime.UtcNow);reply.Count=1;
+            }else if(kind=="ORDERS") {
+                reply.BrokerOrders=AccountQueries.ReadOrders(io,code,DateTime.UtcNow);reply.Count=reply.BrokerOrders.Orders.Count;
             }else if(kind=="HOLDINGS") {
                 reply.Count=Rows(io,2000);var seen=new HashSet<string>();
                 for(int row=0;row<reply.Count;row++) {
@@ -345,6 +358,7 @@ namespace ShinhanNativeTrader {
         sealed class Snapshot { public int Id;public int? ProviderErrorState;public IndiReply Reply;public Exception Error; }
         sealed class Pending {
             public string Kind,Code;public int? Id;
+            public decimal? RequestedPrice;
             public readonly List<Snapshot> Early=new List<Snapshot>();
             public string[] Sensitive=new string[0];
         }
@@ -381,13 +395,14 @@ namespace ShinhanNativeTrader {
             if(result!=null&&!(result is bool)&&result is IConvertible&&Convert.ToString(result,CultureInfo.InvariantCulture)=="0")
                 throw new InvalidOperationException(method+" returned zero.");
         }
-        public bool Begin(string kind,string query,IDictionary<int,string> input,string code) {
+        public bool Begin(string kind,string query,IDictionary<int,string> input,string code,decimal? requestedPrice=null) {
             if(disposed)throw new ObjectDisposedException("IndiRequestCoordinator");
             if(failed)throw new InvalidOperationException("Indi requests halted after an earlier error; reconnect required.");
             if(Busy){Log("Rejected request while another TR is pending.");return false;}
-            var current=new Pending{Kind=kind,Code=code};pending=current;
-            if(kind=="HOLDINGS"&&input!=null) {
-                current.Sensitive=input.Where(x=>x.Key==0||x.Key==2).Select(x=>x.Value).ToArray();
+            var current=new Pending{Kind=kind,Code=code,RequestedPrice=requestedPrice};pending=current;
+            if((kind=="HOLDINGS"||kind=="CASH"||kind=="CAPACITY"||kind=="ORDERS")&&input!=null) {
+                var accountIndex=kind=="ORDERS"?1:0;
+                current.Sensitive=input.Where(x=>x.Key==accountIndex||x.Key==2).Select(x=>x.Value).ToArray();
                 foreach(var value in current.Sensitive)if(!string.IsNullOrWhiteSpace(value))sessionSensitive.Add(value);
             }
             var stage="SetQueryName";
@@ -435,7 +450,7 @@ namespace ShinhanNativeTrader {
                 snapshot.ProviderErrorState=diagnostic.ErrorState.Value;
             else {
                 try{snapshot.Reply=IndiResponseParser.Read(io,current.Kind,current.Code,
-                    (symbol,clock,price)=>Log(IndiDiagnosticFormatter.FormatQuote(current.Kind,symbol,clock,price,sessionSensitive)));}
+                    (symbol,clock,price)=>Log(IndiDiagnosticFormatter.FormatQuote(current.Kind,symbol,clock,price,sessionSensitive)),current.RequestedPrice);}
                 catch(Exception ex){snapshot.Error=ex;}
             }
             if(!current.Id.HasValue) {
@@ -454,11 +469,39 @@ namespace ShinhanNativeTrader {
             if(Done!=null)Done(snapshot.Reply);
         }
         public void Timeout(){if(Busy){var current=pending;Diagnose(current,"timeout rid="+(current.Id.HasValue?current.Id.Value.ToString():"unknown"));Halt("Indi TR timed out after 20 seconds without matching ReceiveData; rid="+(current.Id.HasValue?current.Id.Value.ToString():"unknown")+". Requests and automated trading halted.");}}
+        // Cancels only a local read-only request. It never cancels a broker order.
+        public void CancelPending(){if(disposed||pending==null)return;pending=null;Log("Read-only request discarded locally; late callbacks will be ignored.");}
         public void Halt(string reason) {
             if(disposed||failed)return;
             pending=null;failed=true;Log("HALT: "+reason);if(Fatal!=null)Fatal(reason);
         }
         public void Dispose(){if(disposed)return;disposed=true;pending=null;sessionSensitive.Clear();io.ReceiveData-=OnData;io.Error-=Halt;}
+    }
+
+    // A dedicated order OCX is created lazily only after the production order
+    // gate passes. It never shares response buffers with the read-only OCX.
+    internal sealed class IndiLiveOrderConnection : ILiveOrderWire {
+        readonly Control surface;readonly Action<string> log;
+        ComIndiTransport owner;ComLiveOrderWire wire;bool disposed;
+        public event Action<LiveOrderAcknowledgement> Acknowledged;
+        public IndiLiveOrderConnection(Control surface,Action<string> log){this.surface=surface;this.log=log;}
+        public int Send(LiveOrderIntent intent,LiveAccountCredentials credentials,LiveOrderPreflight checks,DateTime utc) {
+            if(disposed)throw new ObjectDisposedException("IndiLiveOrderConnection");
+            LiveOrderSafety.EnsureAllowed();
+            if(wire==null) {
+                try {
+                    owner=new ComIndiTransport(surface,log);wire=new ComLiveOrderWire(owner.NativeControl);
+                    wire.Acknowledged+=Forward;
+                }catch{if(wire!=null){wire.Dispose();wire=null;}if(owner!=null){owner.Dispose();owner=null;}throw;}
+            }
+            return wire.Send(intent,credentials,checks,utc);
+        }
+        void Forward(LiveOrderAcknowledgement reply){if(Acknowledged!=null)Acknowledged(reply);}
+        public void Dispose() {
+            if(disposed)return;disposed=true;
+            try {if(wire!=null){wire.Acknowledged-=Forward;wire.Dispose();wire=null;}}
+            finally {if(owner!=null){owner.Dispose();owner=null;}}
+        }
     }
 
     public sealed class IndiApi : IDisposable {
@@ -496,19 +539,27 @@ namespace ShinhanNativeTrader {
         }
         public bool Quote(string code){code=ValidateCode(code);return Request("QUOTE","SC",new Dictionary<int,string>{{0,code}},code);}
         public bool SnapshotQuote(string code){code=ValidateCode(code);return Request("SNAPSHOT","TR_1110_11",new Dictionary<int,string>{{0,code}},code);}
+        public ILiveOrderWire CreateLiveOrderWire(){if(disposed)throw new ObjectDisposedException("IndiApi");return new IndiLiveOrderConnection(surface,Log);}
         static string ValidateCode(string code){var normalized=Rules.Code(code);if(normalized=="")throw new ArgumentException("Six digit stock symbol required.");return normalized;}
         public bool Holdings(string account,string password) {
             if(string.IsNullOrWhiteSpace(account)||string.IsNullOrWhiteSpace(password))throw new InvalidOperationException("계좌번호/비밀번호를 PC 화면에서 입력해야 합니다.");
             return Request("HOLDINGS","SABA200QB",new Dictionary<int,string>{{0,account.Trim()},{1,"01"},{2,password}},"");
         }
-        bool Request(string kind,string query,IDictionary<int,string> input,string code) {
+        public bool Cash(string account,string password){return Request("CASH","SABA602Q1",AccountQueries.CashInputs(account,password),"");}
+        public bool Orders(string account,string password,string date){return Request("ORDERS","SABA231Q1",AccountQueries.OrdersInputs(account,password,date),date);}
+        public bool Capacity(string account,string password,string code,decimal limitPrice) {
+            code=ValidateCode(code);
+            return Request("CAPACITY","SABA415Q1",AccountQueries.CapacityInputs(account,password,code,limitPrice),code,limitPrice);
+        }
+        bool Request(string kind,string query,IDictionary<int,string> input,string code,decimal? requestedPrice=null) {
             if(!TransportReady)throw new InvalidOperationException("Indi OCX is not attached or requests are halted.");
             if(Busy)return false;
-            var accepted=requests.Begin(kind,query,input,code);
+            var accepted=requests.Begin(kind,query,input,code,requestedPrice);
             if(requests.Busy)timeout.Start();
             return accepted;
         }
         public void Halt(string reason){if(requests!=null)requests.Halt(reason);}
+        public void CancelPending(){timeout.Stop();if(requests!=null)requests.CancelPending();}
         public void Dispose() {
             if(disposed)return;disposed=true;timeout.Stop();timeout.Dispose();
             if(requests!=null){requests.Dispose();requests=null;}

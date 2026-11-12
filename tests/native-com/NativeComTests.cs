@@ -155,6 +155,9 @@ internal static class NativeComTests {
             Check((string)adapter.Invoke("GetSingleData",24)=="70000"&&Number(source,"GetLastIndex")==24&&Number(source,"GetFirstArgType")==2,"manual snapshot price reads native field24 with a VT_I2 index");
             Check((string)adapter.Invoke("GetSingleData",1)=="","manual snapshot fixture does not invent the SC symbol echo");
             Check((bool)adapter.Invoke("SetQueryName","SC")&&(string)adapter.Invoke("GetQueryName")=="SC","SC quote polling remains admitted separately from manual snapshots");
+            foreach(var accountQuery in new[]{"SABA602Q1","SABA415Q1","SABA231Q1"})
+                Check((bool)adapter.Invoke("SetQueryName",accountQuery)&&(string)adapter.Invoke("GetQueryName")==accountQuery,
+                    "actual account cash, capacity and order snapshots pass only the explicit read-only adapter: "+accountQuery);
             Check((string)adapter.Invoke("GetMultiData",2,5)=="70000","typed multi data returns a VARIANT value");
             Check(Number(source,"GetFirstArgType")==2&&Number(source,"GetSecondArgType")==2&&Number(source,"GetLastRow")==2&&Number(source,"GetLastIndex")==5,"multi data preserves reversed COM arguments and both VT_I2 widths");
             object id=adapter.Invoke("RequestData");

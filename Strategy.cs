@@ -17,7 +17,7 @@ namespace ShinhanNativeTrader {
         public string Code, Name, Reason, SignalDate;
         public decimal Price, Score;
     }
-    public sealed class PaperPosition {
+    public sealed class PositionRiskState {
         public string Code, Name;
         public int Qty;
         public decimal Entry, High;
@@ -92,7 +92,7 @@ namespace ShinhanNativeTrader {
             settings.Validate();
             if(Code(code) == "" || source == null) return null;
             // The supplied last bar may be today's unfinished bar. Entry is a research signal;
-            // actual paper execution must obtain a separate fresh quote and size at that price.
+            // an actual order also requires a fresh quote and broker capacity verification.
             var b = source.Where(x => x != null && ValidBar(x)).OrderBy(x => x.Date, StringComparer.Ordinal)
                 .GroupBy(x => x.Date).Select(g => g.Last()).ToArray();
             var required = Math.Max(settings.SlowPeriod, settings.BreakoutPeriod) + 1;
@@ -114,8 +114,8 @@ namespace ShinhanNativeTrader {
             return DateTime.TryParseExact(b.Date, "yyyyMMdd", CultureInfo.InvariantCulture, DateTimeStyles.None, out date) &&
                 b.Open > 0 && b.Close > 0 && b.Volume > 0 && b.Low > 0 && b.High >= Math.Max(b.Open,b.Close) && b.Low <= Math.Min(b.Open,b.Close);
         }
-        public static string Exit(PaperPosition p, decimal price) { return Exit(p, price, new StrategySettings()); }
-        public static string Exit(PaperPosition p, decimal price, StrategySettings settings) {
+        public static string Exit(PositionRiskState p, decimal price) { return Exit(p, price, new StrategySettings()); }
+        public static string Exit(PositionRiskState p, decimal price, StrategySettings settings) {
             settings.Validate();
             if(p == null || p.Entry <= 0 || price <= 0) return "";
             if(price <= p.Entry * (1 - settings.StopLossPercent / 100)) return "손절 -" + settings.StopLossPercent + "%";
@@ -124,10 +124,10 @@ namespace ShinhanNativeTrader {
                 return "추적손절 -" + settings.TrailingDrawdownPercent + "%";
             return "";
         }
-        public static int PaperQty(decimal cash, decimal price, decimal fraction = 0.2m) {
-            return PaperQty(cash, price, fraction, 0.003m);
+        public static int OrderQuantity(decimal cash, decimal price, decimal fraction = 0.2m) {
+            return OrderQuantity(cash, price, fraction, 0.003m);
         }
-        public static int PaperQty(decimal cash, decimal price, decimal fraction, decimal feeRate) {
+        public static int OrderQuantity(decimal cash, decimal price, decimal fraction, decimal feeRate) {
             if(cash <= 0 || price <= 0 || fraction <= 0 || fraction > 1 || feeRate < 0 || feeRate > 0.1m) return 0;
             return (int)Math.Min(100000, Math.Floor(cash * fraction / (price * (1 + feeRate))));
         }

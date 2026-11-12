@@ -31,11 +31,6 @@ namespace ShinhanNativeTrader {
         public List<PaperFill> Fills = new List<PaperFill>();
         public List<PaperPosition> Positions = new List<PaperPosition>();
     }
-    public static class LiveOrderPolicy {
-        public static bool Enabled { get { return false; } }
-        public const string BlockReason = "실주문 차단: 공식 주문/체결/미체결/주문가능금액 인터페이스, Windows Indi 실서버 재연결·복구 검증 및 별도 사용자 승인이 완료되지 않았습니다.";
-        public static void EnsureAllowed() { throw new InvalidOperationException(BlockReason); }
-    }
     // This ledger is deliberately paper-only. Its cash/fills never represent broker money or execution.
     // Every mutation is validated and durably saved before becoming visible to the caller.
     public sealed class PaperTradingEngine : IDisposable {

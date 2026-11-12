@@ -73,6 +73,37 @@ namespace ShinhanNativeTrader {
             requests.Timeout();Check(fatal==0,"idle timeout has no effect");
             requests.Dispose();fake.Data(7);Check(received==1,"disposed coordinator unhooks receive handler");
 
+            fake=new FakeIndi();fake.Quote();requests=new IndiRequestCoordinator(fake);received=0;fatal=0;
+            requests.Done+=value=>received++;requests.Fatal+=reason=>fatal++;
+            Check(BeginQuote(requests)&&requests.Busy,"read-only request can be pending at unattended session close");
+            requests.CancelPending();requests.Timeout();fake.Data(7);
+            Check(!requests.Busy&&!requests.Failed&&received==0&&fatal==0,"local read-only cancellation rejects a late response without inventing broker cancellation");
+            fake.Id=8;Check(BeginQuote(requests)&&requests.Busy,"local cancellation permits a later deliberate read-only request");
+            fake.Data(7);Check(received==0&&requests.Busy,"old cancelled ID cannot complete the later request");
+            fake.Data(8);Check(received==1&&!requests.Failed,"fresh request completes after cancelled session work");requests.Dispose();
+
+            fake=new FakeIndi();fake.Fields["s:1"]="1000000";fake.Fields["s:20"]="800000";fake.Fields["s:30"]="500000";
+            fake.Diagnostic.Message="계좌12345678901 암호5678";requests=new IndiRequestCoordinator(fake);received=0;
+            string accountTrace="";requests.Trace+=value=>accountTrace+=value;requests.Done+=value=>{received++;reply=value;};
+            Check(requests.Begin("CASH","SABA602Q1",AccountQueries.CashInputs("12345678901","5678"),""),"cash account query uses its read-only contract");
+            fake.Data(7);Check(received==1&&reply.Cash.Cash100Orderable==500000,"cash100 amount is copied from official field30");
+            Check(!accountTrace.Contains("12345678901")&&!accountTrace.Contains("5678"),"cash diagnostics redact account and password in every stage");requests.Dispose();
+
+            fake=new FakeIndi();fake.Diagnostic.Message="계좌12345678901 암호5678";requests=new IndiRequestCoordinator(fake);received=0;accountTrace="";
+            requests.Trace+=value=>accountTrace+=value;requests.Done+=value=>{received++;reply=value;};
+            Check(requests.Begin("ORDERS","SABA231Q1",AccountQueries.OrdersInputs("12345678901","5678","20261112"),"20261112"),"order snapshot keeps account input at1 rather than treating date0 as credentials");
+            fake.Data(7);
+            Check(received==1&&reply.BrokerOrders.TradingDate=="20261112"&&!reply.BrokerOrders.IsComplete&&!reply.BrokerOrders.HasExecutionIds,"empty aggregate order response is displayed without claiming complete reconciliation");
+            fake.Quote();BeginQuote(requests);
+            Check(!accountTrace.Contains("12345678901")&&!accountTrace.Contains("5678"),"order-query credentials stay redacted in a subsequent public query");requests.Dispose();
+
+            fake=new FakeIndi{Rows=1};fake.Fields["m:0:0"]="100";fake.Fields["m:0:1"]="10";fake.Fields["m:0:2"]="12";
+            fake.Fields["m:0:4"]="700000";fake.Fields["m:0:5"]="840000";requests=new IndiRequestCoordinator(fake);received=0;
+            requests.Done+=value=>{received++;reply=value;};
+            Check(requests.Begin("CAPACITY","SABA415Q1",AccountQueries.CapacityInputs("12345678901","5678","005930",70000),"005930",70000m),"capacity request retains requested whole-won limit price as context");
+            fake.Data(7);
+            Check(received==1&&reply.Capacity.Code=="005930"&&reply.Capacity.LimitPrice==70000&&reply.Capacity.Ratio==100&&reply.Capacity.Quantity==10,"capacity callback binds cash100 row to the original requested symbol and price");requests.Dispose();
+
             // Replay the user's 1.4.0 log: Int16 request 3 is accepted while the
             // pre-response error state is 2 with no code/message; ReceiveData 3
             // follows on the next message-pump turn. It must reach the parser.
