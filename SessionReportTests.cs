@@ -53,17 +53,28 @@ namespace ShinhanNativeTrader {
             if(Environment.OSVersion.Platform==PlatformID.Win32NT) {
                 var unreadable=Path.Combine(directory,"windows-unreadable");
                 ReportFixture(unreadable,"account-report-20261113.csv",utc);
-                var original=Directory.GetAccessControl(unreadable);
+                var original=Directory.GetAccessControl(unreadable,System.Security.AccessControl.AccessControlSections.Access)
+                    .GetSecurityDescriptorBinaryForm();
                 var denied=new System.Security.AccessControl.DirectorySecurity();
-                denied.SetSecurityDescriptorBinaryForm(original.GetSecurityDescriptorBinaryForm());
+                denied.SetSecurityDescriptorBinaryForm(original,System.Security.AccessControl.AccessControlSections.Access);
                 using(var identity=System.Security.Principal.WindowsIdentity.GetCurrent()) {
                     denied.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(identity.User,
                         System.Security.AccessControl.FileSystemRights.ListDirectory,System.Security.AccessControl.AccessControlType.Deny));
                     try {
                         Directory.SetAccessControl(unreadable,denied);
                         Check(SessionReport.FindLatestReport(unreadable)==null,"an actual Windows directory-listing denial safely yields no previous report");
-                    }finally{Directory.SetAccessControl(unreadable,original);}
+                    }finally {
+                        // SetAccessControl persists only sections marked modified.
+                        // A fresh descriptor marks this saved DACL for restoration.
+                        var restored=new System.Security.AccessControl.DirectorySecurity();
+                        restored.SetSecurityDescriptorBinaryForm(original,System.Security.AccessControl.AccessControlSections.Access);
+                        Directory.SetAccessControl(unreadable,restored);
+                    }
                 }
+                Check(Directory.GetFiles(unreadable).Length==1&&SessionReport.FindLatestReport(unreadable)!=null,
+                    "original listing access is restored after the real permission denial");
+                Directory.Delete(unreadable,true);
+                Check(!Directory.Exists(unreadable),"the restored Windows ACL fixture can be fully removed");
             }
         }
         static void TestWriteFailures(string directory,DateTime day,DateTime utc) {
