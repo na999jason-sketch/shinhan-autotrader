@@ -28,7 +28,16 @@ static class ReportUiTests {
     }
     static void Reply(MainForm form,IndiReply reply) {Call(form,"Reply",reply);}
     static MainForm NewForm() {
-        var form=new MainForm();Get<Timer>(form,"scheduler").Stop();return form;
+        var form=new MainForm();Get<Timer>(form,"scheduler").Stop();
+        // An unshown WinForms form may dispose without raising FormClosing on
+        // Windows. Create its window so Close follows the production lifecycle
+        // and releases the application settings lease.
+        form.ShowInTaskbar=false;form.Show();Application.DoEvents();
+        Get<Timer>(form,"scheduler").Stop();return form;
+    }
+    static void CheckSettingsLeaseReleased(string data,string label) {
+        using(var lease=new FileStream(Path.Combine(data,"live-settings-v1.xml.lock"),FileMode.Open,FileAccess.ReadWrite,FileShare.None))
+            Check(lease.CanWrite,label);
     }
     static object BindSyntheticAccount(MainForm form) {
         var type=typeof(MainForm).Assembly.GetType("ShinhanNativeTrader.AccountCredentialSession",true);
@@ -144,6 +153,7 @@ static class ReportUiTests {
             Check(Get<Label>(form,"reportStatus").Text.Contains("저장 실패")&&!Get<bool>(form,"reportSaving"),"failed save leaves explicit error status and releases save guard");
             Check(!Directory.GetFiles(Path.GetDirectoryName(report),"*.tmp-*").Any(),"report failure cleans temporary files without retrying during stop");
             form.Close();
+            CheckSettingsLeaseReleased(data,"closing the report form releases its exclusive settings lease");
         }
         string[] beforeRestart=Reports(data);
         using(var restarted=NewForm()) {
@@ -154,6 +164,7 @@ static class ReportUiTests {
             Check(Get<DataGridView>(restarted,"holdingsGrid").Rows.Count==0&&Get<IndiApi>(restarted,"api")==null,"restart does not treat report contents as current broker positions");
             Check(Get<Label>(restarted,"reportStatus").Text.Contains("이전 보고서"),"restart distinguishes previous file from a current account snapshot");
             restarted.Close();
+            CheckSettingsLeaseReleased(data,"closing the restarted form releases its exclusive settings lease");
         }
     }
 
@@ -179,7 +190,7 @@ static class ReportUiTests {
             if(!windows)Results.AppendLine("Windows exclusive-open locking is not verified by the Linux storage-error smoke test.");
         }catch(Exception error){exit=1;Results.AppendLine("FAIL "+error);}
         finally {
-            if(ownsData&&Directory.Exists(data))try{Directory.Delete(data,true);}catch(Exception error){exit=1;Results.AppendLine("FAIL test profile cleanup: "+error.GetType().Name);}
+            if(ownsData&&Directory.Exists(data))try{Directory.Delete(data,true);}catch(Exception error){exit=1;Results.AppendLine("FAIL test profile cleanup: "+error);}
             Console.Write(Results.ToString());
             if(resultPath!=null)try{Directory.CreateDirectory(Path.GetDirectoryName(resultPath));File.WriteAllText(resultPath,Results.ToString(),Encoding.UTF8);}
                 catch(Exception error){Console.Error.WriteLine(error);exit=1;}
