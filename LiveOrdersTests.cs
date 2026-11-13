@@ -54,6 +54,12 @@ namespace ShinhanNativeTrader {
                     Quantity=order.Quantity,LimitPrice=order.LimitPrice,FilledQuantity=order.Quantity,OpenQuantity=0,ConfirmedQuantity=0,
                     AutoCancelledQuantity=0,AverageFillPrice=order.TradeKind==LiveOrderKind.Buy?9900:10100}};
         }
+        static BrokerTerminalFillEvidence ModernTerminalEvidence(LiveOrderJournal journal,LiveOrderRecord order) {
+            var evidence=TerminalEvidence(journal,order);var row=evidence.Row;
+            row.QueryProfile=BrokerOrderQueryProfile.ModernOrderState54;row.QuerySchemaSha256=new string('a',64);
+            row.ConfirmationCode="1";row.StatusName="접수";row.OrderMethodCode="1";row.SorOrderNumber="0";row.SorOriginalOrderNumber="0";
+            return evidence;
+        }
         static DateTime LegacyUtc(int seconds=0){return Utc(seconds).AddDays(1);}
         static LiveOrderRecord LegacyRejected(LiveOrderJournal journal,string code="069500",LiveOrderKind kind=LiveOrderKind.Sell,
             string key=null,DateTime? time=null,string responseNumber="0",bool detailed=false) {
@@ -181,7 +187,7 @@ namespace ShinhanNativeTrader {
                     value=>value.RequestScopeVerified=false,value=>value.MatchingOrderCount=0,value=>value.MatchingOrderCount=2,
                     value=>value.QueryName="TR_5200",value=>value.AccountFingerprint="wrong-account",value=>value.TradingDate="20261111",
                     value=>value.Row.OrderNumber="888888",value=>value.Row.Code="000660",value=>value.Row.SideCode="1",
-                    value=>value.Row.ProductCode="02",value=>value.Row.CreditCode="01",value=>value.Row.ConfirmationCode="1",
+                    value=>value.Row.ProductCode="02",value=>value.Row.CreditCode="01",value=>value.Row.ConfirmationCode="2",
                     value=>value.Row.Quantity=11,value=>value.Row.LimitPrice=10001,value=>value.Row.FilledQuantity=9,
                     value=>value.Row.OpenQuantity=1,value=>value.Row.ConfirmedQuantity=1,value=>value.Row.AutoCancelledQuantity=1,
                     value=>value.Row.AverageFillPrice=0,value=>value.Row.AverageFillPrice=10001,value=>value.Row.OriginalOrderNumber="123",
@@ -191,9 +197,10 @@ namespace ShinhanNativeTrader {
                     "wrong stock","wrong direction","wrong product","credit trade","broker rejection","wrong quantity","wrong limit",
                     "partial fill","open remainder","confirmation quantity","automatic cancellation","missing average","limit-violating average",
                     "original order link","pre-Unknown request","request after receive","future receive"};
-                foreach(var confirmation in new[]{"0",""})for(int index=0;index<mutations.Length;index++) {
-                    var evidence=TerminalEvidence(journal,order);evidence.Row.ConfirmationCode=confirmation;mutations[index](evidence);
-                    Reject(()=>journal.ReconcileKnownTerminalFill(id,evidence,Utc(5)),"terminal checkpoint rejects "+labels[index]+" even with "+(confirmation==""?"unavailable":"normal")+" confirmation");
+                foreach(var confirmation in new[]{"0","","ModernReceived"})for(int index=0;index<mutations.Length;index++) {
+                    var evidence=confirmation=="ModernReceived"?ModernTerminalEvidence(journal,order):TerminalEvidence(journal,order);
+                    if(confirmation!="ModernReceived")evidence.Row.ConfirmationCode=confirmation;mutations[index](evidence);
+                    Reject(()=>journal.ReconcileKnownTerminalFill(id,evidence,Utc(5)),"terminal checkpoint rejects "+labels[index]+" even with "+(confirmation==""?"unavailable":confirmation)+" confirmation");
                 }
                 Reject(()=>journal.ReconcileKnownTerminalFill(id,TerminalEvidence(journal,order),Utc(10)),"stale terminal broker snapshot cannot recover an unknown order");
                 Check(journal.RecoveryRequired&&journal.Snapshot.Executions.Count==0&&journal.Snapshot.Orders.Single().FillCheckpoint==null,
@@ -228,6 +235,8 @@ namespace ShinhanNativeTrader {
                     "pre-provenance journals with explicit normal confirmation retain their original validated checkpoint");
             document.SelectSingleNode("/LiveOrderJournalState/Orders/LiveOrderRecord/FillCheckpoint/AccountFingerprint").InnerText="tampered-account";
             document.Save(path);Reject(()=>new LiveOrderJournal(path),"tampered persisted terminal-checkpoint identity fails closed on restart");
+
+            ModernTerminalRecoveryTests(directory);
 
             foreach(var kind in new[]{LiveOrderKind.Buy,LiveOrderKind.Sell}) {
                 string blankPath=Path.Combine(directory,"terminal-unavailable-confirmation-"+kind+".xml");
@@ -330,6 +339,49 @@ namespace ShinhanNativeTrader {
                 journal.MarkUnknown(order.Id,Utc(2));journal.MarkBrokerEvidenceUnknown(other.Id,Utc(5));
                 var evidence=TerminalEvidence(journal,order);evidence.ReceivedUtc=Utc(6);
                 Reject(()=>journal.ReconcileKnownTerminalFill(order.Id,evidence,Utc(6)),"a request preceding another broker change cannot provide a fresh terminal checkpoint");
+            }
+        }
+        static void ModernTerminalRecoveryTests(string directory) {
+            foreach(var kind in new[]{LiveOrderKind.Buy,LiveOrderKind.Sell}) {
+                string path=Path.Combine(directory,"terminal-modern-received-"+kind+".xml");
+                using(var journal=new LiveOrderJournal(path)) {
+                    journal.BindAccount("12345678901");var intent=Buy("modern-received-"+kind);intent.Kind=kind;
+                    var order=AcceptedWithEvidence(journal,intent,"000812398",Utc());journal.MarkUnknown(order.Id,Utc(2));
+                    foreach(var mutation in new Action<BrokerOrderRow>[] {
+                        row=>row.QueryProfile=BrokerOrderQueryProfile.Unverified,row=>row.QuerySchemaSha256=null,
+                        row=>row.QuerySchemaSha256=new string('g',64),row=>row.StatusName="확인",row=>row.StatusName="거부",
+                        row=>row.ConfirmationCode="2",row=>row.ConfirmationCode="3",row=>row.ConfirmationCode="00",
+                        row=>row.RejectCode="R001",row=>row.RejectName="거부 사유",row=>row.OrderMethodCode="0",row=>row.OrderMethodCode="2",
+                        row=>row.OrderMethodCode="9",row=>row.SorOrderNumber="812398",row=>row.SorOriginalOrderNumber="812397"
+                    }) {
+                        var conflict=ModernTerminalEvidence(journal,order);mutation(conflict.Row);
+                        Reject(()=>journal.ReconcileKnownTerminalFill(order.Id,conflict,Utc(5)),kind+" modern receipt corroboration retains schema, status, rejection and KRX-only constraints");
+                    }
+                    var evidence=ModernTerminalEvidence(journal,order);
+                    Check(journal.ReconcileKnownTerminalFill(order.Id,evidence,Utc(5)),kind+" verified current receipt status and exact accepted full fill recover independently of legacy confirmation enum");
+                    var recovered=journal.Snapshot.Orders.Single();var point=recovered.FillCheckpoint;
+                    Check(point.ConfirmationBasis==BrokerFillConfirmationBasis.ModernAcceptedStateWithFullFill&&point.ConfirmationCode=="1"
+                        &&point.StatusName=="접수"&&point.QueryProfile==BrokerOrderQueryProfile.ModernOrderState54
+                        &&point.QuerySchemaSha256==new string('a',64)&&point.QuerySerializationVersion==0x0208
+                        &&point.RejectCodeShape=="Blank"&&point.RejectNameShape=="Blank"&&point.OrderMethodCode=="1"
+                        &&point.SorOrderNumber=="0"&&point.SorOriginalOrderNumber=="0"&&journal.Snapshot.Executions.Count==0&&!journal.RecoveryRequired,
+                        kind+" checkpoint persists source profile and hash plus received-state and venue provenance while retaining raw 1 without fabricated execution IDs");
+                    Reject(()=>journal.Prepare(intent,Utc(6)),kind+" modern received-state terminal checkpoint cannot replay the original strategy intent");
+                }
+                using(var restarted=new LiveOrderJournal(path))
+                    Check(!restarted.RecoveryRequired&&LiveOrderJournal.HasTerminalFillCheckpoint(restarted.Snapshot.Orders.Single(),restarted.Snapshot.AccountFingerprint),
+                        kind+" modern receipt/full-fill provenance remains valid after restart");
+                string original=File.ReadAllText(path);
+                var tampering=new Dictionary<string,string>{{"ConfirmationBasis","NormalCode"},{"ConfirmationCode","2"},
+                    {"QueryProfile","Unverified"},{"QuerySchemaSha256",new string('g',64)},{"QuerySerializationVersion","519"},
+                    {"StatusName","확인"},{"RejectCodeShape","Present"},{"RejectNameShape","Present"},
+                    {"OrderMethodCode","0"},{"SorOrderNumber","812398"},{"SorOriginalOrderNumber","812397"}};
+                foreach(var mutation in tampering) {
+                    var xml=new XmlDocument();xml.LoadXml(original);
+                    xml.SelectSingleNode("/LiveOrderJournalState/Orders/LiveOrderRecord/FillCheckpoint/"+mutation.Key).InnerText=mutation.Value;xml.Save(path);
+                    Reject(()=>new LiveOrderJournal(path),kind+" incompatible persisted modern checkpoint "+mutation.Key+" fails closed on repeated load");
+                }
+                File.WriteAllText(path,original);
             }
         }
         public static int Run() {

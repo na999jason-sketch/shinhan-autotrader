@@ -161,6 +161,16 @@ namespace ShinhanNativeTrader {
                     Check(conflictText.Contains("\"Present\",\"Present\",\""+(status=="의뢰"||status=="접수"||status=="확인"||status=="거부"?status:"Other")+"\",\"Reject\""),
                         "only documented broker statuses are retained while rejection-field presence remains diagnosable");
                 }
+                conflictRow.QueryProfile=BrokerOrderQueryProfile.ModernOrderState54;conflictRow.QuerySchemaSha256=new string('a',64);
+                conflictRow.StatusName="접수";conflictRow.RejectCode="";conflictRow.RejectName="";
+                SessionReport.Write(directory,day.AddDays(3),utc,null,null,null,conflictOrders,null,"실주문 미시작");
+                conflictText=File.ReadAllText(conflictPath);
+                Check(conflictText.Contains("\"1\",\"Blank\",\"Blank\",\"접수\",\"StatusCorroborated\",\"설치 정의·접수 상태 대조 / 전량체결 근거 별도\"")
+                    &&conflictText.Contains("\"ModernOrderState54\",\""+new string('a',64)+"\""),
+                    "verified modern receipt corroboration exports raw 1 and source profile without renaming it normal");
+                Check(conflictRow.ConfirmationCode=="1"&&conflictRow.ConfirmationKind==BrokerConfirmationKind.StatusCorroborated
+                    &&!conflictText.Contains("\"정상코드\""),
+                    "corroborated status reporting preserves raw metadata and does not authorize or fabricate journal fills");
 
                 positions[0].Price=60000;
                 var second=SessionReport.Write(directory,day,utc.AddMinutes(1),positions,utc,cash,orders,journal,LiveOrderSafety.BlockReason);

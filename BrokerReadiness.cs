@@ -113,7 +113,8 @@ namespace ShinhanNativeTrader {
                     ||(row.SideCode!="1"&&row.SideCode!="2")||!Whole(row.Quantity)||!Whole(row.FilledQuantity)||!Whole(row.OpenQuantity)||row.FilledQuantity+row.OpenQuantity>row.Quantity)
                     throw new ArgumentException("Malformed aggregate broker order evidence.");
                 copy.Orders.Add(new BrokerOrderRow{OrderNumber=row.OrderNumber,OriginalOrderNumber=row.OriginalOrderNumber,Code=row.Code,SideCode=row.SideCode,AmendCancelCode=row.AmendCancelCode,
-                    ProductCode=row.ProductCode,CreditCode=row.CreditCode,Quantity=row.Quantity,FilledQuantity=row.FilledQuantity,OpenQuantity=row.OpenQuantity,LimitPrice=row.LimitPrice,
+                    ProductCode=row.ProductCode,CreditCode=row.CreditCode,QueryProfile=row.QueryProfile,Quantity=row.Quantity,FilledQuantity=row.FilledQuantity,OpenQuantity=row.OpenQuantity,LimitPrice=row.LimitPrice,
+                    QuerySchemaSha256=row.QuerySchemaSha256,OrderMethodCode=row.OrderMethodCode,SorOrderNumber=row.SorOrderNumber,SorOriginalOrderNumber=row.SorOriginalOrderNumber,
                     AverageFillPrice=row.AverageFillPrice,ConfirmationCode=row.ConfirmationCode,RejectCode=row.RejectCode,RejectName=row.RejectName,StatusName=row.StatusName,
                     ConfirmedQuantity=row.ConfirmedQuantity,AutoCancelledQuantity=row.AutoCancelledQuantity});
             }
@@ -203,6 +204,10 @@ namespace ShinhanNativeTrader {
             if(!LiveOrderJournal.HasTerminalFillCheckpoint(order,journal.AccountFingerprint)||row==null||!snapshot.RequestScopeVerified
                 ||!snapshot.MatchesRequestAccountKey(currentAccountKey))return false;
             var point=order.FillCheckpoint;
+            if(point.ConfirmationBasis==BrokerFillConfirmationBasis.ModernAcceptedStateWithFullFill
+                &&(!row.HasRecognizedModernSchema
+                    ||row.ConfirmationKind!=BrokerConfirmationKind.StatusCorroborated&&row.ConfirmationKind!=BrokerConfirmationKind.Normal
+                    ||!string.Equals(row.QuerySchemaSha256,point.QuerySchemaSha256,StringComparison.OrdinalIgnoreCase)))return false;
             if(!row.TerminalConfirmationCompatible||row.ConfirmedQuantity!=0||row.AutoCancelledQuantity!=0
                 ||row.AverageFillPrice!=point.AverageFillPrice||row.FilledQuantity!=point.FilledQuantity||row.OpenQuantity!=0)return false;
             var executions=journal.Executions.Where(value=>value.OrderId==order.Id).ToArray();

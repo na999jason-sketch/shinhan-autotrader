@@ -16,7 +16,7 @@ namespace ShinhanNativeTrader {
         public AccountUserActionException(string message):base(message){}
     }
     internal static class Program {
-        internal const string Version="2.2.10";
+        internal const string Version="2.2.11";
         [STAThread]
         static int Main(string[] args) {
             if(args.Contains("--selftest")) {
@@ -1108,12 +1108,13 @@ namespace ShinhanNativeTrader {
                 order.Status==LiveOrderStatus.Rejected?"이전 버전: 상세 응답 미기록":
                 order.Status==LiveOrderStatus.NotSent?"전송 전 조건·주문 정의 확인 중 중단. 진단 로그의 주문 정의 사유를 확인하십시오.":"상세 응답 미기록";
             if(order.FillCheckpoint!=null&&order.Status==LiveOrderStatus.Filled)
-                return "증권사 전량체결 조회 대사 완료: "+order.FillCheckpoint.FilledQuantity.ToString(CultureInfo.InvariantCulture)
+                return "증권사 전량체결 조회 대사 완료"+(order.FillCheckpoint.ConfirmationBasis==BrokerFillConfirmationBasis.ModernAcceptedStateWithFullFill?" (설치 정의·접수 상태 대조)":"")+": "+order.FillCheckpoint.FilledQuantity.ToString(CultureInfo.InvariantCulture)
                     +"주 / 평균 "+order.FillCheckpoint.AverageFillPrice.ToString(CultureInfo.InvariantCulture)+"원. 개별 체결번호와 별도 보존. "+reason;
             return AcceptedAwaitingReconciliation(order)?"접수 응답과 주문번호 확인. 체결·미체결은 증권사 대사 필요. "+reason:reason;
         }
         static string ConfirmationDescription(BrokerOrderRow row) {
             // Never include arbitrary provider values or names in diagnostics.
+            if(row.ConfirmationKind==BrokerConfirmationKind.StatusCorroborated)return "확인구분 1 보존 / 설치 정의·접수 상태 대조 / 거부코드·거부명 없음";
             string code=row.ConfirmationCode=="0"?"0 (정상 명세)":row.ConfirmationCode=="1"?"1 (거부 명세)":
                 row.ConfirmationCode=="2"?"2 (접속실패 명세)":row.ConfirmationCode=="3"?"3 (거래소거부 명세)":row.ConfirmationShape;
             return "확인구분 "+code+" / 거부 정보 "+(row.HasRejectionConflict?"충돌":"없음");

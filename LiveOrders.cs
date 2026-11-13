@@ -193,10 +193,14 @@ namespace ShinhanNativeTrader {
     }
     // A terminal broker aggregate is a separate evidence source. It does not
     // create an individual execution ID or add its total to existing AA fills.
-    public enum BrokerFillConfirmationBasis { NormalCode, IndependentFullFillWithoutConfirmation }
+    public enum BrokerFillConfirmationBasis { NormalCode, IndependentFullFillWithoutConfirmation, ModernAcceptedStateWithFullFill }
     public sealed class BrokerFillCheckpoint {
         public string AccountFingerprint,TradingDate,BrokerOrderNumber,Code,QueryName;
         public string ProductCode,CreditCode,SideCode,ConfirmationCode;
+        public string StatusName,RejectCodeShape,RejectNameShape;
+        public string QuerySchemaSha256,OrderMethodCode,SorOrderNumber,SorOriginalOrderNumber;
+        public int QuerySerializationVersion;
+        public BrokerOrderQueryProfile QueryProfile;
         public BrokerFillConfirmationBasis ConfirmationBasis;
         public LiveOrderKind TradeKind;
         public int OrderQuantity,FilledQuantity;
@@ -551,12 +555,17 @@ namespace ShinhanNativeTrader {
                         &&(LiveOrderProtocol.BrokerNumbersEqual(value.BrokerOrderNumber,order.BrokerOrderNumber)
                             ||!AbsentBrokerNumber(value.OriginalBrokerOrderNumber)&&LiveOrderProtocol.BrokerNumbersEqual(value.OriginalBrokerOrderNumber,order.BrokerOrderNumber)
                                 &&value.Status!=LiveOrderStatus.Rejected&&value.Status!=LiveOrderStatus.NotSent)))
-                    throw new InvalidOperationException("접수된 원주문과 정상 전량체결 조회의 계좌·거래일·식별자·수량·가격이 일치하지 않습니다.");
+                    throw new InvalidOperationException("접수된 원주문과 전량체결 조회의 계좌·거래일·식별자·수량·가격·확인 근거가 일치하지 않습니다.");
                 var checkpoint=new BrokerFillCheckpoint{AccountFingerprint=copy.AccountFingerprint,TradingDate=order.TradingDate,
                     BrokerOrderNumber=order.BrokerOrderNumber,Code=order.Code,QueryName=evidence.QueryName,
                     ProductCode=row.ProductCode,CreditCode=row.CreditCode,SideCode=row.SideCode,ConfirmationCode=row.ConfirmationCode,
                     ConfirmationBasis=row.ConfirmationKind==BrokerConfirmationKind.Normal?BrokerFillConfirmationBasis.NormalCode:
-                        BrokerFillConfirmationBasis.IndependentFullFillWithoutConfirmation,
+                        row.ConfirmationKind==BrokerConfirmationKind.StatusCorroborated?BrokerFillConfirmationBasis.ModernAcceptedStateWithFullFill:
+                            BrokerFillConfirmationBasis.IndependentFullFillWithoutConfirmation,
+                    QueryProfile=row.QueryProfile,QuerySchemaSha256=row.QuerySchemaSha256,QuerySerializationVersion=row.QuerySerializationVersion,
+                    OrderMethodCode=row.OrderMethodCode,SorOrderNumber=row.SorOrderNumber,SorOriginalOrderNumber=row.SorOriginalOrderNumber,
+                    StatusName=row.ConfirmationKind==BrokerConfirmationKind.StatusCorroborated?row.StatusName:null,
+                    RejectCodeShape=row.RejectCodeShape,RejectNameShape=row.RejectNameShape,
                     TradeKind=order.TradeKind,OrderQuantity=order.Quantity,FilledQuantity=order.Quantity,
                     LimitPrice=order.LimitPrice,AverageFillPrice=row.AverageFillPrice,RequestStartedUtc=evidence.RequestStartedUtc,
                     ReceivedUtc=evidence.ReceivedUtc,ObservedUtc=utc,PreviousOrderUpdatedUtc=order.UpdatedUtc,PreviousBrokerChangeUtc=copy.LastBrokerChangeUtc};
@@ -590,7 +599,13 @@ namespace ShinhanNativeTrader {
                 &&(order.TradeKind==LiveOrderKind.Buy?point.AverageFillPrice<=order.LimitPrice:point.AverageFillPrice>=order.LimitPrice)
                 &&point.ProductCode=="01"&&point.CreditCode=="00"&&point.SideCode==(order.TradeKind==LiveOrderKind.Buy?"2":"1")
                 &&(point.ConfirmationBasis==BrokerFillConfirmationBasis.NormalCode&&point.ConfirmationCode=="0"
-                    ||point.ConfirmationBasis==BrokerFillConfirmationBasis.IndependentFullFillWithoutConfirmation&&string.IsNullOrWhiteSpace(point.ConfirmationCode))
+                    ||point.ConfirmationBasis==BrokerFillConfirmationBasis.IndependentFullFillWithoutConfirmation&&string.IsNullOrWhiteSpace(point.ConfirmationCode)
+                    ||point.ConfirmationBasis==BrokerFillConfirmationBasis.ModernAcceptedStateWithFullFill
+                        &&point.QueryProfile==BrokerOrderQueryProfile.ModernOrderState54&&point.ConfirmationCode=="1"&&point.StatusName=="접수"
+                        &&point.QuerySerializationVersion==0x0208&&BrokerOrderRow.SchemaHashValid(point.QuerySchemaSha256)
+                        &&(string.IsNullOrWhiteSpace(point.OrderMethodCode)||point.OrderMethodCode=="1")
+                        &&AbsentBrokerNumber(point.SorOrderNumber)&&AbsentBrokerNumber(point.SorOriginalOrderNumber)
+                        &&(point.RejectCodeShape=="Blank"||point.RejectCodeShape=="Zero")&&(point.RejectNameShape=="Blank"||point.RejectNameShape=="Zero"))
                 &&point.RequestStartedUtc.Kind==DateTimeKind.Utc&&point.ReceivedUtc.Kind==DateTimeKind.Utc&&point.ObservedUtc.Kind==DateTimeKind.Utc
                 &&point.PreviousOrderUpdatedUtc.Kind==DateTimeKind.Utc&&point.PreviousBrokerChangeUtc.Kind==DateTimeKind.Utc
                 &&point.PreviousOrderUpdatedUtc>=order.CreatedUtc&&point.RequestStartedUtc>point.PreviousOrderUpdatedUtc

@@ -76,6 +76,7 @@ namespace ShinhanNativeTrader {
         static string FillConfirmationComparison(BrokerOrderRow order) {
             bool full=order.Quantity>0&&order.FilledQuantity==order.Quantity&&order.OpenQuantity==0;
             if(full&&!order.TerminalConfirmationCompatible)return "전량체결 수량·확인명세 충돌";
+            if(order.ConfirmationKind==BrokerConfirmationKind.StatusCorroborated)return "설치 정의·접수 상태 대조 / 전량체결 근거 별도";
             return order.HasRejectionConflict?"거부명세 확인 필요":order.ConfirmationKind==BrokerConfirmationKind.Unavailable?"확인구분 공란":
                 order.ConfirmationKind==BrokerConfirmationKind.Unknown?"확인구분 미검증":"정상코드";
         }
@@ -229,14 +230,17 @@ namespace ShinhanNativeTrader {
             Row(report,"응답 범위",orders!=null&&orders.IsComplete?"완료 확인":"완료 여부 미검증");
             Row(report,"개별 체결번호",orders!=null&&orders.HasExecutionIds?"제공":"미제공 또는 미검증");
             Row(report,"주문번호","원주문번호","코드","매매구분","주문수량","주문가격","누적체결수량","평균체결가격","미체결수량","확인수량","확인구분",
-                "거부코드 형태","거부코드명 형태","상태명 분류","확인구분 분류","체결·확인 대조");
+                "거부코드 형태","거부코드명 형태","상태명 분류","확인구분 분류","체결·확인 대조",
+                "조회 정의 프로필","조회 정의 SHA256","주문방식코드","SOR 주문번호 형태","SOR 원주문번호 형태");
             if(orders!=null)foreach(var order in orders.Orders) {
                 if(order==null)throw new InvalidOperationException("A broker order report row is missing.");
                 Row(report,BrokerNumber(order.OrderNumber),BrokerNumber(order.OriginalOrderNumber),Symbol(order.Code),
                     Side(order.SideCode),order.Quantity,order.LimitPrice,order.FilledQuantity,
                     order.AverageFillPrice,order.OpenQuantity,order.ConfirmedQuantity,Flag(order.ConfirmationCode),
                     RejectionMetadataShape(order.RejectCode),RejectionMetadataShape(order.RejectName),BrokerStatusClass(order.StatusName),
-                    order.ConfirmationShape,FillConfirmationComparison(order));
+                    order.ConfirmationShape,FillConfirmationComparison(order),
+                    order.HasRecognizedModernSchema?"ModernOrderState54":"Unverified",order.HasRecognizedModernSchema?order.QuerySchemaSha256:Unknown,
+                    Flag(order.OrderMethodCode),RejectionMetadataShape(order.SorOrderNumber),RejectionMetadataShape(order.SorOriginalOrderNumber));
             }
             Row(report);
             Row(report,"프로그램 실주문 기록(접수·체결 구분)");

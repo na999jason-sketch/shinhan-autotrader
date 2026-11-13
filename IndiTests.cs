@@ -63,6 +63,15 @@ namespace ShinhanNativeTrader {
                 Fields["m:0:3"]="보통";Fields["m:0:4"]="2";Fields["m:0:10"]="2";Fields["m:0:11"]="0";
                 Fields["m:0:12"]="70000";Fields["m:0:13"]="-71000";Fields["m:0:22"]="0";
             }
+            public void FilledModernOrder() {
+                Rows=1;
+                Fields["m:0:0"]="000345678";Fields["m:0:1"]="0";Fields["m:0:4"]="1";Fields["m:0:6"]="0";
+                Fields["m:0:13"]="A005930";Fields["m:0:14"]="SYNTHETIC";Fields["m:0:15"]="2";
+                Fields["m:0:16"]="70000";Fields["m:0:17"]="01";Fields["m:0:18"]="091500";
+                Fields["m:0:21"]="1";Fields["m:0:22"]="091501";Fields["m:0:24"]="2";
+                Fields["m:0:25"]="70000";Fields["m:0:26"]="0";Fields["m:0:28"]="2";
+                Fields["m:0:29"]="00";Fields["m:0:31"]="접수";Fields["m:0:35"]="0";
+            }
         }
         static int checks;
         static void Check(bool condition,string name){checks++;if(!condition)throw new Exception("Indi test failed: "+name);}
@@ -309,12 +318,112 @@ namespace ShinhanNativeTrader {
             Check(reply!=null&&reply.BrokerOrders.RequestScopeVerified&&fake.RequestCount==2&&fake.FieldSetCount==18&&fake.Inputs[0]==day,
                 "bounded order-read retry rebinds all nine private inputs and verifies its own successful matching callback");requests.Dispose();
         }
+        static void ModernOrdersSchemaProof() {
+            const string number="12345678901",secret="5678",day="20261112";
+            var schema=IndiAccountOrderSchema.Inspect(IndiAccountOrderSchemaTests.ModernDefinition());
+            var unsupported=IndiAccountOrderSchema.Inspect(new byte[]{0});
+            Check(schema.Recognized&&!unsupported.Recognized,"coordinator schema cases use recognized synthetic 54-field and unrecognized definitions");
+            var fake=new FakeIndi();fake.FilledModernOrder();int resolved=0;bool beforeNative=false;
+            var requests=new IndiRequestCoordinator(fake,()=>{resolved++;return schema;});IndiReply reply=null;
+            requests.Done+=value=>reply=value;fake.DuringRequest=()=>beforeNative=resolved==1;
+            requests.Begin("ORDERS","SABA231Q1",AccountQueries.OrdersInputs(number,secret,day),day);
+            fake.Data(99);Check(reply==null&&requests.Busy,"wrong accepted-callback ID cannot publish installed-schema order proof");
+            fake.Data(7);
+            Check(reply!=null&&reply.BrokerOrders.RequestScopeVerified&&beforeNative&&resolved==1
+                &&reply.BrokerOrders.MatchesRequestAccount(number),"installed order schema is resolved before RequestData and bound to the exact normal accepted request");
+            var row=reply.BrokerOrders.Orders[0];
+            Check(row.QueryProfile==BrokerOrderQueryProfile.ModernOrderState54&&row.QuerySchemaSha256==schema.Sha256
+                &&row.HasRecognizedModernSchema&&row.ConfirmationCode=="1"&&row.StatusName=="접수"
+                &&row.ConfirmationKind==BrokerConfirmationKind.StatusCorroborated&&!row.HasRejection
+                &&row.FilledQuantity==2&&row.OpenQuantity==0,
+                "recognized definition digest and separate receipt status corroborate raw code1 without rewriting it or inventing a fill");requests.Dispose();
+
+            foreach(var unavailable in new[]{"default","null","throws","unrecognized"}) {
+                fake=new FakeIndi();fake.FilledModernOrder();
+                Func<IndiAccountOrderSchemaInfo> resolver=unavailable=="default"?null:
+                    new Func<IndiAccountOrderSchemaInfo>(()=>{if(unavailable=="throws")throw new InvalidOperationException("account-123-password-SECRET");return unavailable=="null"?null:unsupported;});
+                requests=unavailable=="default"?new IndiRequestCoordinator(fake):new IndiRequestCoordinator(fake,resolver);
+                reply=null;string trace="";requests.Done+=value=>reply=value;requests.Trace+=value=>trace+=value;
+                requests.Begin("ORDERS","SABA231Q1",AccountQueries.OrdersInputs(number,secret,day),day);fake.Data(7);
+                row=reply==null?null:reply.BrokerOrders.Orders[0];
+                Check(row!=null&&reply.BrokerOrders.RequestScopeVerified&&row.QueryProfile==BrokerOrderQueryProfile.Unverified
+                    &&string.IsNullOrEmpty(row.QuerySchemaSha256)&&!row.HasRecognizedModernSchema
+                    &&row.ConfirmationKind!=BrokerConfirmationKind.StatusCorroborated,
+                    "missing or unusable installed schema keeps readable rows unverified despite a normal account scope: "+unavailable);
+                Check(!trace.Contains("account-123-password-SECRET"),"schema resolution failure never echoes exception text: "+unavailable);requests.Dispose();
+            }
+            foreach(var scope in new[]{"missing-input","restricted-input","date-mismatch","wrong-query","null-query-setter","null-field-setter","numeric-field-setter"}) {
+                fake=new FakeIndi();fake.FilledModernOrder();resolved=0;
+                if(scope.EndsWith("setter",StringComparison.Ordinal)) {
+                    fake.OverrideSetterReturns=true;fake.QuerySetterReturn=scope=="null-query-setter"?null:(object)true;
+                    fake.FieldSetterReturn=scope=="null-field-setter"?null:scope=="numeric-field-setter"?(object)1:true;
+                }
+                requests=new IndiRequestCoordinator(fake,()=>{resolved++;return schema;});reply=null;requests.Done+=value=>reply=value;
+                var inputs=AccountQueries.OrdersInputs(number,secret,day);
+                if(scope=="missing-input")inputs.Remove(8);if(scope=="restricted-input")inputs[5]="1";
+                requests.Begin("ORDERS",scope=="wrong-query"?"SABA200QB":"SABA231Q1",inputs,scope=="date-mismatch"?"20261111":day);fake.Data(7);
+                row=reply==null?null:reply.BrokerOrders.Orders[0];
+                Check(row!=null&&!reply.BrokerOrders.RequestScopeVerified&&row.QueryProfile==BrokerOrderQueryProfile.Unverified
+                    &&string.IsNullOrEmpty(row.QuerySchemaSha256)&&!row.HasRecognizedModernSchema&&resolved==0,
+                    "an installed schema cannot bypass incomplete request/setter proof: "+scope);requests.Dispose();
+            }
+            foreach(var diagnostic in new[]{"missing","throws","error"}) {
+                fake=new FakeIndi();fake.FilledModernOrder();
+                if(diagnostic=="missing")fake.Diagnostic.ErrorState=null;
+                if(diagnostic=="throws")fake.DiagnosticThrows=true;
+                if(diagnostic=="error")fake.Diagnostic.ErrorState=2;
+                requests=new IndiRequestCoordinator(fake,()=>schema);reply=null;requests.Done+=value=>reply=value;
+                requests.Begin("ORDERS","SABA231Q1",AccountQueries.OrdersInputs(number,secret,day),day);fake.DeliverWithoutSettingStatus(7);
+                if(diagnostic=="error")Check(reply==null&&requests.Failed,"provider-error callback never becomes modern order profile evidence");
+                else {
+                    row=reply==null?null:reply.BrokerOrders.Orders[0];
+                    Check(row!=null&&!reply.BrokerOrders.RequestScopeVerified&&row.QueryProfile==BrokerOrderQueryProfile.Unverified
+                        &&string.IsNullOrEmpty(row.QuerySchemaSha256),"unknown callback diagnostics cannot certify modern order profile: "+diagnostic);
+                }
+                requests.Dispose();
+            }
+            fake=new FakeIndi();fake.FilledModernOrder();resolved=0;
+            requests=new IndiRequestCoordinator(fake,()=>{resolved++;fake.Data(7);return schema;});reply=null;requests.Done+=value=>reply=value;
+            fake.DuringSetField=()=>fake.Data(7);
+            requests.Begin("ORDERS","SABA231Q1",AccountQueries.OrdersInputs(number,secret,day),day);
+            Check(reply==null&&requests.Busy&&resolved==1,"setter- and schema-resolver-pumped callbacks are ignored before actual RequestData entry");
+            fake.Data(7);
+            Check(reply!=null&&reply.BrokerOrders.RequestScopeVerified
+                &&reply.BrokerOrders.Orders[0].QuerySchemaSha256==schema.Sha256,"a later matching callback can use only the actual accepted request's schema proof");requests.Dispose();
+
+            fake=new FakeIndi{ErrorAfterRequest=true};fake.FilledModernOrder();resolved=0;int completed=0;
+            requests=new IndiRequestCoordinator(fake,()=>{resolved++;return schema;});reply=null;requests.Done+=value=>{completed++;reply=value;};
+            fake.DuringRequest=()=>{fake.Data(99);fake.Data(7);};
+            Check(requests.Begin("ORDERS","SABA231Q1",AccountQueries.OrdersInputs(number,secret,day),day)&&reply!=null
+                &&completed==1&&resolved==1&&reply.BrokerOrders.RequestScopeVerified
+                &&reply.BrokerOrders.Orders[0].QueryProfile==BrokerOrderQueryProfile.ModernOrderState54
+                &&reply.BrokerOrders.Orders[0].QuerySchemaSha256==schema.Sha256,
+                "reentrant matching response retains its own normal schema proof while wrong-ID and stale post-return error state cannot replace it");requests.Dispose();
+
+            foreach(bool recognizedOnRetry in new[]{false,true}) {
+                fake=Gi004();fake.FilledModernOrder();resolved=0;
+                var current=recognizedOnRetry?unsupported:schema;
+                requests=new IndiRequestCoordinator(fake,()=>{resolved++;return current;});reply=null;requests.Done+=value=>reply=value;
+                requests.Begin("ORDERS","SABA231Q1",AccountQueries.OrdersInputs(number,secret,day),day);
+                Check(reply==null&&requests.Busy&&resolved==1,"GI004 delay never emits schema evidence from the unaccepted attempt: "+recognizedOnRetry);
+                current=recognizedOnRetry?schema:unsupported;fake.Id=8;
+                Check(requests.PollReadOnlyRetry(DateTime.UtcNow.AddSeconds(2))&&resolved==2&&fake.RequestCount==2&&fake.FieldSetCount==18,
+                    "GI004 retry resolves the installed schema again after rebinding all nine inputs: "+recognizedOnRetry);
+                fake.Data(7);Check(reply==null&&requests.Busy,"the failed attempt's callback cannot complete fresh retry schema proof: "+recognizedOnRetry);
+                fake.Data(8);row=reply==null?null:reply.BrokerOrders.Orders[0];
+                Check(row!=null&&reply.BrokerOrders.RequestScopeVerified
+                    &&row.QueryProfile==(recognizedOnRetry?BrokerOrderQueryProfile.ModernOrderState54:BrokerOrderQueryProfile.Unverified)
+                    &&(recognizedOnRetry?row.QuerySchemaSha256==schema.Sha256:string.IsNullOrEmpty(row.QuerySchemaSha256)),
+                    "retry response derives profile and digest exclusively from its fresh resolver result: "+recognizedOnRetry);requests.Dispose();
+            }
+        }
         public static int Run() {
             checks=0;
             KrxHoldingsProvenance();
             OrdinaryHoldingsProvenance();
             ReadOnlyGi004Recovery();
             OrdersRequestScopeProof();
+            ModernOrdersSchemaProof();
             var fake=new FakeIndi();fake.Quote();var requests=new IndiRequestCoordinator(fake);
             int received=0,fatal=0;IndiReply reply=null;
             requests.Done+=value=>{received++;reply=value;};requests.Fatal+=reason=>fatal++;

@@ -24,24 +24,43 @@ namespace ShinhanNativeTrader {
         public bool OrderSemanticsVerified { get { return false; } }
     }
 
-    public enum BrokerConfirmationKind { Normal, Rejected, Unavailable, Unknown }
+    public enum BrokerOrderQueryProfile { Unverified, ModernOrderState54 }
+    public enum BrokerConfirmationKind { Normal, Rejected, Unavailable, Unknown, StatusCorroborated }
 
     public sealed class BrokerOrderRow {
         public string OrderNumber,OriginalOrderNumber,Code,Name,SideCode,AmendCancelCode;
         public string ProductCode,CreditCode,OrderClock,FillClock,RejectCode,RejectName,ConfirmationCode,StatusName;
+        public string QuerySchemaSha256,OrderMethodCode,SorOrderNumber,SorOriginalOrderNumber;
+        public BrokerOrderQueryProfile QueryProfile;
         public decimal Quantity,LimitPrice,FilledQuantity,AverageFillPrice,OpenQuantity,ConfirmedQuantity,AutoCancelledQuantity;
-        public bool HasRejection { get { return ConfirmationCode=="1"||ConfirmationCode=="2"||ConfirmationCode=="3"; } }
-        // SABA231Q1 MO21 is a one-character enum. A missing echo is unavailable
-        // metadata, never code 0; other nonblank representations need evidence.
+        // The verified 0x0208/54-field resource identifies MO21 as
+        // ord_stat_tp_code. Its observed receipt code is corroborated by the
+        // separate MO31 status, never normalized into legacy "0 normal".
+        internal static bool SchemaHashValid(string value){return value!=null&&value.Length==64
+            &&value.All(character=>character>='0'&&character<='9'||character>='a'&&character<='f'||character>='A'&&character<='F');}
+        public int QuerySerializationVersion {get{return QueryProfile==BrokerOrderQueryProfile.ModernOrderState54?0x0208:0;}}
+        public bool HasRecognizedModernSchema {get{return QueryProfile==BrokerOrderQueryProfile.ModernOrderState54&&SchemaHashValid(QuerySchemaSha256);}}
+        public bool ModernVenueCompatible {get{return (string.IsNullOrWhiteSpace(OrderMethodCode)||OrderMethodCode=="1")
+            &&NoRejectionValue(SorOrderNumber)&&NoRejectionValue(SorOriginalOrderNumber);}}
+        bool HasCorroboratedModernReceipt {get{return HasRecognizedModernSchema&&ModernVenueCompatible
+            &&ConfirmationCode=="1"&&StatusName=="접수"&&NoRejectionValue(RejectCode)&&NoRejectionValue(RejectName);}}
+        public bool HasRejection { get { return ConfirmationCode=="1"&&!HasCorroboratedModernReceipt||ConfirmationCode=="2"||ConfirmationCode=="3"; } }
+        // The legacy Helper describes a one-character enum; the current XTR
+        // does not embed that mapping. Missing metadata never becomes code 0,
+        // and current received-state corroboration remains a separate class.
         public BrokerConfirmationKind ConfirmationKind { get {
-            return ConfirmationCode=="0"?BrokerConfirmationKind.Normal:HasRejection?BrokerConfirmationKind.Rejected:
+            return ConfirmationCode=="0"?BrokerConfirmationKind.Normal:HasCorroboratedModernReceipt?BrokerConfirmationKind.StatusCorroborated:
+                HasRejection?BrokerConfirmationKind.Rejected:
                 string.IsNullOrWhiteSpace(ConfirmationCode)?BrokerConfirmationKind.Unavailable:BrokerConfirmationKind.Unknown;
         } }
         public string ConfirmationShape { get {
             return ConfirmationKind==BrokerConfirmationKind.Unavailable?"Blank":ConfirmationKind==BrokerConfirmationKind.Normal?"Zero":
-                ConfirmationKind==BrokerConfirmationKind.Rejected?"Reject":ConfirmationCode.All(value=>value=='0')?"PaddedZero":"Other";
+                ConfirmationKind==BrokerConfirmationKind.Rejected?"Reject":ConfirmationKind==BrokerConfirmationKind.StatusCorroborated?"StatusCorroborated":
+                ConfirmationCode.All(value=>value=='0')?"PaddedZero":"Other";
         } }
         static bool NoRejectionValue(string value){return string.IsNullOrWhiteSpace(value)||value.All(character=>character=='0');}
+        public string RejectCodeShape {get{return string.IsNullOrWhiteSpace(RejectCode)?"Blank":NoRejectionValue(RejectCode)?"Zero":"Present";}}
+        public string RejectNameShape {get{return string.IsNullOrWhiteSpace(RejectName)?"Blank":NoRejectionValue(RejectName)?"Zero":"Present";}}
         public bool HasRejectionConflict { get {
             return HasRejection||!NoRejectionValue(RejectCode)||!NoRejectionValue(RejectName)
                 ||!string.IsNullOrEmpty(StatusName)&&(StatusName.IndexOf("거부",StringComparison.Ordinal)>=0
@@ -50,7 +69,9 @@ namespace ShinhanNativeTrader {
         // This is only one prerequisite for a separately verified, exact,
         // known-accepted terminal fill. It cannot prove acceptance or a fill.
         public bool TerminalConfirmationCompatible {get{return !HasRejectionConflict
-            &&(ConfirmationKind==BrokerConfirmationKind.Normal||ConfirmationKind==BrokerConfirmationKind.Unavailable);}}
+            &&(QueryProfile==BrokerOrderQueryProfile.Unverified||HasRecognizedModernSchema&&ModernVenueCompatible)
+            &&(ConfirmationKind==BrokerConfirmationKind.Normal||ConfirmationKind==BrokerConfirmationKind.Unavailable
+                ||ConfirmationKind==BrokerConfirmationKind.StatusCorroborated);}}
         // SABA231Q1 aggregate rows are a snapshot, never individual executions.
         public bool HasExecutionId { get { return false; } }
     }
@@ -446,8 +467,12 @@ namespace ShinhanNativeTrader {
             if(result==null)throw new AccountQueryException("SABA415Q1 did not return an unambiguous cash100 row.");
             return result;
         }
-        public static BrokerOrdersSnapshot ReadOrders(IIndiTransport io,string tradingDate,DateTime receivedUtc) {
+        public static BrokerOrdersSnapshot ReadOrders(IIndiTransport io,string tradingDate,DateTime receivedUtc,
+            BrokerOrderQueryProfile queryProfile=BrokerOrderQueryProfile.Unverified,string querySchemaSha256=null) {
             if(io==null)throw new ArgumentNullException("io");Utc(receivedUtc);Date(tradingDate);
+            if(!Enum.IsDefined(typeof(BrokerOrderQueryProfile),queryProfile))throw new ArgumentException("Unknown broker order query profile.","queryProfile");
+            if(queryProfile==BrokerOrderQueryProfile.ModernOrderState54&&!BrokerOrderRow.SchemaHashValid(querySchemaSha256))
+                throw new ArgumentException("A recognized modern query definition digest is required.","querySchemaSha256");
             const string query="SABA231Q1";
             var result=new BrokerOrdersSnapshot {TradingDate=tradingDate,ReceivedUtc=receivedUtc};
             var seen=new HashSet<string>(StringComparer.Ordinal);
@@ -457,7 +482,8 @@ namespace ShinhanNativeTrader {
                 var code=Rules.Code(Multi(io,row,13,query));var side=Multi(io,row,4,query);
                 if(code=="")throw new AccountQueryException("SABA231Q1 invalid stock symbol multi[13].");
                 if(side!="1"&&side!="2")throw new AccountQueryException("SABA231Q1 invalid stock side multi[4].");
-                var item=new BrokerOrderRow {OrderNumber=id,OriginalOrderNumber=OrderId(Multi(io,row,1,query),true),
+                var item=new BrokerOrderRow {OrderNumber=id,OriginalOrderNumber=OrderId(Multi(io,row,1,query),true),QueryProfile=queryProfile,
+                    QuerySchemaSha256=queryProfile==BrokerOrderQueryProfile.ModernOrderState54?querySchemaSha256.ToLowerInvariant():null,
                     Code=code,Name=Text(Multi(io,row,14,query)),SideCode=side,AmendCancelCode=Text(Multi(io,row,6,query)),
                     ProductCode=Text(Multi(io,row,17,query)),CreditCode=Text(Multi(io,row,29,query)),
                     Quantity=Quantity(Multi(io,row,15,query),query+" quantity[15]"),
@@ -470,6 +496,10 @@ namespace ShinhanNativeTrader {
                     OrderClock=Text(Multi(io,row,18,query)),FillClock=Text(Multi(io,row,22,query)),
                     RejectCode=Text(Multi(io,row,19,query)),RejectName=Text(Multi(io,row,20,query)),
                     ConfirmationCode=Text(Multi(io,row,21,query)),StatusName=Text(Multi(io,row,31,query))};
+                if(queryProfile==BrokerOrderQueryProfile.ModernOrderState54) {
+                    item.OrderMethodCode=Text(Multi(io,row,41,query));item.SorOrderNumber=Text(Multi(io,row,47,query));
+                    item.SorOriginalOrderNumber=Text(Multi(io,row,48,query));
+                }
                 if(item.FilledQuantity>item.Quantity||item.OpenQuantity>item.Quantity||item.FilledQuantity+item.OpenQuantity>item.Quantity)
                     throw new AccountQueryException("SABA231Q1 inconsistent aggregate order quantities multi[15/24/26].");
                 if(item.FilledQuantity>0&&item.AverageFillPrice<=0)

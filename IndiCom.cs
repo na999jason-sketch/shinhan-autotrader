@@ -273,7 +273,8 @@ namespace ShinhanNativeTrader {
             if(count!=decimal.Truncate(count)||count>limit)throw new InvalidOperationException("Indi row count outside supported range.");
             return (int)count;
         }
-        public static IndiReply Read(IIndiTransport io,string kind,string code,Action<string,string,string> quoteTrace=null,decimal? requestedPrice=null,bool tradeBasisRequested=false,bool ordinaryOnlyRequested=false) {
+        public static IndiReply Read(IIndiTransport io,string kind,string code,Action<string,string,string> quoteTrace=null,decimal? requestedPrice=null,bool tradeBasisRequested=false,bool ordinaryOnlyRequested=false,
+            BrokerOrderQueryProfile orderQueryProfile=BrokerOrderQueryProfile.Unverified,string orderSchemaSha256=null) {
             Func<int,string> single=col=>{
                 try{return Convert.ToString(io.Invoke("GetSingleData",col),CultureInfo.InvariantCulture)??"";}
                 catch(Exception ex){throw new FieldFailure("GetSingleData index="+col+" failed",ex);}
@@ -345,7 +346,7 @@ namespace ShinhanNativeTrader {
                 if(!requestedPrice.HasValue||requestedPrice.Value<=0)throw new FieldFailure("Capacity request price is missing");
                 reply.Capacity=AccountQueries.ReadCapacity(io,code,requestedPrice.Value,DateTime.UtcNow);reply.Count=1;
             }else if(kind=="ORDERS") {
-                reply.BrokerOrders=AccountQueries.ReadOrders(io,code,DateTime.UtcNow);reply.Count=reply.BrokerOrders.Orders.Count;
+                reply.BrokerOrders=AccountQueries.ReadOrders(io,code,DateTime.UtcNow,orderQueryProfile,orderSchemaSha256);reply.Count=reply.BrokerOrders.Orders.Count;
             }else if(kind=="HOLDINGS") {
                 reply.Count=Rows(io,2000);var seen=new HashSet<string>();
                 for(int row=0;row<reply.Count;row++) {
@@ -375,20 +376,23 @@ namespace ShinhanNativeTrader {
             public bool Retried,RequestEntered;
             public DateTime? RetryDueUtc;
             public bool TradeBasisRequested,OrdinaryOnlyRequested,OrdersScopeRequested;
+            public BrokerOrderQueryProfile OrdersProfile;
+            public string OrderSchemaSha256;
             public decimal? RequestedPrice;
             public DateTime RequestStartedUtc;
             public readonly List<Snapshot> Early=new List<Snapshot>();
             public string[] Sensitive=new string[0];
         }
         readonly IIndiTransport io;Pending pending;bool failed,disposed;
+        readonly Func<IndiAccountOrderSchemaInfo> orderSchemaResolver;
         readonly HashSet<string> sessionSensitive=new HashSet<string>(StringComparer.Ordinal);
         public event Action<string> Trace;
         public event Action<string> Fatal;
         public event Action<IndiReply> Done;
         public bool Busy {get{return pending!=null;}}
         public bool Failed {get{return failed;}}
-        public IndiRequestCoordinator(IIndiTransport transport) {
-            io=transport;io.ReceiveData+=OnData;io.Error+=Halt;
+        public IndiRequestCoordinator(IIndiTransport transport,Func<IndiAccountOrderSchemaInfo> schemaResolver=null) {
+            io=transport;orderSchemaResolver=schemaResolver;io.ReceiveData+=OnData;io.Error+=Halt;
         }
         void Log(string message){if(Trace!=null)Trace(message);}
         IndiDiagnosticSnapshot Diagnose(Pending current,string stage) {
@@ -478,6 +482,18 @@ namespace ShinhanNativeTrader {
                 current.TradeBasisRequested=VerifiedHoldingsRequest(kind,"TRADEHOLDINGS",query,input,settersConfirmed,"1");
                 current.OrdinaryOnlyRequested=VerifiedHoldingsRequest(kind,"ORDINARYHOLDINGS",query,input,settersConfirmed,"5");
                 current.OrdersScopeRequested=VerifiedOrdersRequest(kind,query,input,settersConfirmed,code);
+                if(current.OrdersScopeRequested&&orderSchemaResolver!=null) {
+                    // Bind immutable static-layout evidence to this request.
+                    // Missing definitions keep legacy interpretation and cannot
+                    // authorize a modern status exception by numeric code alone.
+                    try {
+                        var schema=orderSchemaResolver();
+                        if(schema!=null) {
+                            Log(schema.Diagnostic);
+                            if(schema.Recognized){current.OrdersProfile=BrokerOrderQueryProfile.ModernOrderState54;current.OrderSchemaSha256=schema.Sha256;}
+                        }
+                    }catch {Log("SABA231Q1 installed schema unavailable; modern status corroboration disabled.");}
+                }
                 // Input COM calls may pump a stop/dispose/account-change event.
                 // An obsolete pending instance must not start its deferred read.
                 if(disposed||failed||pending!=current)return false;
@@ -542,7 +558,9 @@ namespace ShinhanNativeTrader {
                 try{snapshot.Reply=IndiResponseParser.Read(io,current.Kind,current.Code,
                     (symbol,clock,price)=>Log(IndiDiagnosticFormatter.FormatQuote(current.Kind,symbol,clock,price,sessionSensitive)),current.RequestedPrice,
                     current.TradeBasisRequested&&diagnostic!=null&&diagnostic.ErrorState==0,
-                    current.OrdinaryOnlyRequested&&diagnostic!=null&&diagnostic.ErrorState==0);}
+                    current.OrdinaryOnlyRequested&&diagnostic!=null&&diagnostic.ErrorState==0,
+                    current.OrdersScopeRequested&&snapshot.NormalResponse?current.OrdersProfile:BrokerOrderQueryProfile.Unverified,
+                    current.OrdersScopeRequested&&snapshot.NormalResponse?current.OrderSchemaSha256:null);}
                 catch(Exception ex){snapshot.Error=ex;}
             }
             if(!current.Id.HasValue) {
@@ -669,7 +687,7 @@ namespace ShinhanNativeTrader {
             if(requests!=null){requests.Dispose();requests=null;}
             if(transport!=null){transport.Dispose();transport=null;}
             transport=new ComIndiTransport(surface,Log);
-            requests=new IndiRequestCoordinator(transport);requests.Trace+=Log;
+            requests=new IndiRequestCoordinator(transport,()=>IndiAccountOrderSchema.ReadInstalled(transport.InstalledStarterPath));requests.Trace+=Log;
             requests.Done+=reply=>{timeout.Stop();hasReceivedData=true;if(Done!=null)Done(reply);};
             requests.Fatal+=reason=>{timeout.Stop();if(Fatal!=null)Fatal(reason);};
             transport.ReceiveSysMsg+=id=>Log("Indi ReceiveSysMsg="+id+"; no assumption of account/login readiness.");

@@ -276,6 +276,37 @@ namespace ShinhanNativeTrader {
             orders=AccountQueries.ReadOrders(io,"20261112",utc);
             Check(orders.Orders[0].ConfirmationCode==""&&orders.Orders[0].ConfirmationKind==BrokerConfirmationKind.Unavailable
                 &&!orders.Orders[0].HasRejection,"MO21 missing echo remains unavailable after parsing instead of being replaced by normal");
+            io=new Response();io.Order(0);io.SetRow(0,21,"1");io.SetRow(0,31,"접수");
+            var unverified=AccountQueries.ReadOrders(io,"20261112",utc).Orders[0];
+            Check(unverified.HasRejection&&unverified.ConfirmationKind==BrokerConfirmationKind.Rejected,
+                "receipt text alone never changes the legacy or unverified confirmation-1 interpretation");
+            var modern=AccountQueries.ReadOrders(io,"20261112",utc,BrokerOrderQueryProfile.ModernOrderState54,new string('a',64)).Orders[0];
+            Check(modern.ConfirmationCode=="1"&&modern.StatusName=="접수"&&modern.ConfirmationKind==BrokerConfirmationKind.StatusCorroborated
+                &&modern.ConfirmationKind!=BrokerConfirmationKind.Normal&&!modern.HasRejection&&modern.TerminalConfirmationCompatible
+                &&modern.QuerySerializationVersion==0x0208&&modern.QuerySchemaSha256==new string('a',64),
+                "a recognized modern schema and separate received status corroborate raw 1 without asserting a verified vendor normal enum");
+            foreach(var hash in new[]{null,"",new string('a',63),new string('g',64)})
+                Reject(()=>AccountQueries.ReadOrders(io,"20261112",utc,BrokerOrderQueryProfile.ModernOrderState54,hash),
+                    "modern order-state parsing requires a valid recognized-definition digest");
+            Reject(()=>AccountQueries.ReadOrders(io,"20261112",utc,(BrokerOrderQueryProfile)99,new string('a',64)),
+                "unknown query-profile values cannot select modern status semantics");
+            foreach(var field in new[]{19,20,21,31,41,47,48}) {
+                var conflictIo=new Response();conflictIo.Order(0);conflictIo.SetRow(0,21,"1");conflictIo.SetRow(0,31,"접수");
+                conflictIo.SetRow(0,field,field==31?"확인":field==21?"2":"2");
+                var conflict=AccountQueries.ReadOrders(conflictIo,"20261112",utc,BrokerOrderQueryProfile.ModernOrderState54,new string('a',64)).Orders[0];
+                Check(conflict.ConfirmationKind!=BrokerConfirmationKind.StatusCorroborated&&!conflict.TerminalConfirmationCompatible,
+                    "unsupported status, rejection or alternate venue metadata cannot corroborate the modern received-state case");
+            }
+            io.SetRow(0,19,"0000");io.SetRow(0,20,"0");io.SetRow(0,41,"1");io.SetRow(0,47,"0");io.SetRow(0,48,"0000");
+            modern=AccountQueries.ReadOrders(io,"20261112",utc,BrokerOrderQueryProfile.ModernOrderState54,new string('A',64)).Orders[0];
+            Check(modern.TerminalConfirmationCompatible&&modern.RejectCodeShape=="Zero"&&modern.RejectNameShape=="Zero"
+                &&modern.QuerySchemaSha256==new string('a',64),"explicit zero rejection and SOR placeholders preserve separate raw modern receipt provenance");
+            io.ThrowField="m:0:41";
+            Check(AccountQueries.ReadOrders(io,"20261112",utc).Orders[0].QueryProfile==BrokerOrderQueryProfile.Unverified,
+                "unverified legacy queries never probe fields absent from their known layout");
+            Reject(()=>AccountQueries.ReadOrders(io,"20261112",utc,BrokerOrderQueryProfile.ModernOrderState54,new string('a',64)),
+                "a missing modern venue getter prevents a recognized-profile parse instead of silently proving absence");
+            io=new Response();io.Order(0);
             io.SetRow(0,14,"Name\r\nInjected\u202E");orders=AccountQueries.ReadOrders(io,"20261112",utc);
             Check(orders.Orders[0].Name=="NameInjected","display text cannot insert multiline or bidi records");
             io.Order(1,"00123");Reject(()=>AccountQueries.ReadOrders(io,"20261112",utc),"duplicate aggregate IDs cannot be misread as two executions");

@@ -293,6 +293,40 @@ namespace ShinhanNativeTrader {
                     }
                 }
             }
+            var point=order.FillCheckpoint;point.ConfirmationBasis=BrokerFillConfirmationBasis.ModernAcceptedStateWithFullFill;
+            point.QueryProfile=BrokerOrderQueryProfile.ModernOrderState54;point.QuerySchemaSha256=new string('a',64);point.QuerySerializationVersion=0x0208;
+            point.ConfirmationCode="1";point.StatusName="접수";point.RejectCodeShape="Blank";point.RejectNameShape="Blank";
+            point.OrderMethodCode="1";point.SorOrderNumber="0";point.SorOriginalOrderNumber="0";
+            Action resetModern=()=>snapshot.Orders[0]=new BrokerOrderRow{OrderNumber="00011",Code=order.Code,SideCode="1",ProductCode="01",CreditCode="00",
+                Quantity=10,LimitPrice=10000,FilledQuantity=10,OpenQuantity=0,AverageFillPrice=10000,
+                QueryProfile=BrokerOrderQueryProfile.ModernOrderState54,QuerySchemaSha256=new string('a',64),ConfirmationCode="1",StatusName="접수",
+                OrderMethodCode="1",SorOrderNumber="0",SorOriginalOrderNumber="0"};
+            resetModern();observeFresh();
+            Check(f.Evaluate().Ready&&f.Evaluate().Checks.FillsReconciled&&f.Journal.Executions.Count==1,
+                "current matching modern schema and receipt status validate the distinct full-fill checkpoint without adding executions");
+            foreach(var mutation in new Action<BrokerOrderRow>[] {
+                row=>row.QueryProfile=BrokerOrderQueryProfile.Unverified,row=>row.QuerySchemaSha256=null,row=>row.QuerySchemaSha256=new string('b',64),
+                row=>row.StatusName="확인",row=>row.StatusName="거부",row=>row.ConfirmationCode="",row=>row.ConfirmationCode="2",row=>row.ConfirmationCode="3",
+                row=>row.RejectCode="R001",row=>row.RejectName="거부",row=>row.OrderMethodCode="2",row=>row.SorOrderNumber="11",row=>row.SorOriginalOrderNumber="12"
+            }) {
+                resetModern();mutation(snapshot.Orders[0]);observeFresh();resetModern();
+                Check(!f.Evaluate().Ready,"a changed source digest, receipt interpretation or alternate-venue metadata invalidates modern checkpoint readiness until reverified");
+            }
+            resetModern();snapshot.Orders[0].ConfirmationCode="0";observeFresh();
+            Check(f.Evaluate().Ready&&point.ConfirmationCode=="1"&&point.ConfirmationBasis==BrokerFillConfirmationBasis.ModernAcceptedStateWithFullFill,
+                "fresh explicit normal confirmation from the same recognized modern definition validates rather than rewrites the preserved received-state checkpoint");
+            foreach(var mutation in new Action<BrokerOrderRow>[] {
+                row=>row.QueryProfile=BrokerOrderQueryProfile.Unverified,row=>row.QuerySchemaSha256=new string('b',64),row=>row.RejectCode="R001",row=>row.RejectName="거부"
+            }) {
+                resetModern();snapshot.Orders[0].ConfirmationCode="0";mutation(snapshot.Orders[0]);observeFresh();
+                Check(!f.Evaluate().Ready&&point.ConfirmationCode=="1",
+                    "explicit normal code cannot exempt current schema provenance or rejection details while preserving the original checkpoint");
+            }
+            resetModern();snapshot.Orders[0].OrderMethodCode="";snapshot.Orders[0].SorOrderNumber="";snapshot.Orders[0].SorOriginalOrderNumber="";observeFresh();
+            Check(f.Evaluate().Ready,"missing venue echoes never replace the preserved accepted KRX identity or contradict an existing compatible checkpoint");
+            point.QuerySchemaSha256=new string('b',64);
+            Check(!f.Evaluate().Ready,"a syntactically valid but different persisted schema digest cannot match the actual current scoped broker row");
+            point.QuerySchemaSha256=new string('a',64);
         }
         static void OrdinarySourceChecks() {
             var trade=ParsedBalance("",true,io=>{io.Fields[3]="";io.Fields[22]="";});
