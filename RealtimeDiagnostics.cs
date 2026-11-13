@@ -19,6 +19,7 @@ namespace ShinhanNativeTrader {
         public string LastCode {get;private set;}
         public string LastClock {get;private set;}
         public string LastClockShape {get;private set;}
+        public string LastRawClockDigits {get;private set;}
         public string LastMarket {get;private set;}
         public decimal LastVolume {get;private set;}
         public RealtimeQuoteState LastState {get;private set;}
@@ -36,10 +37,29 @@ namespace ShinhanNativeTrader {
         }
         public static string NormalizeClock(string raw) {
             var value=(raw??"").Trim();var shape=ClockShape(value);
+            if(shape=="digits8") {
+                // SC publishes an eight-character trade time. Support two explicit
+                // numeric encodings, never an arbitrary substring chosen by PC time.
+                // Their regular-session interpretations cannot overlap: padding has
+                // literal leading 00, whereas HHmmssff has an hour from 09 to 15.
+                var fractional=RegularClock(value.Substring(0,6));
+                var padded=value.StartsWith("00",StringComparison.Ordinal)?RegularClock(value.Substring(2,6)):"";
+                if(fractional!=""&&padded!=""&&fractional!=padded)return "";
+                return fractional!=""?fractional:padded;
+            }
             if(shape!="digits6"&&shape!="colon8")return "";
             DateTime parsed;
             if(!DateTime.TryParseExact(value,shape=="digits6"?"HHmmss":"HH:mm:ss",CultureInfo.InvariantCulture,DateTimeStyles.None,out parsed))return "";
             return parsed.ToString("HHmmss",CultureInfo.InvariantCulture);
+        }
+        static string RegularClock(string value) {
+            DateTime parsed;
+            if(!DateTime.TryParseExact(value,"HHmmss",CultureInfo.InvariantCulture,DateTimeStyles.None,out parsed))return "";
+            var time=parsed.TimeOfDay;
+            return time>=new TimeSpan(9,0,0)&&time<=new TimeSpan(15,30,0)?value:"";
+        }
+        public static string RawClockDigits(string raw) {
+            var value=(raw??"").Trim();return value.Length==8&&Digits(value)?value:"";
         }
         public void RecordCallback(object kind,DateTime utc) {
             Utc(utc);CallbackCount=Next(CallbackCount);LastCallbackUtc=utc;
@@ -54,12 +74,13 @@ namespace ShinhanNativeTrader {
             if(!Enum.IsDefined(typeof(RealtimeQuoteState),state))throw new ArgumentException("Known realtime quote diagnostic state required.");
             LastQuoteUtc=quote.ReceivedUtc;LastCode=!string.IsNullOrEmpty(quote.Code)&&Rules.Code(quote.Code)==quote.Code?quote.Code:"invalid";
             LastClock=NormalizeClock(quote.Clock);LastClockShape=new[]{"blank","digits6","colon8","digits8","other"}.Contains(quote.ClockShape)?quote.ClockShape:"other";
+            LastRawClockDigits=RawClockDigits(quote.ClockRawDigits);
             var market=(quote.MarketCode??"").Trim();LastMarket=market.Length==0?"blank":market.Length==1&&market[0]>='0'&&market[0]<='9'?market:"other";
             LastVolume=quote.CumulativeVolume>=0&&quote.CumulativeVolume==decimal.Truncate(quote.CumulativeVolume)?quote.CumulativeVolume:0;
             LastState=state;invalidated=false;
         }
         public void Invalidate() {
-            LastQuoteUtc=null;LastCode=null;LastClock=null;LastClockShape=null;LastMarket=null;LastVolume=0;
+            LastQuoteUtc=null;LastCode=null;LastClock=null;LastClockShape=null;LastRawClockDigits=null;LastMarket=null;LastVolume=0;
             invalidated=true;
         }
         public string StateAt(DateTime utc) {
@@ -88,7 +109,7 @@ namespace ShinhanNativeTrader {
             if(!LastQuoteUtc.HasValue)return state+" · "+counts;
             string clock=LastClock.Length==6?LastClock.Substring(0,2)+":"+LastClock.Substring(2,2)+":"+LastClock.Substring(4,2):"미인식";
             var seconds=(utc-LastQuoteUtc.Value).TotalSeconds;string age=seconds<0?"미래":seconds>9999?"9999+초":Math.Floor(seconds).ToString(CultureInfo.InvariantCulture)+"초";
-            return state+" · "+counts+" · 최근 "+LastCode+" "+clock+" ("+LastClockShape+") 장"+LastMarket+" · "+age;
+            return state+" · "+counts+" · 최근 "+LastCode+" "+clock+" ("+LastClockShape+")"+(LastRawClockDigits.Length==0?"":" 원본="+LastRawClockDigits)+" 장"+LastMarket+" · "+age;
         }
     }
 }

@@ -58,13 +58,27 @@ namespace ShinhanNativeTrader {
             fields=Quote(clock:"09:15:31",volume:"101");processor.Process("SC",utc.AddSeconds(1));
             Check(processor.TryGetQuote("005930",utc.AddSeconds(1),out ready)&&ready.Clock=="091531"&&ready.ClockShape=="colon8","advancing colon SC clocks preserve leading zeros and establish the same sequence as six digits");
             Check(!processor.TryGetQuote("005930",utc.AddMinutes(2),out ready),"normalized colon SC timestamps still expire without fresh ticks");
-            fields=Quote(clock:"09153200",volume:"102");processor.Process("SC",utc.AddSeconds(2));
-            Check(!processor.TryGetQuote("005930",utc.AddSeconds(2),out ready)&&processor.Diagnostics.LastClockShape=="digits8"&&processor.Diagnostics.LastState==RealtimeQuoteState.InvalidClock,"ambiguous eight-digit SC clock remains unusable and reports its finite shape");
+            fields=Quote(clock:"24609999",volume:"102");processor.Process("SC",utc.AddSeconds(2));
+            Check(!processor.TryGetQuote("005930",utc.AddSeconds(2),out ready)&&processor.Diagnostics.LastClockShape=="digits8"&&processor.Diagnostics.LastState==RealtimeQuoteState.InvalidClock,"invalid eight-digit SC clock remains unusable and reports its finite shape");
             fields=Quote(clock:"09:15:33",volume:"103",market:"4");processor.Process("SC",utc.AddSeconds(3));
             Check(!processor.TryGetQuote("005930",utc.AddSeconds(3),out ready)&&processor.Diagnostics.LastState==RealtimeQuoteState.NonRegularMarket,"colon clock cannot bypass regular-market evidence");
             processor.Untrack("005930");Check(processor.Diagnostics.StateAt(utc.AddSeconds(3))=="이벤트 재확인 대기","unregistering the latest quote clears its prior diagnostic evidence");
             processor.Invalidate();Check(processor.Diagnostics.StateAt(utc.AddSeconds(3))=="이벤트 재확인 대기","system invalidation cannot leave a normal quote diagnostic behind");
             processor.Dispose();
+
+            var numericUtc=new DateTime(2026,11,13,1,4,55,DateTimeKind.Utc);
+            foreach(var pair in new[]{new[]{"10045512","10045613"},new[]{"00100455","00100456"}}) {
+                fields=Quote(clock:pair[0]);processor=new RealtimeEventProcessor(index=>Field(fields,index));processor.Track("005930");
+                processor.Process("SC",numericUtc);
+                Check(!processor.TryGetQuote("005930",numericUtc,out ready),"a valid eight-digit initial tick still cannot establish a live sequence");
+                fields=Quote(clock:pair[1],volume:"101");processor.Process("SC",numericUtc.AddSeconds(1));
+                Check(processor.TryGetQuote("005930",numericUtc.AddSeconds(1),out ready)&&ready.Clock=="100456"&&ready.ClockRawDigits==pair[1],"each explicit eight-digit profile feeds actual fresh SC progression");
+                Check(processor.Diagnostics.Describe(numericUtc.AddSeconds(1)).Contains("원본="+pair[1]),"bounded public raw SC clock survives normalization for exact diagnosis");
+                Check(!processor.TryGetQuote("005930",numericUtc.AddSeconds(60),out ready),"eight-digit clock cannot bypass quote expiry");
+                fields=Quote(clock:pair[0],volume:"100");processor.Process("SC",numericUtc.AddSeconds(2));
+                Check(!processor.TryGetQuote("005930",numericUtc.AddSeconds(2),out ready)&&processor.Diagnostics.LastState==RealtimeQuoteState.Regressed,"eight-digit time and volume regression clears readiness");
+                processor.Dispose();
+            }
 
             fields=Order();var trade=RealtimeRecordParser.ReadOrder(index=>Field(fields,index),"12345678901",utc);
             Check(trade.IsExecution&&trade.ExecutionId=="F0004"&&trade.IndividualFillQuantity==1&&trade.CumulativeFilledQuantity==4,"AA individual quantity23 is distinct from cumulative quantity16");

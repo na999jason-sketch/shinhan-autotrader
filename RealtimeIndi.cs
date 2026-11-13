@@ -16,7 +16,7 @@ namespace ShinhanNativeTrader {
     }
 
     public sealed class RealtimeQuote {
-        public string Code,Clock,MarketCode,ClockShape;
+        public string Code,Clock,MarketCode,ClockShape,ClockRawDigits;
         public decimal Price,CumulativeVolume;
         public DateTime ReceivedUtc;
         public bool SequenceConfirmed;
@@ -61,7 +61,7 @@ namespace ShinhanNativeTrader {
             if(price<=0)throw new InvalidOperationException("SC realtime price[3] must be positive.");
             var volume=Number(Field(read,7,"SC"),"SC cumulative volume[7]");
             if(volume!=decimal.Truncate(volume))throw new InvalidOperationException("SC cumulative volume[7] must be a whole-share amount.");
-            return new RealtimeQuote{Code=code,Clock=RealtimeDiagnostics.NormalizeClock(clock),ClockShape=RealtimeDiagnostics.ClockShape(clock),Price=price,
+            return new RealtimeQuote{Code=code,Clock=RealtimeDiagnostics.NormalizeClock(clock),ClockShape=RealtimeDiagnostics.ClockShape(clock),ClockRawDigits=RealtimeDiagnostics.RawClockDigits(clock),Price=price,
                 CumulativeVolume=volume,MarketCode=Field(read,17,"SC"),ReceivedUtc=utc};
         }
         public static CashOrderEvent ReadOrder(Func<int,object> read,string account,DateTime utc){

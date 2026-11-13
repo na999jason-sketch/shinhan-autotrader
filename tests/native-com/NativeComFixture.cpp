@@ -130,7 +130,7 @@ public:
             const wchar_t* text = L"";
             switch(index) {
                 case 1:text = realtimeBuffer_ ? L"005930" : L"000660"; break;
-                case 2:text = realtimeBuffer_ ? L"09:48:50" : L"00:00:00"; break;
+                case 2:text = realtimeBuffer_ ? L"10045512" : L"00000000"; break;
                 case 3:text = realtimeBuffer_ ? L"70000" : L"1"; break;
                 case 7:text = realtimeBuffer_ ? L"12345" : L"0"; break;
                 case 17:text = realtimeBuffer_ ? L"1" : L"4"; break;

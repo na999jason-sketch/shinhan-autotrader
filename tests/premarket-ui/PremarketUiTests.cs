@@ -160,8 +160,38 @@ static class PremarketUiTests {
             status=Get<Label>(form,"quoteStatus").Text;
             Check(status.Contains("확인 1 / 등록 1")&&status.Contains("정상")&&Get<Label>(form,"quoteStatus").ForeColor==System.Drawing.Color.Black,
                 "advancing colon-formatted exchange clocks establish a confirmed realtime quote in the actual form status");
-            fields[2]="unrecognized";processor.Process("SC",Opening.AddSeconds(2));
+            fields[2]="09000212";fields[7]="103";processor.Process("SC",Opening.AddSeconds(2));
             Call(form,"EvaluatePreparedSignals",Opening.AddSeconds(2));
+            status=Get<Label>(form,"quoteStatus").Text;
+            Check(status.Contains("확인 1 / 등록 1")&&status.Contains("정상")&&status.Contains("09000212")&&status.Contains("digits8"),
+                "eight numeric HHmmssff exchange clocks retain bounded raw diagnostics and continue the confirmed quote sequence");
+            fields[2]="00090003";fields[7]="104";processor.Process("SC",Opening.AddSeconds(3));
+            Call(form,"EvaluatePreparedSignals",Opening.AddSeconds(3));
+            status=Get<Label>(form,"quoteStatus").Text;
+            Check(status.Contains("확인 1 / 등록 1")&&status.Contains("정상")&&status.Contains("00090003"),
+                "zero-padded 00HHmmss exchange clocks remain usable through explicit regular-session parsing");
+            fields[2]="09000499";fields[7]="105";processor.Process("SC",Opening.AddSeconds(100));
+            Call(form,"EvaluatePreparedSignals",Opening.AddSeconds(100));
+            status=Get<Label>(form,"quoteStatus").Text;
+            Check(status.Contains("확인 0 / 등록 1")&&status.Contains("시각 불일치")&&status.Contains("09000499"),
+                "valid eight-digit syntax with a stale exchange time remains unconfirmed for trading and reports clock mismatch");
+            processor.Invalidate();
+            fields[2]="09014112";fields[7]="106";processor.Process("SC",Opening.AddSeconds(101));
+            Call(form,"EvaluatePreparedSignals",Opening.AddSeconds(101));
+            Check(Get<Label>(form,"quoteStatus").Text.Contains("확인 0 / 등록 1"),
+                "one fresh eight-digit quote after explicit source invalidation does not bypass sequence confirmation");
+            fields[2]="09014212";fields[7]="107";processor.Process("SC",Opening.AddSeconds(102));
+            Call(form,"EvaluatePreparedSignals",Opening.AddSeconds(102));
+            status=Get<Label>(form,"quoteStatus").Text;
+            Check(status.Contains("확인 1 / 등록 1")&&status.Contains("정상"),
+                "a second advancing fresh eight-digit quote restores confirmed form status after source invalidation");
+            fields[2]="99619999";fields[7]="108";processor.Process("SC",Opening.AddSeconds(103));
+            Call(form,"EvaluatePreparedSignals",Opening.AddSeconds(103));
+            status=Get<Label>(form,"quoteStatus").Text;
+            Check(status.Contains("확인 0 / 등록 1")&&status.Contains("시각 형식")&&status.Contains("99619999"),
+                "eight digits alone cannot establish a clock when neither explicit format is valid");
+            fields[2]="unrecognized";processor.Process("SC",Opening.AddSeconds(104));
+            Call(form,"EvaluatePreparedSignals",Opening.AddSeconds(104));
             status=Get<Label>(form,"quoteStatus").Text;
             Check(status.Contains("확인 0 / 등록 1")&&status.Contains("시각 형식"),"received SC with an invalid clock is distinguished from missing callbacks and cannot remain trade-ready");
             Check(!processor.Failed&&Get<LiveOrderGateway>(form,"gateway")==null&&Get<LiveOrderJournal>(form,"journal")==null
@@ -172,7 +202,7 @@ static class PremarketUiTests {
 
     static void Run(string data,string screenshot) {
         using(var form=NewForm()) {
-            Check(form.Text.Contains("2.2.1"),"premarket regression runs against version 2.2.1");
+            Check(form.Text.Contains("2.2.2"),"premarket regression runs against version 2.2.2");
             Check(!Get<LiveTradingSession>(form,"authorization").Active,"application startup never authorizes live orders");
             var fixture=new Fixture(form);Bind(form);
             Call(form,"BeginResearch",Opening.AddHours(-10),false);

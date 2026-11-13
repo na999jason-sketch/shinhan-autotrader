@@ -142,8 +142,8 @@ internal static class NativeComTests {
                 Invoke(source,"EmitRealtime");
                 Check(realtimeCallbacks==1&&realtimeKind is string&&(string)realtimeKind=="SC","actual RT DISPID2 delivers a BSTR inside its formal VARIANT callback");
                 Check(realtimeThread==Thread.CurrentThread.ManagedThreadId,"RT callback and typed field getters execute synchronously on the owning STA");
-                Check(quoteFields[1]=="005930"&&quoteFields[2]=="09:48:50"&&quoteFields[3]=="70000"&&quoteFields[7]=="12345"&&quoteFields[17]=="1","RT callback copies documented SC fields through production typed GetSingleData including an eight-character exchange clock");
-                Check((string)quoteAdapter.Invoke("GetSingleData",2)=="00:00:00"&&quoteFields[2]=="09:48:50","later native buffer changes cannot replace the clock already copied inside RT callback");
+                Check(quoteFields[1]=="005930"&&quoteFields[2]=="10045512"&&quoteFields[3]=="70000"&&quoteFields[7]=="12345"&&quoteFields[17]=="1","RT callback copies documented SC fields through production typed GetSingleData preserving all eight numeric exchange-clock characters");
+                Check((string)quoteAdapter.Invoke("GetSingleData",2)=="00000000"&&quoteFields[2]=="10045512","later native buffer changes cannot replace the eight-digit clock already copied inside RT callback");
                 GC.Collect();GC.WaitForPendingFinalizers();GC.Collect();
                 Invoke(source,"EmitRealtime");
                 Check(realtimeCallbacks==2&&quoteFields[3]=="70000","DISPID2 subscription and same-source quote reads survive forced collection");

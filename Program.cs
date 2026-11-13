@@ -16,7 +16,7 @@ namespace ShinhanNativeTrader {
         public AccountUserActionException(string message):base(message){}
     }
     internal static class Program {
-        internal const string Version="2.2.1";
+        internal const string Version="2.2.2";
         [STAThread]
         static int Main(string[] args) {
             if(args.Contains("--selftest")) {
