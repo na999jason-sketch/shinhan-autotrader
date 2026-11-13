@@ -41,67 +41,116 @@ namespace ShinhanNativeTrader {
         public DateTime ReceivedUtc;
     }
 
+    public enum RealtimeRecordKind { Event,SC,AA,AD }
+    public enum RealtimeValueShape { None,Unavailable,Blank,Digits6,Digits8,Colon8,Digits,Numeric,Other }
+    public enum RealtimeFailureCode { FieldUnavailable,InvalidNumber,InvalidQuantity,InvalidSymbol,InvalidBrokerNumber,
+        UnsupportedCode,ProfileMismatch,InconsistentQuantities,InvalidClock,InvalidExecution,ReadFailure,SubscriberFailure,EventType }
+    // Only parser-owned enums and bounded field positions enter this evidence.
+    // Provider values, account identities and exception messages never do.
+    public sealed class RealtimeFailureEvidence {
+        public RealtimeRecordKind Kind {get;private set;}
+        public int FieldIndex {get;private set;}
+        public RealtimeFailureCode Code {get;private set;}
+        public RealtimeValueShape ValueShape {get;private set;}
+        internal RealtimeFailureEvidence(RealtimeRecordKind kind,int index,RealtimeFailureCode code,RealtimeValueShape shape=RealtimeValueShape.None) {
+            Kind=kind;FieldIndex=index;Code=code;ValueShape=shape;
+        }
+        public string SafeDiagnostic {get{return "RealtimeFailure kind="+Kind+"; field="+(FieldIndex<0?"none":FieldIndex.ToString(CultureInfo.InvariantCulture))+"; code="+Code+"; shape="+ValueShape+". Provider values omitted.";}}
+    }
+    internal sealed class RealtimeRecordException : InvalidOperationException {
+        public RealtimeFailureEvidence Evidence {get;private set;}
+        internal RealtimeRecordException(string kind,int index,RealtimeFailureCode code,string value=null) {
+            var record=kind=="SC"?RealtimeRecordKind.SC:kind=="AA"?RealtimeRecordKind.AA:kind=="AD"?RealtimeRecordKind.AD:RealtimeRecordKind.Event;
+            Evidence=new RealtimeFailureEvidence(record,index,code,code==RealtimeFailureCode.FieldUnavailable?RealtimeValueShape.Unavailable:Shape(value));
+        }
+        static RealtimeValueShape Shape(string value) {
+            if(value==null)return RealtimeValueShape.None;
+            if(value.Length==0)return RealtimeValueShape.Blank;
+            bool digits=value.All(character=>character>='0'&&character<='9');
+            if(digits)return value.Length==6?RealtimeValueShape.Digits6:value.Length==8?RealtimeValueShape.Digits8:RealtimeValueShape.Digits;
+            if(value.Length==8&&value[2]==':'&&value[5]==':'
+                &&(value.Substring(0,2)+value.Substring(3,2)+value.Substring(6,2)).All(character=>character>='0'&&character<='9'))return RealtimeValueShape.Colon8;
+            decimal number;
+            return decimal.TryParse(value,NumberStyles.Number,CultureInfo.InvariantCulture,out number)?RealtimeValueShape.Numeric:RealtimeValueShape.Other;
+        }
+    }
+
     // Only documented fields are read, inside the ReceiveRTData callback. Names,
     // account numbers and arbitrary provider descriptions never leave this parser.
     public static class RealtimeRecordParser {
         static string Field(Func<int,object> read,int index,string kind){
             try{return (Convert.ToString(read(index),CultureInfo.InvariantCulture)??"").Trim();}
-            catch{throw new InvalidOperationException(kind+" realtime field["+index+"] is unavailable; provider text omitted.");}
+            catch{throw new RealtimeRecordException(kind,index,RealtimeFailureCode.FieldUnavailable);}
         }
-        static decimal Number(string raw,string field,bool signed=false){return IndiResponseParser.RequiredNumber(raw,field,signed);}
-        static int Quantity(string raw,string field){var value=Number(raw,field);if(value!=decimal.Truncate(value)||value>int.MaxValue)throw new InvalidOperationException("Invalid realtime quantity: "+field);return (int)value;}
-        static string Symbol(string raw){var result=Rules.Code(raw);if(result=="")throw new InvalidOperationException("Invalid realtime stock symbol.");return result;}
-        static string BrokerNumber(string raw,bool optional){if(optional&&(raw==""||raw.All(c=>c=='0')))return "";if(!LiveOrderProtocol.ValidBrokerNumber(raw))throw new InvalidOperationException("Invalid realtime broker order number.");return raw;}
+        static decimal Number(string raw,string kind,int index,bool signed=false){
+            try{return IndiResponseParser.RequiredNumber(raw,"realtime number",signed);}
+            catch{throw new RealtimeRecordException(kind,index,RealtimeFailureCode.InvalidNumber,raw);}
+        }
+        static int Quantity(string raw,string kind,int index){
+            var value=Number(raw,kind,index);
+            if(value!=decimal.Truncate(value)||value>int.MaxValue)throw new RealtimeRecordException(kind,index,RealtimeFailureCode.InvalidQuantity,raw);
+            return (int)value;
+        }
+        static string Symbol(string raw,string kind,int index){
+            var result=Rules.Code(raw);if(result=="")throw new RealtimeRecordException(kind,index,RealtimeFailureCode.InvalidSymbol,raw);return result;
+        }
+        static string BrokerNumber(string raw,bool optional,string kind,int index){
+            if(optional&&(raw==""||raw.All(c=>c=='0')))return "";
+            if(!LiveOrderProtocol.ValidBrokerNumber(raw))throw new RealtimeRecordException(kind,index,RealtimeFailureCode.InvalidBrokerNumber,raw);return raw;
+        }
         static void Utc(DateTime value){if(value.Kind!=DateTimeKind.Utc)throw new ArgumentException("UTC realtime receipt time required.");}
         static bool AccountMatches(string incoming,string expected){return expected!=null&&incoming.Replace("-","")==expected;}
         static bool Clock(string value){DateTime parsed;return DateTime.TryParseExact(value,"HHmmss",CultureInfo.InvariantCulture,DateTimeStyles.None,out parsed);}
         public static RealtimeQuote ReadQuote(Func<int,object> read,DateTime utc){
-            Utc(utc);var code=Symbol(Field(read,1,"SC"));var clock=Field(read,2,"SC");
-            var price=Math.Abs(Number(Field(read,3,"SC"),"SC realtime price[3]",true));
-            if(price<=0)throw new InvalidOperationException("SC realtime price[3] must be positive.");
-            var volume=Number(Field(read,7,"SC"),"SC cumulative volume[7]");
-            if(volume!=decimal.Truncate(volume))throw new InvalidOperationException("SC cumulative volume[7] must be a whole-share amount.");
+            Utc(utc);var code=Symbol(Field(read,1,"SC"),"SC",1);var clock=Field(read,2,"SC");
+            var price=Math.Abs(Number(Field(read,3,"SC"),"SC",3,true));
+            if(price<=0)throw new RealtimeRecordException("SC",3,RealtimeFailureCode.InvalidNumber);
+            var volume=Number(Field(read,7,"SC"),"SC",7);
+            if(volume!=decimal.Truncate(volume))throw new RealtimeRecordException("SC",7,RealtimeFailureCode.InvalidQuantity);
             return new RealtimeQuote{Code=code,Clock=RealtimeDiagnostics.NormalizeClock(clock),ClockShape=RealtimeDiagnostics.ClockShape(clock),ClockRawDigits=RealtimeDiagnostics.RawClockDigits(clock),Price=price,
                 CumulativeVolume=volume,MarketCode=Field(read,17,"SC"),ReceivedUtc=utc};
         }
         public static CashOrderEvent ReadOrder(Func<int,object> read,string account,DateTime utc){
             Utc(utc);if(!AccountMatches(Field(read,2,"AA"),account)||Field(read,4,"AA")!="01")return null;
             var processing=Field(read,0,"AA");
-            if(!new[]{"00","03","04","05","09","19","98","99"}.Contains(processing))throw new InvalidOperationException("Unsupported AA processing code.");
+            if(!new[]{"00","03","04","05","09","19","98","99"}.Contains(processing))throw new RealtimeRecordException("AA",0,RealtimeFailureCode.UnsupportedCode,processing);
             var rejected=processing=="09"||processing=="19"||processing=="98"||processing=="99";
-            var result=new CashOrderEvent{ProcessingCode=processing,Code=Symbol(Field(read,11,"AA")),ProductCode="01",
-                BrokerOrderNumber=BrokerNumber(Field(read,5,"AA"),rejected),OriginalBrokerOrderNumber=BrokerNumber(Field(read,6,"AA"),true),
+            var result=new CashOrderEvent{ProcessingCode=processing,Code=Symbol(Field(read,11,"AA"),"AA",11),ProductCode="01",
+                BrokerOrderNumber=BrokerNumber(Field(read,5,"AA"),rejected,"AA",5),OriginalBrokerOrderNumber=BrokerNumber(Field(read,6,"AA"),true,"AA",6),
                 SideCode=Field(read,8,"AA"),TradeTypeCode=Field(read,9,"AA"),OrderStatusCode=Field(read,10,"AA"),OriginalResultCode=Field(read,32,"AA"),
-                OrderQuantity=Quantity(Field(read,14,"AA"),"AA order quantity[14]"),
-                OrderPrice=Math.Abs(Number(Field(read,15,"AA"),"AA order price[15]",true)),
-                CumulativeFilledQuantity=Quantity(Field(read,16,"AA"),"AA cumulative filled[16]"),
-                ConfirmedQuantity=Quantity(Field(read,19,"AA"),"AA confirmed quantity[19]"),
-                OpenQuantity=Quantity(Field(read,20,"AA"),"AA open quantity[20]"),ReceivedUtc=utc};
-            if(result.SideCode!="01"&&result.SideCode!="02")throw new InvalidOperationException("Unsupported AA cash-stock side.");
-            if(result.TradeTypeCode!=(result.SideCode=="01"?"01":"02"))throw new InvalidOperationException("AA trade type[9] is not the matching cash buy/sell profile.");
-            if(result.OrderStatusCode!="01"&&result.OrderStatusCode!="02"&&result.OrderStatusCode!="03")throw new InvalidOperationException("AA order status[10] is unsupported.");
-            if(result.OriginalResultCode!="0"&&result.OriginalResultCode!="1")throw new InvalidOperationException("AA original-result role[32] is unsupported.");
+                OrderQuantity=Quantity(Field(read,14,"AA"),"AA",14),
+                OrderPrice=Math.Abs(Number(Field(read,15,"AA"),"AA",15,true)),
+                CumulativeFilledQuantity=Quantity(Field(read,16,"AA"),"AA",16),
+                ConfirmedQuantity=Quantity(Field(read,19,"AA"),"AA",19),
+                OpenQuantity=Quantity(Field(read,20,"AA"),"AA",20),ReceivedUtc=utc};
+            if(result.SideCode!="01"&&result.SideCode!="02")throw new RealtimeRecordException("AA",8,RealtimeFailureCode.UnsupportedCode,result.SideCode);
+            if(result.TradeTypeCode!=(result.SideCode=="01"?"01":"02"))throw new RealtimeRecordException("AA",9,RealtimeFailureCode.ProfileMismatch,result.TradeTypeCode);
+            if(result.OrderStatusCode!="01"&&result.OrderStatusCode!="02"&&result.OrderStatusCode!="03")throw new RealtimeRecordException("AA",10,RealtimeFailureCode.UnsupportedCode,result.OrderStatusCode);
+            if(result.OriginalResultCode!="0"&&result.OriginalResultCode!="1")throw new RealtimeRecordException("AA",32,RealtimeFailureCode.UnsupportedCode,result.OriginalResultCode);
             if((processing=="04"||processing=="05")&&result.OrderStatusCode!="02"||rejected&&result.OrderStatusCode!="03"||processing=="03"&&result.OrderStatusCode=="03")
-                throw new InvalidOperationException("AA processing and order status do not establish the declared event.");
-            if(result.CumulativeFilledQuantity>result.OrderQuantity||result.OpenQuantity>result.OrderQuantity)throw new InvalidOperationException("AA aggregate quantities are inconsistent.");
+                throw new RealtimeRecordException("AA",10,RealtimeFailureCode.ProfileMismatch,result.OrderStatusCode);
+            if(result.CumulativeFilledQuantity>result.OrderQuantity)throw new RealtimeRecordException("AA",16,RealtimeFailureCode.InconsistentQuantities);
+            if(result.OpenQuantity>result.OrderQuantity)throw new RealtimeRecordException("AA",20,RealtimeFailureCode.InconsistentQuantities);
             if(result.IsExecution){
                 result.ExecutionId=Field(read,22,"AA");
                 if(result.ExecutionId.Length==0||result.ExecutionId.Length>64||result.ExecutionId.All(c=>c=='0')||result.ExecutionId.Any(c=>!(char.IsLetterOrDigit(c)||c=='-'||c=='_')))
-                    throw new InvalidOperationException("AA execution identifier[22] is missing or invalid.");
-                result.IndividualFillQuantity=Quantity(Field(read,23,"AA"),"AA individual fill quantity[23]");
-                result.IndividualFillPrice=Math.Abs(Number(Field(read,24,"AA"),"AA individual fill price[24]",true));
+                    throw new RealtimeRecordException("AA",22,RealtimeFailureCode.InvalidExecution,result.ExecutionId);
+                result.IndividualFillQuantity=Quantity(Field(read,23,"AA"),"AA",23);
+                result.IndividualFillPrice=Math.Abs(Number(Field(read,24,"AA"),"AA",24,true));
                 result.Clock=Field(read,25,"AA");
-                if(result.IndividualFillQuantity<=0||result.IndividualFillQuantity>result.OrderQuantity||result.IndividualFillPrice<=0||!Clock(result.Clock))
-                    throw new InvalidOperationException("AA individual fill fields are invalid.");
+                if(result.IndividualFillQuantity<=0||result.IndividualFillQuantity>result.OrderQuantity)
+                    throw new RealtimeRecordException("AA",23,RealtimeFailureCode.InvalidQuantity);
+                if(result.IndividualFillPrice<=0)throw new RealtimeRecordException("AA",24,RealtimeFailureCode.InvalidNumber);
+                if(!Clock(result.Clock))throw new RealtimeRecordException("AA",25,RealtimeFailureCode.InvalidClock,result.Clock);
             }else{result.ExecutionId="";result.Clock=Field(read,21,"AA");}
             return result;
         }
         public static CashBalanceEvent ReadBalance(Func<int,object> read,string account,DateTime utc){
             Utc(utc);if(!AccountMatches(Field(read,0,"AD"),account)||Field(read,1,"AD")!="01")return null;
-            return new CashBalanceEvent{Code=Symbol(Field(read,2,"AD")),StockKindCode=Field(read,3,"AD"),
-                Quantity=Quantity(Field(read,6,"AD"),"AD holding quantity[6]"),AveragePrice=Number(Field(read,7,"AD"),"AD average price[7]"),
-                OrderableQuantity=Quantity(Field(read,8,"AD"),"AD orderable quantity[8]"),SellPendingQuantity=Quantity(Field(read,9,"AD"),"AD sell pending[9]"),
-                Price=Math.Abs(Number(Field(read,20,"AD"),"AD current price[20]",true)),ReceivedUtc=utc};
+            return new CashBalanceEvent{Code=Symbol(Field(read,2,"AD"),"AD",2),StockKindCode=Field(read,3,"AD"),
+                Quantity=Quantity(Field(read,6,"AD"),"AD",6),AveragePrice=Number(Field(read,7,"AD"),"AD",7),
+                OrderableQuantity=Quantity(Field(read,8,"AD"),"AD",8),SellPendingQuantity=Quantity(Field(read,9,"AD"),"AD",9),
+                Price=Math.Abs(Number(Field(read,20,"AD"),"AD",20,true)),ReceivedUtc=utc};
         }
     }
 
@@ -111,6 +160,7 @@ namespace ShinhanNativeTrader {
         readonly Dictionary<string,RealtimeQuote> quotes=new Dictionary<string,RealtimeQuote>(StringComparer.Ordinal);
         string account;bool disposed;
         public bool Failed {get;private set;}
+        public RealtimeFailureEvidence LastFailure {get;private set;}
         public bool AccountStreamObserved {get;private set;}
         public RealtimeDiagnostics Diagnostics {get;}=new RealtimeDiagnostics();
         public event Action<RealtimeQuote> QuoteReceived;
@@ -127,7 +177,9 @@ namespace ShinhanNativeTrader {
         public void Process(object kind,DateTime utc){
             if(disposed||Failed)return;
             Diagnostics.RecordCallback(kind,utc);
-            var type=kind as string;if(type==null){Fail("실시간 이벤트 형식이 지원되지 않습니다.");return;}
+            var type=kind as string;
+            if(type==null){LastFailure=new RealtimeFailureEvidence(RealtimeRecordKind.Event,-1,RealtimeFailureCode.EventType);Fail(LastFailure.SafeDiagnostic);return;}
+            bool publishing=false;
             try {
                 if(type=="SC") {
                     var quote=RealtimeRecordParser.ReadQuote(read,utc);RealtimeQuote previous;
@@ -142,13 +194,19 @@ namespace ShinhanNativeTrader {
                         quote.MarketCode!="1"?RealtimeQuoteState.NonRegularMarket:regressed?RealtimeQuoteState.Regressed:
                         quote.SequenceConfirmed?RealtimeQuoteState.Confirmed:previous==null?RealtimeQuoteState.FirstTick:RealtimeQuoteState.Replay;
                     Diagnostics.ObserveQuote(quote,state);
-                    quotes[quote.Code]=quote.Copy();if(QuoteReceived!=null)QuoteReceived(quote.Copy());
+                    quotes[quote.Code]=quote.Copy();publishing=true;if(QuoteReceived!=null)QuoteReceived(quote.Copy());
                 }else if(type=="AA") {
-                    var value=RealtimeRecordParser.ReadOrder(read,account,utc);if(value==null)return;AccountStreamObserved=true;if(OrderReceived!=null)OrderReceived(value);
+                    var value=RealtimeRecordParser.ReadOrder(read,account,utc);if(value==null)return;AccountStreamObserved=true;publishing=true;if(OrderReceived!=null)OrderReceived(value);
                 }else if(type=="AD") {
-                    var value=RealtimeRecordParser.ReadBalance(read,account,utc);if(value==null)return;AccountStreamObserved=true;if(BalanceReceived!=null)BalanceReceived(value);
+                    var value=RealtimeRecordParser.ReadBalance(read,account,utc);if(value==null)return;AccountStreamObserved=true;publishing=true;if(BalanceReceived!=null)BalanceReceived(value);
                 }
-            }catch(Exception ex){Fail("실시간 "+(type=="SC"||type=="AA"||type=="AD"?type:"event")+" 처리 실패 ("+ex.GetBaseException().GetType().Name+"). 공급자 원문 생략.");}
+            }catch(Exception error){
+                var record=error as RealtimeRecordException;
+                var recordKind=type=="SC"?RealtimeRecordKind.SC:type=="AA"?RealtimeRecordKind.AA:type=="AD"?RealtimeRecordKind.AD:RealtimeRecordKind.Event;
+                LastFailure=!publishing&&record!=null?record.Evidence:new RealtimeFailureEvidence(recordKind,-1,
+                    publishing?RealtimeFailureCode.SubscriberFailure:RealtimeFailureCode.ReadFailure);
+                Fail(LastFailure.SafeDiagnostic);
+            }
         }
         public bool TryGetQuote(string code,DateTime utc,out RealtimeQuote quote){
             if(utc.Kind!=DateTimeKind.Utc)throw new ArgumentException("UTC quote evaluation time required.");
@@ -172,6 +230,7 @@ namespace ShinhanNativeTrader {
         public bool Connected {get{return !disposed&&!Failed&&native!=null;}}
         public bool Failed {get{return failed||processor.Failed;}}
         public bool AccountSubscribed {get;private set;}
+        public RealtimeFailureEvidence LastFailure {get{return processor==null?null:processor.LastFailure;}}
         public bool AccountStreamObserved {get{return processor.AccountStreamObserved;}}
         public int QuoteSubscriptionCount {get{return watch.Count;}}
         public string DiagnosticsSummary(DateTime utc){return processor.Diagnostics.Describe(utc);}

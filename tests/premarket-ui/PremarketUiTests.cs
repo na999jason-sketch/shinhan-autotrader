@@ -304,8 +304,9 @@ static class PremarketUiTests {
     }
     sealed class NoOrderWire : ILiveOrderWire,ILiveOrderChannelPreparation {
         public int Sends,Preparations;
+        public Action DuringPreparation;
         public event Action<LiveOrderAcknowledgement> Acknowledged {add{} remove{}}
-        public void PrepareChannel(){Preparations++;}
+        public void PrepareChannel(){Preparations++;if(DuringPreparation!=null)DuringPreparation();}
         public int Send(LiveOrderIntent intent,LiveAccountCredentials credentials,LiveOrderPreflight checks,DateTime utc) {
             Sends++;throw new InvalidOperationException("This UI fixture must never transmit even a synthetic order.");
         }
@@ -370,6 +371,50 @@ static class PremarketUiTests {
             }
         }
     }
+    static void AcceptedUnknownStatus(string data) {
+        using(var form=NewForm()) {
+            var fixture=new Fixture(form);Bind(form);
+            using(var journal=new LiveOrderJournal(Path.Combine(data,"ui-accepted-unknown-journal.xml"))) {
+                journal.BindAccount("12345678901");Set(form,"journal",journal);
+                var historical=RejectedSell(journal,"305720","historical-rejection",31,false);
+                var accepted=journal.Prepare(new LiveOrderIntent{Kind=LiveOrderKind.Sell,Code="069500",Quantity=2,LimitPrice=83775,ClientKey="accepted-reconciliation"},Opening.AddSeconds(2));
+                journal.MarkDispatching(accepted.Id,Opening.AddSeconds(2));journal.MarkRequestAccepted(accepted.Id,32,Opening.AddSeconds(2));
+                var fields=new[]{"0","000000000000812345","0","","1","총주문금액 :167,550","가계산수수료 :830","가계산제세금 :0"};
+                var evidence=LiveOrderResponseParser.Read(32,index=>fields[index],new IndiDiagnosticSnapshot{CommState=0,ErrorState=0},OrderResponseLayout.Modern,new string[0]);
+                journal.RecordAcknowledgement(accepted.Id,32,evidence.BrokerOrderNumber,false,Opening.AddSeconds(2),evidence);
+                Call(form,"RefreshOrders");var grid=Get<DataGridView>(form,"ordersGrid");
+                var historicalRow=grid.Rows.Cast<DataGridViewRow>().Single(row=>(row.Tag as LiveOrderRecord).Id==historical.Id);
+                grid.ClearSelection();grid.CurrentCell=historicalRow.Cells[0];historicalRow.Selected=true;
+                Call(form,"OnGatewayOrderChanged",journal.Snapshot.Orders.Single(order=>order.Id==accepted.Id));
+                Check((grid.SelectedRows[0].Tag as LiveOrderRecord).Id==accepted.Id&&Get<TextBox>(form,"orderResponseDetails").Text.Contains("result=Accepted"),
+                    "a newly accepted response selects its own row and details instead of an older rejection");
+                journal.MarkUnknown(accepted.Id,Opening.AddSeconds(3));Call(form,"RefreshOrders");
+                var current=grid.Rows.Cast<DataGridViewRow>().Single(row=>(row.Tag as LiveOrderRecord).Id==accepted.Id);
+                Check(Convert.ToString(current.Cells["확인상태"].Value,CultureInfo.InvariantCulture)=="접수 확인 · 체결 대사 필요"
+                    &&Get<TextBox>(form,"orderResponseDetails").Text.Contains("접수 응답과 주문번호 확인")
+                    &&journal.RecoveryRequired&&journal.Snapshot.Orders.Single(order=>order.Id==accepted.Id).Status==LiveOrderStatus.Unknown,
+                    "accepted broker identity remains visible while durable Unknown and recovery restrictions remain unchanged");
+                historicalRow=grid.Rows.Cast<DataGridViewRow>().Single(row=>(row.Tag as LiveOrderRecord).Id==historical.Id);
+                grid.ClearSelection();grid.CurrentCell=historicalRow.Cells[0];historicalRow.Selected=true;Call(form,"RefreshOrders");
+                Check((grid.SelectedRows[0].Tag as LiveOrderRecord).Id==historical.Id&&Get<TextBox>(form,"orderResponseDetails").Text=="이전 버전: 상세 응답 미기록",
+                    "periodic order refresh preserves the user's selected historical record");
+                var brokerSnapshot=new BrokerOrdersSnapshot{TradingDate=MarketTime.ToKorea(Opening).ToString("yyyyMMdd",CultureInfo.InvariantCulture),ReceivedUtc=Opening.AddSeconds(4)};
+                var brokerRow=new BrokerOrderRow{OrderNumber="812345",Code="069500",SideCode="1",Quantity=2,FilledQuantity=0,OpenQuantity=2,LimitPrice=83775};
+                brokerSnapshot.Orders.Add(brokerRow);Set(form,"brokerOrders",brokerSnapshot);
+                Set(form,"preferredOrderSelectionKey","broker:"+brokerSnapshot.TradingDate+":069500:812345");Call(form,"RefreshOrders");
+                Check(grid.Rows.Count==2&&ReferenceEquals(grid.SelectedRows[0].Tag,brokerRow)
+                    &&Convert.ToString(grid.SelectedRows[0].Cells["확인상태"].Value,CultureInfo.InvariantCulture)=="접수 확인 · 체결 대사 필요"
+                    &&Get<TextBox>(form,"orderResponseDetails").Text.Contains("result=Accepted"),
+                    "unpadded broker snapshot merges its padded ACK identity without duplicates and retains response evidence and broker-row actions");
+                brokerRow.ConfirmationCode="1";Call(form,"RefreshOrders");
+                Check(Convert.ToString(grid.SelectedRows[0].Cells["확인상태"].Value,CultureInfo.InvariantCulture)=="증권사 거부 · 대사 필요"
+                    &&Get<TextBox>(form,"orderResponseDetails").Text.Contains("result=Accepted")&&journal.RecoveryRequired,
+                    "a later broker rejection takes display priority while preserving earlier acceptance evidence and recovery requirements");
+                Check(fixture.Wire.Queries.Count==1,"accepted reconciliation presentation sends no broker query or order");
+                Close(form,data);
+            }
+        }
+    }
     static void RejectedSellQueue(string data) {
         using(var form=NewForm()) {
             var fixture=new Fixture(form);Bind(form);Get<UnattendedSession>(form,"session").Tick(Opening,false);
@@ -390,6 +435,18 @@ static class PremarketUiTests {
                 Set(realtime,"processor",processor);Set(realtime,"watch",new HashSet<string>(StringComparer.Ordinal){"069500"});Set(realtime,"native",new object());
                 Set(form,"realtime",realtime);Get<HashSet<string>>(form,"trackedQuotes").Add("069500");
                 Call(form,"RefreshOrders");var grid=Get<DataGridView>(form,"ordersGrid");grid.ClearSelection();grid.CurrentCell=grid.Rows[0].Cells[0];grid.Rows[0].Selected=true;
+                Set(form,"monitoring",true);
+                wire.DuringPreparation=()=>{
+                    wire.DuringPreparation=null;
+                    Check(Get<bool>(form,"orderPreparing")&&Get<object>(form,"entry")==null,
+                        "order initialization claims its guard before a fake StartIndi can pump callbacks");
+                    Schedule(form,utc);
+                    Check(wire.Preparations==1&&Get<object>(form,"entry")==null&&fixture.Wire.Queries.Count==1,
+                        "a scheduler tick pumped during initialization cannot prepare a second order or issue a TR");
+                    bool duplicateRefused=false;try{Call(form,"RetrySelectedRejectedSellAt",utc);}catch(InvalidOperationException){duplicateRefused=true;}
+                    Check(duplicateRefused&&wire.Preparations==1&&wire.Sends==0&&Get<LiveTradingSession>(form,"authorization").Active,
+                        "a retry click pumped during preparation is refused without revoking the original authorized operation");
+                };
                 Call(form,"RetrySelectedRejectedSellAt",utc);
                 var pending=Get<object>(form,"entry");
                 var intent=pending==null?null:(LiveOrderIntent)pending.GetType().GetField("Intent").GetValue(pending);
@@ -402,9 +459,26 @@ static class PremarketUiTests {
                 Check(journal.Snapshot.Orders.Count==1&&journal.Snapshot.Orders.Single().Id==previous.Id
                     &&journal.Snapshot.Orders.Single().Status==LiveOrderStatus.Rejected&&wire.Sends==0&&wire.Preparations==1&&fixture.Wire.Queries.Count==1,
                     "queueing a manual retry preserves rejected audit history and transmits no order or additional query");
+                Check(!Get<bool>(form,"orderPreparing")&&Get<Label>(form,"orderGate").Text.Contains("새 주문 069500 / 사전검증 대기"),
+                    "successful initialization releases its guard and visibly identifies a new pending intent");
                 bool refused=false;try{Call(form,"RetrySelectedRejectedSellAt",utc);}catch(InvalidOperationException){refused=true;}
                 Check(refused&&ReferenceEquals(Get<object>(form,"entry"),pending)&&wire.Sends==0&&wire.Preparations==1,
                     "repeated retry clicks cannot replace an already queued preflight or transmit an order");
+                Call(form,"RunPreflight",utc.AddMilliseconds(2));
+                Check(Get<Label>(form,"orderGate").Text.Contains("새 주문 069500 / 완료봉 조회 응답 대기")&&fixture.Api.Busy,
+                    "fresh selected retry displays its actual preflight read stage before any transmission");
+                fixture.Wire.Complete();Set(form,"entry",null);
+                wire.DuringPreparation=()=>Get<LiveTradingSession>(form,"authorization").Revoke();
+                Call(form,"RetrySelectedRejectedSellAt",utc);
+                Check(!Get<bool>(form,"orderPreparing")&&Get<object>(form,"entry")==null&&wire.Sends==0
+                    &&Get<Label>(form,"state").Text.Contains("새 주문 준비 중단"),
+                    "authorization revoked during channel initialization cannot leave a queued order and reports why preparation stopped");
+                Get<LiveTradingSession>(form,"authorization").Authorize("12345678901",BeforeOpen);
+                wire.DuringPreparation=()=>{throw new InvalidOperationException("Synthetic initialization failure");};
+                bool initializationFailed=false;try{Call(form,"RetrySelectedRejectedSellAt",utc);}catch(InvalidOperationException){initializationFailed=true;}
+                Check(initializationFailed&&!Get<bool>(form,"orderPreparing")&&!Get<LiveTradingSession>(form,"authorization").Active
+                    &&Get<object>(form,"entry")==null&&wire.Sends==0&&journal.Snapshot.Orders.Count==1,
+                    "channel initialization failure releases the guard revokes authorization and preserves all prior audit records");
                 Close(form,data);
             }
         }
@@ -458,7 +532,7 @@ static class PremarketUiTests {
 
     static void Run(string data,string screenshot) {
         using(var form=NewForm()) {
-            Check(form.Text.Contains("2.2.6"),"premarket regression runs against version 2.2.6");
+            Check(form.Text.Contains("2.2.7"),"premarket regression runs against version 2.2.7");
             Check(All(form).OfType<Button>().Any(button=>button.Text=="조회 정의 내보내기"),"static query-definition export is available without invoking registry COM or provider queries");
             Check(!Get<LiveTradingSession>(form,"authorization").Active,"application startup never authorizes live orders");
             var fixture=new Fixture(form);Bind(form);
@@ -572,7 +646,9 @@ static class PremarketUiTests {
         RealtimeStatus(data);
         OrdinarySourceStatus(data);
         RejectedOrderStatus(data);
+        AcceptedUnknownStatus(data);
         RejectedSellQueue(data);
+        AcceptedRealtimeFaultCases.Run(data,Check);
         DeferredReadStatus(data);
     }
 
@@ -601,5 +677,115 @@ static class PremarketUiTests {
                 catch(Exception error){Console.Error.WriteLine(error);exit=1;}
         }
         return exit;
+    }
+}
+
+// Synthetic integration only: the actual form's ACK/AA/AD subscribers run,
+// while the broker boundary is an in-memory wire and no COM object is created.
+static class AcceptedRealtimeFaultCases {
+    static readonly BindingFlags Hidden=BindingFlags.Instance|BindingFlags.NonPublic;
+    static readonly DateTime Utc=new DateTime(2026,11,12,0,15,30,DateTimeKind.Utc);
+    static T Get<T>(object owner,string name){return (T)owner.GetType().GetField(name,Hidden).GetValue(owner);}
+    static void Set(object owner,string name,object value){owner.GetType().GetField(name,Hidden).SetValue(owner,value);}
+    static void Call(object owner,string name,params object[] values){
+        try{owner.GetType().GetMethod(name,Hidden).Invoke(owner,values);}
+        catch(TargetInvocationException error){throw error.InnerException??error;}
+    }
+    static T Handler<T>(MainForm form,string name) where T:class {
+        return Delegate.CreateDelegate(typeof(T),form,typeof(MainForm).GetMethod(name,Hidden)) as T;
+    }
+    sealed class Wire : ILiveOrderWire {
+        public event Action<LiveOrderAcknowledgement> Acknowledged;
+        public int Sends;
+        public int Send(LiveOrderIntent intent,LiveAccountCredentials credentials,LiveOrderPreflight checks,DateTime utc){Sends++;return 2201;}
+        public void Accept(){
+            var values=new[]{"0","000812345","0","777","0","synthetic accepted","0","0"};
+            var evidence=LiveOrderResponseParser.Read(2201,index=>values[index],new IndiDiagnosticSnapshot{ErrorState=0},OrderResponseLayout.Modern,new[]{"12345678901","1111"});
+            if(Acknowledged!=null)Acknowledged(new LiveOrderAcknowledgement{RequestId=2201,BrokerOrderNumber=evidence.BrokerOrderNumber,ResponseEvidence=evidence});
+        }
+        public void Dispose(){}
+    }
+    static Dictionary<int,object> AA(string clock) {
+        return new Dictionary<int,object>{{0,"03"},{2,"12345678901"},{4,"01"},{5,"812345"},{6,"0"},{8,"01"},{9,"01"},{10,"02"},{11,"A069500"},
+            {14,"2"},{15,"86295"},{16,"2"},{19,"0"},{20,"0"},{21,"091531"},{22,"F0002"},{23,"2"},{24,"86295"},{25,clock},{32,"0"}};
+    }
+    static Dictionary<int,object> AD() {
+        return new Dictionary<int,object>{{0,"12345678901"},{1,"01"},{2,"A069500"},{3,"0"},{6,"0"},{7,""},{8,"0"},{9,"0"},{20,"86295"}};
+    }
+    public static void Run(string data,Action<bool,string> check) {
+        foreach(var scenario in new[]{"AA-valid","AA-clock8","AD-blank-average"})RunCase(data,scenario,check);
+    }
+    static void RunCase(string data,string scenario,Action<bool,string> check) {
+        using(var form=new MainForm()) {
+            Get<Timer>(form,"scheduler").Stop();form.ShowInTaskbar=false;form.Show();Application.DoEvents();Get<Timer>(form,"scheduler").Stop();
+            var credentialType=typeof(MainForm).Assembly.GetType("ShinhanNativeTrader.AccountCredentialSession",true);
+            var credential=Activator.CreateInstance(credentialType,new object[]{"12345678901","1111"});
+            var key=(string)credentialType.GetProperty("Key").GetValue(credential,null);
+            Set(form,"credentials",credential);Set(form,"boundKey",key);Set(form,"lastReportKey",key);
+            var authorization=Get<LiveTradingSession>(form,"authorization");authorization.Authorize("12345678901",Utc);
+            var session=Get<UnattendedSession>(form,"session");session.Arm(Utc);session.Tick(Utc,false);
+            string path=Path.Combine(data,"accepted-rt-"+scenario+".xml");
+            using(var journal=new LiveOrderJournal(path)) {
+                journal.BindAccount("12345678901");Set(form,"journal",journal);
+                var readiness=new BrokerReadiness(key,journal.Snapshot.AccountFingerprint);readiness.SetAuthorization(true);readiness.SetAccountStream(true,true,Utc);Set(form,"readiness",readiness);
+                var router=new BrokerAccountEventRouter(journal,Handler<Action<DateTime,string>>(form,"OnAccountInvalidated"));
+                router.Changed+=Handler<Action<LiveOrderRecord>>(form,"OnBrokerOrderChanged");
+                router.SetBrokerDate(MarketTime.ToKorea(Utc).ToString("yyyyMMdd",CultureInfo.InvariantCulture),Utc);Set(form,"accountEvents",router);
+                var fields=AA("091532");var processor=new RealtimeEventProcessor(index=>fields.ContainsKey(index)?fields[index]:"");processor.BindAccount("12345678901");
+                var realtime=(RealtimeIndi)FormatterServices.GetUninitializedObject(typeof(RealtimeIndi));
+                Set(realtime,"processor",processor);Set(realtime,"watch",new HashSet<string>());Set(realtime,"native",new object());
+                Set(realtime,"<AccountSubscribed>k__BackingField",true);Set(form,"realtime",realtime);
+                processor.OrderReceived+=Handler<Action<CashOrderEvent>>(form,"OnRealtimeOrder");
+                processor.BalanceReceived+=Handler<Action<CashBalanceEvent>>(form,"OnRealtimeBalance");
+                processor.Faulted+=ignored=>Call(form,"OnRealtimeFailure","UNTRUSTED account12345678901 raw09153212");
+                var wire=new Wire();var gateway=new LiveOrderGateway(journal,wire,()=>Utc);gateway.OrderChanged+=Handler<Action<LiveOrderRecord>>(form,"OnGatewayOrderChanged");Set(form,"gateway",gateway);
+                var checks=new LiveOrderPreflight{Authorization=authorization,EvidenceStillCurrent=()=>true,AccountAuthorized=true,OrderableAmountVerified=true,
+                    SellableQuantityVerified=true,OrdersReconciled=true,FillsReconciled=true,RecoveryVerified=true,PriceRuleVerified=true,QuoteVerified=true,
+                    SellableQuantity=2,SnapshotUtc=Utc,QuoteUtc=Utc,OperatingLimit=1000000};
+                var sent=gateway.Submit(new LiveOrderIntent{Kind=LiveOrderKind.Sell,Code="069500",Quantity=2,LimitPrice=86295,ClientKey="synthetic-"+scenario},
+                    new LiveAccountCredentials("12345678901","1111"),checks,Utc);
+                check(wire.Sends==1&&sent.Status==LiveOrderStatus.AwaitingAcknowledgement,scenario+": fake wire submission waits for actual ACK subscriber processing");
+                wire.Accept();var accepted=journal.Snapshot.Orders.Single();
+                check(accepted.Status==LiveOrderStatus.Working&&accepted.BrokerOrderNumber=="000812345"&&accepted.ResponseEvidence.Disposition==OrderResponseDisposition.Accepted,
+                    scenario+": modern positive KRX ACK traverses actual form listeners and remains accepted before RT data");
+                if(scenario=="AA-clock8")fields=AA("09153212");
+                if(scenario=="AD-blank-average")fields=AD();
+                processor.Process(scenario.StartsWith("AD",StringComparison.Ordinal)?"AD":"AA",Utc.AddSeconds(2));
+                if(scenario=="AA-valid") {
+                    var filled=journal.Snapshot.Orders.Single();
+                    check(!processor.Failed&&filled.Status==LiveOrderStatus.Filled&&filled.FilledQuantity==2&&journal.Snapshot.Executions.Count==1,
+                        scenario+": valid six-digit AA execution traverses the actual router and preserves a confirmed fill");
+                }else {
+                    var failure=processor.LastFailure;
+                    check(processor.Failed&&failure!=null&&failure.FieldIndex==(scenario=="AA-clock8"?25:7),
+                        scenario+": RT parser preserves the exact synthetic failure field without publishing a fabricated fill");
+                    LiveOrderJournalState persisted;
+                    using(var saved=File.OpenRead(path))persisted=(LiveOrderJournalState)new System.Xml.Serialization.XmlSerializer(typeof(LiveOrderJournalState)).Deserialize(saved);
+                    {
+                        var uncertain=persisted.Orders.Single();
+                        check(uncertain.Status==LiveOrderStatus.Unknown&&uncertain.BrokerOrderNumber=="000812345"
+                            &&uncertain.ResponseEvidence.Disposition==OrderResponseDisposition.Accepted&&uncertain.FilledQuantity==0&&persisted.Executions.Count==0,
+                            scenario+": actual RT-failure handler stops operations while retaining accepted broker identity and ACK evidence durably");
+                    }
+                    check(Get<object>(form,"credentials")==null&&!authorization.Active&&wire.Sends==1,
+                        scenario+": RT failure revokes the account session and never resends the accepted order");
+                    var grid=Get<DataGridView>(form,"ordersGrid");
+                    check(grid.Rows.Count==1&&Convert.ToString(grid.Rows[0].Cells["주문번호"].Value,CultureInfo.InvariantCulture)=="000812345",
+                        scenario+": the actual order grid retains the positive broker order number after reconciliation becomes necessary");
+                    check(Convert.ToString(grid.Rows[0].Cells["확인상태"].Value,CultureInfo.InvariantCulture)=="접수 확인 · 체결 대사 필요"
+                        &&Get<TextBox>(form,"orderResponseDetails").Text.Contains("result=Accepted"),
+                        scenario+": stopped order display preserves broker acceptance while explicitly requiring fill reconciliation");
+                    string diagnostic=Get<Label>(form,"realtimeFailureStatus").Text;
+                    string logged=Get<TextBox>(form,"logs").Text;
+                    check(diagnostic.Contains(failure.SafeDiagnostic)&&diagnostic.Contains("kind="+failure.Kind)
+                        &&diagnostic.Contains("field="+failure.FieldIndex.ToString(CultureInfo.InvariantCulture))&&diagnostic.Contains("shape=")
+                        &&logged.Contains(failure.SafeDiagnostic)&&!logged.Contains("UNTRUSTED")&&!logged.Contains("raw09153212")&&!logged.Contains("12345678901"),
+                        scenario+": parser-owned kind field and shape survive Halt visibly and in logs without arbitrary callback text");
+                }
+                form.Close();
+                using(var lease=new FileStream(Path.Combine(data,"live-settings-v1.xml.lock"),FileMode.Open,FileAccess.ReadWrite,FileShare.None))
+                    check(lease.CanWrite,scenario+": actual form cleanup releases its settings lease");
+            }
+        }
     }
 }

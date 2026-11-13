@@ -16,7 +16,7 @@ namespace ShinhanNativeTrader {
         public AccountUserActionException(string message):base(message){}
     }
     internal static class Program {
-        internal const string Version="2.2.6";
+        internal const string Version="2.2.7";
         [STAThread]
         static int Main(string[] args) {
             if(args.Contains("--selftest")) {
@@ -112,6 +112,7 @@ namespace ShinhanNativeTrader {
             reportStatus=new Label{AutoSize=true,Text="보고서: 계좌 조회 응답 후 자동 저장 (CSV)"},
             researchStatus=new Label{AutoSize=true,Text="장전 분석: 미준비 / 실주문 시작 또는 전체 스캔으로 준비"},
             quoteStatus=new Label{AutoSize=true,Text="실시간 SC: 아직 수신 확인 전 / 수동 현재가 조회와 별도"},
+            realtimeFailureStatus=new Label{AutoSize=true,ForeColor=Color.DarkRed},
             basisStatus=new Label{AutoSize=true,Text="주문 잔고기준: 미조회"};
         readonly DataGridView holdingsGrid=Grid("코드","종목명","수량","평균단가","현재가","매입금액","평가금액","평가손익","수익률(%)","시세 조회시각","매도판정"),
             ordersGrid=Grid("주문번호","종목","구분","주문수량","누적체결","미체결","주문단가","체결평균가","확인상태","응답 사유"),
@@ -154,10 +155,11 @@ namespace ShinhanNativeTrader {
         DateTime? holdingsReceivedUtc;
         bool orderAcknowledgementPending;
         DateTime nextAccountReadUtc=DateTime.SpecifyKind(DateTime.MinValue,DateTimeKind.Utc),nextReportUtc=DateTime.SpecifyKind(DateTime.MinValue,DateTimeKind.Utc);
-        bool scanning,requestedScan,monitoring,firstQueryQueued,pendingSessionScan,storageFault,closingForm,realtimeFailed,displayDirty,submitting,preflightDirty,liveDayCompleted;
+        bool scanning,requestedScan,monitoring,firstQueryQueued,pendingSessionScan,storageFault,closingForm,realtimeFailed,displayDirty,submitting,preflightDirty,liveDayCompleted,orderPreparing;
         int scanned,holdingRequests,connectionEpoch;
         string boundKey,lastReportKey;
         string gateDetail="실주문 미시작";
+        string preferredOrderSelectionKey;
         string lastBasisDiagnostic;
         string lastCashProfileDiagnostic;
         DateTime? lastBasisDiagnosticUtc;
@@ -189,7 +191,7 @@ namespace ShinhanNativeTrader {
             state.Text="Indi 연결 후 계좌를 조회하고 부재중 운영을 시작하십시오.";
             var statusArea=new FlowLayoutPanel{Dock=DockStyle.Fill,FlowDirection=FlowDirection.TopDown,WrapContents=false};
             statusArea.SizeChanged+=(s,e)=>{quoteStatus.MaximumSize=new Size(Math.Max(400,statusArea.ClientSize.Width-12),0);};
-            statusArea.Controls.Add(state);statusArea.Controls.Add(reportStatus);statusArea.Controls.Add(researchStatus);statusArea.Controls.Add(quoteStatus);statusArea.Controls.Add(basisStatus);root.Controls.Add(statusArea,0,2);
+            statusArea.Controls.Add(state);statusArea.Controls.Add(reportStatus);statusArea.Controls.Add(researchStatus);statusArea.Controls.Add(quoteStatus);statusArea.Controls.Add(basisStatus);statusArea.Controls.Add(realtimeFailureStatus);root.Controls.Add(statusArea,0,2);
             var summary=new FlowLayoutPanel{Dock=DockStyle.Fill};summary.Controls.Add(portfolio);summary.Controls.Add(cashLabel);root.Controls.Add(summary,0,3);
             var tabs=new TabControl{Dock=DockStyle.Fill};root.Controls.Add(tabs,0,4);
             AddTab(tabs,"실계좌 잔고·손익",holdingsGrid);
@@ -307,7 +309,7 @@ namespace ShinhanNativeTrader {
             nextAccountReadUtc=DateTime.UtcNow;QueueAccountRefresh();UpdateOrderStatus("계좌 변동 후 최신 조회 중");
         }
         void OnGatewayOrderChanged(LiveOrderRecord record) {
-            if(record!=null&&record.ResponseEvidence!=null){Log("주문 응답 "+record.Code+" / "+record.ResponseEvidence.SafeDiagnostic);UpdateOrderStatus("주문 응답 "+record.Code+" / "+LocalOrderStatus(record.Status));}
+            if(record!=null&&record.ResponseEvidence!=null){preferredOrderSelectionKey=OrderRowKey(record);Log("주문 응답 "+record.Code+" / "+record.ResponseEvidence.SafeDiagnostic);UpdateOrderStatus("주문 응답 "+record.Code+" / "+LocalOrderStatusForRecord(record));}
             if(readiness!=null)readiness.Invalidate(DateTime.UtcNow);
             if(accountEvents!=null)accountEvents.DrainOnGatewayOrderChanged();
             OnBrokerOrderChanged(record);
@@ -320,9 +322,15 @@ namespace ShinhanNativeTrader {
         }
         void OnRealtimeFailure(string ignoredProviderText) {
             if(realtimeFailed)return;realtimeFailed=true;bool mustStop=authorization.Active||(journal!=null&&journal.Snapshot.Orders.Any(LiveOrderJournal.IsUnresolved));
+            // Copy the parser-owned, finite evidence before invalidation can
+            // synchronously Halt and dispose the realtime processor. Never copy
+            // arbitrary provider text from a callback into a durable diagnostic.
+            var failure=realtime==null?null:realtime.LastFailure;
+            string diagnostic=failure==null?"RealtimeFailure kind=Event; field=none; code=ChannelFailure. Provider values omitted.":failure.SafeDiagnostic;
+            realtimeFailureStatus.Text="마지막 실시간 오류: "+diagnostic;Log(diagnostic);
             authorization.Revoke();if(readiness!=null){readiness.SetAuthorization(false);readiness.SetAccountStream(false,DateTime.UtcNow);}
             if(gateway!=null)gateway.Invalidate(DateTime.UtcNow);
-            if(mustStop){Halt();Log("실시간 연결 오류로 실주문 운영을 중단했습니다. 다시 연결하고 시작해야 합니다.");}
+            if(mustStop){Halt();state.Text="실시간 오류로 신규 주문 중단 / 접수 주문·체결 상태 확인 필요";Log("실시간 연결 오류로 실주문 운영을 중단했습니다. 접수된 주문의 체결·미체결 대사가 필요합니다.");}
             else{UpdateOrderStatus("실시간 연결 미확인 / 조회 감시 유지");Log("실시간 연결 미확인. 조회용 가격만 표시합니다.");}
         }
 
@@ -497,6 +505,9 @@ namespace ShinhanNativeTrader {
         void Schedule(){ScheduleAt(DateTime.UtcNow);}
         void ScheduleAt(DateTime now) {
             if(now.Kind!=DateTimeKind.Utc)throw new ArgumentException("UTC scheduler time required.");
+            // StartIndi can pump the STA message loop. Leave the outer order
+            // preparation responsible for revalidating its account and session.
+            if(orderPreparing)return;
             if(api!=null)api.PollReadOnlyRetry(now);
             // Persist the copied account state independently of TR queues and
             // preflight work. A busy broker must not starve a due report.
@@ -685,7 +696,7 @@ namespace ShinhanNativeTrader {
             return journal.Snapshot.Orders.Any(x=>(x.ClientKey==intent.ClientKey&&x.Status!=LiveOrderStatus.NotSent)||((intent.Kind==LiveOrderKind.Buy||intent.Kind==LiveOrderKind.Sell)&&x.Code==intent.Code&&LiveOrderJournal.IsUnresolved(x)));
         }
         void QueueOrder(LiveOrderIntent intent,RealtimeQuote quote,Candidate candidate,bool autoSize,DateTime now) {
-            if(!LiveStarted||entry!=null||gateway==null||gateway.Busy||readiness==null||journal==null)return;
+            if(orderPreparing||!LiveStarted||entry!=null||gateway==null||gateway.Busy||readiness==null||journal==null)return;
             if(journal.RecoveryRequired){Halt();Log("실주문 결과 불명 상태를 먼저 증권사와 대사해야 합니다.");return;}
             try{LiveOrderProtocol.ValidateIntent(intent);}catch(ArgumentException){UpdateOrderStatus("주문 종목·수량·가격 확인 필요");return;}
             CashInstrument instrument;instruments.TryGetValue(intent.Code,out instrument);
@@ -696,9 +707,18 @@ namespace ShinhanNativeTrader {
             // Initialize the dedicated order control before invalidating and
             // collecting fresh proofs. Initial account queries never create it.
             var activeGateway=gateway;string accountBinding=boundKey;
-            activeGateway.PrepareChannel();
-            if(gateway!=activeGateway||boundKey!=accountBinding||!LiveStarted||!ActiveSession||readiness==null)return;
+            orderPreparing=true;UpdateOrderStatus("새 주문 "+intent.Code+" / 전송 채널 초기화 중");
+            try{activeGateway.PrepareChannel();}
+            catch{
+                authorization.Revoke();if(readiness!=null)readiness.SetAuthorization(false);
+                state.Text="주문 채널 초기화 실패 / 실주문 시작 해제";UpdateOrderStatus();Log(state.Text);throw;
+            }finally{orderPreparing=false;}
+            if(gateway!=activeGateway||boundKey!=accountBinding||!LiveStarted||!ActiveSession||readiness==null) {
+                state.Text="새 주문 준비 중단 / 계좌·운영 시작·장중 상태가 변경되었습니다.";
+                UpdateOrderStatus(state.Text);Log(state.Text);return;
+            }
             entry=new EntryRequest{Intent=intent,Quote=quote,Candidate=candidate,AutoSize=autoSize};RestartPreflight(now,false);
+            UpdateOrderStatus("새 주문 "+intent.Code+" / 사전검증 대기 (기존 주문 기록 유지)");
         }
         void RestartPreflight(DateTime now,bool delay) {
             if(entry==null)return;entry.Reads.Clear();entry.WaitingFor=null;entry.Capacity=null;entry.Attempts++;
@@ -723,6 +743,8 @@ namespace ShinhanNativeTrader {
                 entry.Quote=quote;
             }
             entry.Reads.Dequeue();entry.WaitingFor=kind;
+            string step=kind=="BARS"?"완료봉":kind=="ORDINARYHOLDINGS"?"현물 잔고":kind=="CASH"?"주문가능 현금":kind=="TRADEHOLDINGS"?"매매기준 잔고":kind=="ORDERS"?"증권사 금일 주문":"주문가능 수량";
+            UpdateOrderStatus("새 주문 "+entry.Intent.Code+" / "+step+" 조회 응답 대기");
             if(kind=="BARS"){requestedScan=false;api.Bars(entry.Intent.Code,2);return;}
             if(kind=="CAPACITY")credentials.Use((number,secret)=>api.Capacity(number,secret,entry.Intent.Code,entry.Intent.LimitPrice));
             else ReadAccountKind(kind,now);
@@ -796,7 +818,7 @@ namespace ShinhanNativeTrader {
         void ChangeSelectedOrder(bool amend) {
             RequireIdle();if(credentials==null||ordersGrid.SelectedRows.Count==0)throw new AccountUserActionException("실계좌와 증권사 주문을 선택하십시오.");
             if(!LiveStarted)throw new AccountUserActionException("먼저 이 계좌의 실주문 운영 시작을 누르십시오.");
-            if(entry!=null||gateway==null||gateway.Busy)throw new AccountUserActionException("앞선 주문 확인 후 다시 실행하십시오.");
+            if(orderPreparing||entry!=null||gateway==null||gateway.Busy)throw new AccountUserActionException("앞선 주문 준비·확인 후 다시 실행하십시오.");
             var selected=ordersGrid.SelectedRows[0].Tag as BrokerOrderRow;if(selected==null||selected.OpenQuantity<=0)throw new AccountUserActionException("미체결 증권사 주문을 선택하십시오.");
             var intent=new LiveOrderIntent{Kind=amend?LiveOrderKind.Amend:LiveOrderKind.Cancel,Code=selected.Code,
                 Quantity=checked((int)Math.Min(orderQuantity.Value,selected.OpenQuantity)),LimitPrice=amend?orderPrice.Value:selected.LimitPrice,
@@ -815,7 +837,7 @@ namespace ShinhanNativeTrader {
                 ||previous.TradingDate!=MarketTime.ToKorea(now).ToString("yyyyMMdd",CultureInfo.InvariantCulture)
                 ||!string.IsNullOrEmpty(previous.BrokerOrderNumber)||previous.FilledQuantity!=0)
                 throw new AccountUserActionException("접수번호 없는 거절 매도만 재검증할 수 있습니다. 결과 불명·접수된 주문은 증권사 대사가 필요합니다.");
-            if(!LiveStarted||!ActiveSession||gateway==null||gateway.Busy||entry!=null||journal.RecoveryRequired)
+            if(orderPreparing||!LiveStarted||!ActiveSession||gateway==null||gateway.Busy||entry!=null||journal.RecoveryRequired)
                 throw new AccountUserActionException("현재 계좌의 운영 시작과 앞선 주문 확인이 필요합니다.");
             if(journal.Snapshot.Orders.Count(item=>item.Code==previous.Code&&item.TradingDate==previous.TradingDate&&item.ClientKey.StartsWith("retry-",StringComparison.Ordinal))>=3)
                 throw new AccountUserActionException("이 종목의 거절 재시도3회 기록을 먼저 확인하십시오.");
@@ -876,21 +898,57 @@ namespace ShinhanNativeTrader {
             cashLabel.Text=cash==null?"  현금100% 주문가능금액: 미조회":"  예수금 "+cash.DepositCash.ToString("N0",CultureInfo.CurrentCulture)+"원 / 현금100% 주문가능금액 "+cash.Cash100Orderable.ToString("N0",CultureInfo.CurrentCulture)+"원";
         }
         void RefreshOrders() {
+            string selectedKey=ordersGrid.SelectedRows.Count==0?null:OrderRowKey(ordersGrid.SelectedRows[0].Tag);
             ordersGrid.Rows.Clear();var shown=new HashSet<string>(StringComparer.Ordinal);
+            var localOrders=journal==null?new List<LiveOrderRecord>():journal.Snapshot.Orders;
             if(brokerOrders!=null)foreach(var order in brokerOrders.Orders) {
-                int index=ordersGrid.Rows.Add(order.OrderNumber,order.Code,order.SideCode=="1"?"매도":order.SideCode=="2"?"매수":"미확인",order.Quantity,order.FilledQuantity,order.OpenQuantity,order.LimitPrice,order.AverageFillPrice,order.HasRejection?"증권사 거부":"증권사 누적 조회");
-                ordersGrid.Rows[index].Tag=order;shown.Add(order.OrderNumber);
+                var local=localOrders.Where(value=>value.TradingDate==brokerOrders.TradingDate&&value.Code==order.Code
+                    &&LiveOrderProtocol.BrokerNumbersEqual(value.BrokerOrderNumber,order.OrderNumber))
+                    .OrderByDescending(value=>value.UpdatedUtc).FirstOrDefault();
+                string reason=local==null?"증권사 금일 주문 누적 조회":LocalOrderResponseReason(local);
+                string status=order.HasRejection?(local!=null&&local.Status==LiveOrderStatus.Unknown?"증권사 거부 · 대사 필요":"증권사 거부"):
+                    local!=null&&AcceptedAwaitingReconciliation(local)?LocalOrderStatusForRecord(local):"증권사 누적 조회";
+                int index=ordersGrid.Rows.Add(order.OrderNumber,order.Code,order.SideCode=="1"?"매도":order.SideCode=="2"?"매수":"미확인",order.Quantity,order.FilledQuantity,order.OpenQuantity,order.LimitPrice,order.AverageFillPrice,status,reason);
+                ordersGrid.Rows[index].Tag=order;ordersGrid.Rows[index].Cells[9].ToolTipText=reason;
+                shown.Add(BrokerOrderRowKey(brokerOrders.TradingDate,order.Code,order.OrderNumber));
             }
-            if(journal!=null)foreach(var order in journal.Snapshot.Orders.Where(x=>string.IsNullOrEmpty(x.BrokerOrderNumber)||!shown.Contains(x.BrokerOrderNumber))) {
+            foreach(var order in localOrders.Where(x=>!LiveOrderProtocol.ValidBrokerNumber(x.BrokerOrderNumber)||!shown.Contains(OrderRowKey(x)))) {
                 string number=order.Status==LiveOrderStatus.NotSent?"미전송":!string.IsNullOrEmpty(order.BrokerOrderNumber)?order.BrokerOrderNumber:order.Status==LiveOrderStatus.Rejected?"접수 거절":"접수 미확인";
                 object open=order.Status==LiveOrderStatus.Rejected||order.Status==LiveOrderStatus.NotSent?(object)"해당 없음":order.Quantity-order.FilledQuantity-order.CancelledQuantity;
-                string reason=order.ResponseEvidence!=null?order.ResponseEvidence.SafeDiagnostic:
-                    order.Status==LiveOrderStatus.Rejected?"이전 버전: 상세 응답 미기록":
-                    order.Status==LiveOrderStatus.NotSent?"전송 전 조건·주문 정의 확인 중 중단. 진단 로그의 주문 정의 사유를 확인하십시오.":"상세 응답 미기록";
-                int index=ordersGrid.Rows.Add(number,order.Code,order.Kind,order.Quantity,order.FilledQuantity,open,order.LimitPrice,"미확인",LocalOrderStatus(order.Status),reason);
+                string reason=LocalOrderResponseReason(order);
+                int index=ordersGrid.Rows.Add(number,order.Code,order.Kind,order.Quantity,order.FilledQuantity,open,order.LimitPrice,"미확인",LocalOrderStatusForRecord(order),reason);
                 ordersGrid.Rows[index].Tag=order;ordersGrid.Rows[index].Cells[9].ToolTipText=reason;
             }
+            string target=preferredOrderSelectionKey??selectedKey;
+            var selected=ordersGrid.Rows.Cast<DataGridViewRow>().FirstOrDefault(row=>OrderRowKey(row.Tag)==target&&target!=null);
+            if(selected!=null) {
+                ordersGrid.ClearSelection();ordersGrid.CurrentCell=selected.Cells[0];selected.Selected=true;
+                ordersGrid.FirstDisplayedScrollingRowIndex=selected.Index;
+            }
+            preferredOrderSelectionKey=null;
             UpdateSelectedOrderResponse();
+        }
+        static string BrokerOrderRowKey(string date,string symbol,string number) {
+            return "broker:"+date+":"+symbol+":"+LiveOrderProtocol.BrokerNumberKey(number);
+        }
+        string OrderRowKey(object value) {
+            var broker=value as BrokerOrderRow;if(broker!=null)return BrokerOrderRowKey(brokerOrders==null?null:brokerOrders.TradingDate,broker.Code,broker.OrderNumber);
+            var local=value as LiveOrderRecord;if(local==null)return null;
+            return LiveOrderProtocol.ValidBrokerNumber(local.BrokerOrderNumber)?BrokerOrderRowKey(local.TradingDate,local.Code,local.BrokerOrderNumber):"local:"+local.Id;
+        }
+        static string LocalOrderResponseReason(LiveOrderRecord order) {
+            string reason=order.ResponseEvidence!=null?order.ResponseEvidence.SafeDiagnostic:
+                order.Status==LiveOrderStatus.Rejected?"이전 버전: 상세 응답 미기록":
+                order.Status==LiveOrderStatus.NotSent?"전송 전 조건·주문 정의 확인 중 중단. 진단 로그의 주문 정의 사유를 확인하십시오.":"상세 응답 미기록";
+            return AcceptedAwaitingReconciliation(order)?"접수 응답과 주문번호 확인. 체결·미체결은 증권사 대사 필요. "+reason:reason;
+        }
+        static bool AcceptedAwaitingReconciliation(LiveOrderRecord order) {
+            return order.Status==LiveOrderStatus.Unknown&&order.ResponseEvidence!=null
+                &&order.ResponseEvidence.Disposition==OrderResponseDisposition.Accepted
+                &&LiveOrderProtocol.BrokerNumbersEqual(order.BrokerOrderNumber,order.ResponseEvidence.BrokerOrderNumber);
+        }
+        static string LocalOrderStatusForRecord(LiveOrderRecord order) {
+            return AcceptedAwaitingReconciliation(order)?"접수 확인 · 체결 대사 필요":LocalOrderStatus(order.Status);
         }
         void UpdateSelectedOrderResponse() {
             orderResponseDetails.Text=ordersGrid.SelectedRows.Count==0?"주문 행을 선택하면 응답 사유를 표시합니다.":

@@ -122,6 +122,63 @@ namespace ShinhanNativeTrader {
             processor.Process("SC",utc);Check(processor.Failed&&!fault.Contains("SECRET")&&!fault.Contains("12345678901")&&!fault.Contains("1111"),"provider exceptions latch the channel without exposing account values");
             processor.Process("SC",utc);Check(!processor.TryGetQuote("005930",utc,out ready),"failed channel cannot silently resume using cached data");processor.Dispose();
             processor=new RealtimeEventProcessor(index=>Field(fields,index));processor.Process(42,utc);Check(processor.Failed,"non-string VARIANT realtime type is refused rather than coerced");processor.Dispose();
+            // Failure evidence is finite and parser-owned. No provider text or
+            // account field is copied merely because a live callback failed.
+            fields=Order();fields[19]="SECRET account12345678901 password1111";
+            processor=new RealtimeEventProcessor(index=>Field(fields,index));processor.BindAccount("12345678901");fault="";processor.Faulted+=value=>fault=value;
+            processor.Process("AA",utc);
+            Check(processor.Failed&&processor.LastFailure.Kind==RealtimeRecordKind.AA&&processor.LastFailure.FieldIndex==19
+                &&processor.LastFailure.Code==RealtimeFailureCode.InvalidNumber&&processor.LastFailure.ValueShape==RealtimeValueShape.Other&&fault==processor.LastFailure.SafeDiagnostic,
+                "invalid AA quantity preserves its exact field index and finite reason without losing callback identity");
+            Check(!fault.Contains("SECRET")&&!fault.Contains("12345678901")&&!fault.Contains("1111")&&!processor.AccountStreamObserved,
+                "AA failure diagnostics omit credentials and revoke actual account-stream observation");
+            var firstFailure=processor.LastFailure;fields=Order();processor.Process("AA",utc.AddSeconds(1));
+            Check(ReferenceEquals(firstFailure,processor.LastFailure)&&processor.Failed,"failed session preserves its first failure and cannot recover from a subsequent valid payload");processor.Dispose();
+
+            fields=Order();fields[25]="bad clock SECRET 1111";
+            processor=new RealtimeEventProcessor(index=>Field(fields,index));processor.BindAccount("12345678901");fault="";processor.Faulted+=value=>fault=value;
+            processor.Process("AA",utc);
+            Check(processor.Failed&&processor.LastFailure.FieldIndex==25&&processor.LastFailure.Code==RealtimeFailureCode.InvalidClock
+                &&fault.Contains("kind=AA")&&!fault.Contains("SECRET")&&!fault.Contains("1111"),
+                "invalid AA execution clock is identified separately from quantity and exception text");processor.Dispose();
+
+            fields=Order();fields[25]="09153000";
+            processor=new RealtimeEventProcessor(index=>Field(fields,index));processor.BindAccount("12345678901");processor.Process("AA",utc);
+            Check(processor.Failed&&processor.LastFailure.FieldIndex==25&&processor.LastFailure.Code==RealtimeFailureCode.InvalidClock
+                &&processor.LastFailure.ValueShape==RealtimeValueShape.Digits8&&!processor.LastFailure.SafeDiagnostic.Contains("09153000"),
+                "unsupported eight-digit execution clock records its finite shape without guessing an AA encoding");processor.Dispose();
+            fields=Balance();fields[7]="";
+            processor=new RealtimeEventProcessor(index=>Field(fields,index));processor.BindAccount("12345678901");processor.Process("AD",utc);
+            Check(processor.Failed&&processor.LastFailure.FieldIndex==7&&processor.LastFailure.Code==RealtimeFailureCode.InvalidNumber
+                &&processor.LastFailure.ValueShape==RealtimeValueShape.Blank,
+                "blank AD average price remains invalid with an explicit blank shape rather than a guessed default");processor.Dispose();
+
+            fields=Order();fields[32]="unknown SECRET";
+            processor=new RealtimeEventProcessor(index=>Field(fields,index));processor.BindAccount("12345678901");processor.Process("AA",utc);
+            Check(processor.LastFailure.FieldIndex==32&&processor.LastFailure.Code==RealtimeFailureCode.UnsupportedCode,
+                "unsupported original-result role retains field32 while still failing the channel");processor.Dispose();
+
+            fields=Balance();fields[8]="1.5";
+            processor=new RealtimeEventProcessor(index=>Field(fields,index));processor.BindAccount("12345678901");fault="";processor.Faulted+=value=>fault=value;processor.Process("AD",utc);
+            Check(processor.Failed&&processor.LastFailure.Kind==RealtimeRecordKind.AD&&processor.LastFailure.FieldIndex==8
+                &&processor.LastFailure.Code==RealtimeFailureCode.InvalidQuantity&&processor.LastFailure.ValueShape==RealtimeValueShape.Numeric&&!processor.AccountStreamObserved,
+                "fractional AD sellable quantity identifies field8 and cannot establish account readiness");processor.Dispose();
+
+            fields=Balance();processor=new RealtimeEventProcessor(index=>{if(index==7)throw new Exception("SECRET account12345678901 password1111");return Field(fields,index);});
+            processor.BindAccount("12345678901");fault="";processor.Faulted+=value=>fault=value;processor.Process("AD",utc);
+            Check(processor.LastFailure.Kind==RealtimeRecordKind.AD&&processor.LastFailure.FieldIndex==7
+                &&processor.LastFailure.Code==RealtimeFailureCode.FieldUnavailable&&processor.LastFailure.ValueShape==RealtimeValueShape.Unavailable&&!fault.Contains("SECRET")&&!fault.Contains("12345678901"),
+                "AD getter failures identify the missing field without copying provider exceptions");processor.Dispose();
+
+            fields=Order();processor=new RealtimeEventProcessor(index=>Field(fields,index));processor.BindAccount("12345678901");
+            processor.OrderReceived+=value=>{throw new InvalidOperationException("SECRET account12345678901 password1111");};
+            fault="";processor.Faulted+=value=>fault=value;processor.Process("AA",utc);
+            Check(processor.LastFailure.Kind==RealtimeRecordKind.AA&&processor.LastFailure.FieldIndex==-1
+                &&processor.LastFailure.Code==RealtimeFailureCode.SubscriberFailure&&processor.Failed&&!processor.AccountStreamObserved,
+                "financial callback subscriber failure is distinguished from parser field validation");
+            Check(!fault.Contains("SECRET")&&!fault.Contains("12345678901")&&!fault.Contains("1111"),
+                "subscriber exceptions cannot expose financial DTO values through diagnostic text");processor.Dispose();
+
             return checks;
         }
     }

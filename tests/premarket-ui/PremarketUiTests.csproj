@@ -16,6 +16,7 @@
     <Reference Include="System.Core" />
     <Reference Include="System.Drawing" />
     <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Xml" />
     <Reference Include="ShinhanNativeTrader"><HintPath>..\..\bin\Release\ShinhanNativeTrader.exe</HintPath><Private>true</Private></Reference>
   </ItemGroup>
   <ItemGroup><Compile Include="PremarketUiTests.cs" /></ItemGroup>
