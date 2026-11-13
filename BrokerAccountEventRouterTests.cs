@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Xml.Serialization;
@@ -56,8 +57,70 @@ namespace ShinhanNativeTrader {
             var result=Event(number,process);result.OriginalBrokerOrderNumber=original;result.OrderQuantity=quantity;result.ConfirmedQuantity=confirmed;
             result.IndividualFillQuantity=0;result.CumulativeFilledQuantity=0;result.OpenQuantity=quantity;result.OrderPrice=price;return result;
         }
+        static CashOrderEvent ParsedExecution(string clock,string execution="vendor-eight-digit-fill") {
+            var fields=new Dictionary<int,object>{{0,"03"},{2,"12345678901"},{4,"01"},{5,"123"},{6,"0"},{8,"02"},{9,"02"},
+                {10,"01"},{11,"A005930"},{14,"10"},{15,"10000"},{16,"10"},{19,"0"},{20,"0"},{21,"151639"},
+                {22,execution},{23,"10"},{24,"9900"},{25,clock},{32,"0"}};
+            return RealtimeRecordParser.ReadOrder(index=>fields[index],"12345678901",Utc(2));
+        }
+        static void NormalizedExecutionClockChecks() {
+            foreach(var raw in new[]{"15164042","00151640"})using(var fixture=new Fixture()) {
+                var order=fixture.Acknowledge(fixture.Pending());var value=ParsedExecution(raw);
+                Check(value.Clock=="151640"&&value.OriginalClock==raw,
+                    "AA parser preserves an explicit accepted eight-digit provider clock separately from normalized HHmmss");
+                fixture.Router.ObserveAA(value);
+                Check(fixture.Find(order.Id).Status==LiveOrderStatus.Filled&&fixture.Find(order.Id).FilledQuantity==10
+                    &&fixture.Journal.Snapshot.Executions.Count==1&&fixture.Journal.Snapshot.Executions.Single().ExecutionId=="vendor-eight-digit-fill"
+                    &&fixture.Journal.Snapshot.Executions.Single().ExecutedUtc==value.ReceivedUtc&&fixture.Unknown==0,
+                    "normalized eight-digit AA routes the actual execution identifier to a full fill without an unknown-order pause or fabricated ID");
+                fixture.Router.ObserveAA(ParsedExecution(raw));
+                Check(fixture.Journal.Snapshot.Executions.Count==1&&fixture.Invalidations==1&&fixture.Unknown==0,
+                    "repeated eight-digit AA remains idempotent under the original broker execution ID");
+            }
+            using(var fixture=new Fixture()) {
+                var order=fixture.TerminalCheckpoint();var value=ParsedExecution("15164042");value.ReceivedUtc=Utc(6);
+                fixture.Router.ObserveAA(value);
+                Check(fixture.Find(order.Id).Status==LiveOrderStatus.Filled&&fixture.Journal.Snapshot.Executions.Count==0
+                    &&fixture.Invalidations==0&&fixture.Unknown==0,
+                    "a delayed normalized eight-digit AA already covered by a terminal aggregate neither reopens recovery nor fabricates individual executions");
+            }
+            using(var fixture=new Fixture()) {
+                var order=fixture.Pending();var value=ParsedExecution("15164042");fixture.Router.ObserveAA(value);
+                Check(fixture.Router.BufferedCount==1,"a valid eight-digit AA still waits for its separate positive broker acknowledgement");
+                value.Clock="235959";value.OriginalClock="invalid-mutated-clock";
+                fixture.Acknowledge(order);fixture.Router.DrainOnGatewayOrderChanged();
+                Check(fixture.Router.BufferedCount==0&&fixture.Find(order.Id).Status==LiveOrderStatus.Filled&&fixture.Unknown==0,
+                    "pre-ACK defensive copy retains consistent normalized and original clocks despite caller mutation");
+            }
+            using(var fixture=new Fixture()) {
+                var order=fixture.Pending();var value=ParsedExecution("15164042");value.OriginalClock="15164142";
+                fixture.Router.ObserveAA(value);value.OriginalClock="15164042";
+                fixture.Acknowledge(order);fixture.Router.DrainOnGatewayOrderChanged();
+                Check(fixture.Find(order.Id).Status==LiveOrderStatus.Unknown&&fixture.Unknown==1&&fixture.Journal.Snapshot.Executions.Count==0,
+                    "buffering retains conflicting original-clock provenance instead of dropping it or accepting a later caller repair");
+            }
+            foreach(var raw in new[]{"25164042","15166042","00156640","0915AB00","15:16:40"})using(var fixture=new Fixture()) {
+                var order=fixture.Acknowledge(fixture.Pending());var value=Event(fill:10,cumulative:10);
+                value.Clock="151640";value.OriginalClock=raw;fixture.Router.ObserveAA(value);
+                Check(fixture.Find(order.Id).Status==LiveOrderStatus.Unknown&&fixture.Unknown==1&&fixture.Journal.Snapshot.Executions.Count==0,
+                    "direct DTOs cannot bypass strict AA original-clock validation with a valid replacement normalized clock");
+            }
+            using(var fixture=new Fixture()) {
+                var order=fixture.Acknowledge(fixture.Pending());var value=Event(fill:10,cumulative:10);
+                value.Clock="151640";value.OriginalClock="15164142";fixture.Router.ObserveAA(value);
+                Check(fixture.Find(order.Id).Status==LiveOrderStatus.Unknown&&fixture.Journal.Snapshot.Executions.Count==0,
+                    "a valid original clock that disagrees with its normalized clock is contradictory rather than silently replaced");
+            }
+            using(var fixture=new Fixture()) {
+                var order=fixture.Acknowledge(fixture.Pending());var value=Event(fill:10,cumulative:10);value.Clock="15164042";
+                fixture.Router.ObserveAA(value);
+                Check(fixture.Find(order.Id).Status==LiveOrderStatus.Unknown&&fixture.Journal.Snapshot.Executions.Count==0,
+                    "router still requires a validated normalized six-digit clock when raw provenance is absent");
+            }
+        }
         public static int Run() {
             checks=0;
+            NormalizedExecutionClockChecks();
             using(var fixture=new Fixture(false)) {
                 fixture.Router.ObserveAA(Event());
                 Check(fixture.Unmatched==1&&fixture.Unknown==0&&fixture.Invalidations==1,"account subscription before initial broker date refreshes a manual event without blocking read-only use");

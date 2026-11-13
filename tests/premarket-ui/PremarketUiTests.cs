@@ -534,7 +534,7 @@ static class PremarketUiTests {
 
     static void Run(string data,string screenshot) {
         using(var form=NewForm()) {
-            Check(form.Text.Contains("2.2.11"),"premarket regression runs against version 2.2.11");
+            Check(form.Text.Contains("2.2.12"),"premarket regression runs against version 2.2.12");
             Check(!All(form).OfType<Button>().Any(button=>button.Text=="선택 거절 매도 재시도"),"ordinary automatic rejection handling requires no manual retry button");
             Check(All(form).OfType<Button>().Any(button=>button.Text=="조회 정의 내보내기"),"static query-definition export is available without invoking registry COM or provider queries");
             Check(!Get<LiveTradingSession>(form,"authorization").Active,"application startup never authorizes live orders");
@@ -720,51 +720,93 @@ static class AcceptedRealtimeFaultCases {
         return new Dictionary<int,object>{{0,"12345678901"},{1,"01"},{2,"A069500"},{3,"0"},{6,"0"},{7,""},{8,"0"},{9,"0"},{20,"86295"}};
     }
     public static void Run(string data,Action<bool,string> check) {
-        foreach(var scenario in new[]{"AA-valid","AA-clock8","AD-blank-average"})RunCase(data,scenario,check);
+        foreach(var scenario in new[]{"AA-clock8-fractional","AA-clock8-padded","AA-valid","AA-invalid-clock","AD-blank-average"})RunCase(data,scenario,check);
+    }
+    static void EvaluateNextCandidate(MainForm form,RealtimeEventProcessor processor,RealtimeIndi realtime,Wire wire,DateTime utc,
+        Action<Dictionary<int,object>> setFields,Action<bool,string> check,string scenario) {
+        var strategy=Get<AccountAppSettings>(form,"configuration").Strategy;
+        var target=MarketTime.ToKorea(utc).Date;var dates=new List<DateTime>();var date=target.AddDays(-1);
+        int required=Math.Max(strategy.SlowPeriod,strategy.BreakoutPeriod)+5;
+        while(dates.Count<required) {
+            if(date.DayOfWeek!=DayOfWeek.Saturday&&date.DayOfWeek!=DayOfWeek.Sunday)dates.Add(date);
+            date=date.AddDays(-1);
+        }
+        dates.Reverse();var bars=new List<Bar>();
+        for(int index=0;index<dates.Count;index++) {
+            decimal close=10000+index*10;
+            bars.Add(new Bar{Date=dates[index].ToString("yyyyMMdd",CultureInfo.InvariantCulture),Open=close,High=close+10,Low=close-10,Close=close,Volume=1000});
+        }
+        var reference=PremarketResearch.Create(new Stock{Code="000660",Name="SYNTHETIC NEXT",Market="0"},bars,strategy,target);
+        check(reference!=null,scenario+": a separate synthetic completed-bar reference is available after the sell fill");
+        Get<Dictionary<string,PremarketReference>>(form,"preparedReferences")[reference.Code]=reference;
+        Get<List<PremarketReference>>(form,"watchedReferences").Add(reference);
+        Get<DataGridView>(form,"candidatesGrid").Rows.Add(reference.Code,reference.Name,reference.PriorHigh,reference.RankScore,"completed bars","waiting");
+        processor.Track(reference.Code);Get<HashSet<string>>(realtime,"watch").Add(reference.Code);Get<HashSet<string>>(form,"trackedQuotes").Add(reference.Code);
+        for(int index=3;index<=4;index++) {
+            var at=utc.AddSeconds(index);
+            setFields(new Dictionary<int,object>{{1,reference.Code},{2,MarketTime.ToKorea(at).ToString("HHmmss",CultureInfo.InvariantCulture)},
+                {3,reference.PriorHigh+10},{7,reference.AverageVolume*(strategy.VolumeMultiplier+1)+index},{17,"1"}});
+            processor.Process("SC",at);
+        }
+        Call(form,"EvaluatePreparedSignals",utc.AddSeconds(4));
+        check(Get<Queue<Candidate>>(form,"buyQuotes").Any(value=>value.Code==reference.Code)
+            &&Get<object>(form,"entry")==null&&wire.Sends==1&&!processor.Failed
+            &&Get<LiveTradingSession>(form,"authorization").Active&&Get<bool>(form,"monitoring"),
+            scenario+": the next confirmed SC breakout reaches the actual candidate evaluator while order submission still awaits separate preflight");
     }
     static void RunCase(string data,string scenario,Action<bool,string> check) {
+        bool clock8=scenario.StartsWith("AA-clock8",StringComparison.Ordinal);
+        var utc=clock8?new DateTime(2026,11,12,6,16,38,DateTimeKind.Utc):Utc;
+        string rawClock=scenario=="AA-clock8-fractional"?"15164025":scenario=="AA-clock8-padded"?"00151640":scenario=="AA-invalid-clock"?"24609999":"091532";
         using(var form=new MainForm()) {
             Get<Timer>(form,"scheduler").Stop();form.ShowInTaskbar=false;form.Show();Application.DoEvents();Get<Timer>(form,"scheduler").Stop();
             var credentialType=typeof(MainForm).Assembly.GetType("ShinhanNativeTrader.AccountCredentialSession",true);
             var credential=Activator.CreateInstance(credentialType,new object[]{"12345678901","1111"});
             var key=(string)credentialType.GetProperty("Key").GetValue(credential,null);
-            Set(form,"credentials",credential);Set(form,"boundKey",key);Set(form,"lastReportKey",key);
-            var authorization=Get<LiveTradingSession>(form,"authorization");authorization.Authorize("12345678901",Utc);
-            var session=Get<UnattendedSession>(form,"session");session.Arm(Utc);session.Tick(Utc,false);
+            Set(form,"credentials",credential);Set(form,"boundKey",key);Set(form,"lastReportKey",key);Set(form,"monitoring",true);
+            var authorization=Get<LiveTradingSession>(form,"authorization");authorization.Authorize("12345678901",utc);
+            var session=Get<UnattendedSession>(form,"session");session.Arm(utc);session.Tick(utc,false);
             string path=Path.Combine(data,"accepted-rt-"+scenario+".xml");
             using(var journal=new LiveOrderJournal(path)) {
                 journal.BindAccount("12345678901");Set(form,"journal",journal);
-                var readiness=new BrokerReadiness(key,journal.Snapshot.AccountFingerprint);readiness.SetAuthorization(true);readiness.SetAccountStream(true,true,Utc);Set(form,"readiness",readiness);
+                var readiness=new BrokerReadiness(key,journal.Snapshot.AccountFingerprint);readiness.SetAuthorization(true);readiness.SetAccountStream(true,true,utc);Set(form,"readiness",readiness);
                 var router=new BrokerAccountEventRouter(journal,Handler<Action<DateTime,string>>(form,"OnAccountInvalidated"));
                 router.Changed+=Handler<Action<LiveOrderRecord>>(form,"OnBrokerOrderChanged");
-                router.SetBrokerDate(MarketTime.ToKorea(Utc).ToString("yyyyMMdd",CultureInfo.InvariantCulture),Utc);Set(form,"accountEvents",router);
+                router.SetBrokerDate(MarketTime.ToKorea(utc).ToString("yyyyMMdd",CultureInfo.InvariantCulture),utc);Set(form,"accountEvents",router);
                 var fields=AA("091532");var processor=new RealtimeEventProcessor(index=>fields.ContainsKey(index)?fields[index]:"");processor.BindAccount("12345678901");
                 var realtime=(RealtimeIndi)FormatterServices.GetUninitializedObject(typeof(RealtimeIndi));
                 Set(realtime,"processor",processor);Set(realtime,"watch",new HashSet<string>());Set(realtime,"native",new object());
                 Set(realtime,"<AccountSubscribed>k__BackingField",true);Set(form,"realtime",realtime);
                 processor.OrderReceived+=Handler<Action<CashOrderEvent>>(form,"OnRealtimeOrder");
+                CashOrderEvent parsedOrder=null;processor.OrderReceived+=value=>parsedOrder=value;
                 processor.BalanceReceived+=Handler<Action<CashBalanceEvent>>(form,"OnRealtimeBalance");
                 processor.Faulted+=ignored=>Call(form,"OnRealtimeFailure","UNTRUSTED account12345678901 raw09153212");
-                var wire=new Wire();var gateway=new LiveOrderGateway(journal,wire,()=>Utc);gateway.OrderChanged+=Handler<Action<LiveOrderRecord>>(form,"OnGatewayOrderChanged");Set(form,"gateway",gateway);
+                var wire=new Wire();var gateway=new LiveOrderGateway(journal,wire,()=>utc);gateway.OrderChanged+=Handler<Action<LiveOrderRecord>>(form,"OnGatewayOrderChanged");Set(form,"gateway",gateway);
                 var checks=new LiveOrderPreflight{Authorization=authorization,EvidenceStillCurrent=()=>true,AccountAuthorized=true,OrderableAmountVerified=true,
                     SellableQuantityVerified=true,OrdersReconciled=true,FillsReconciled=true,RecoveryVerified=true,PriceRuleVerified=true,QuoteVerified=true,
-                    SellableQuantity=2,SnapshotUtc=Utc,QuoteUtc=Utc,OperatingLimit=1000000};
+                    SellableQuantity=2,SnapshotUtc=utc,QuoteUtc=utc,OperatingLimit=1000000};
                 var sent=gateway.Submit(new LiveOrderIntent{Kind=LiveOrderKind.Sell,Code="069500",Quantity=2,LimitPrice=86295,ClientKey="synthetic-"+scenario},
-                    new LiveAccountCredentials("12345678901","1111"),checks,Utc);
+                    new LiveAccountCredentials("12345678901","1111"),checks,utc);
                 check(wire.Sends==1&&sent.Status==LiveOrderStatus.AwaitingAcknowledgement,scenario+": fake wire submission waits for actual ACK subscriber processing");
                 wire.Accept();var accepted=journal.Snapshot.Orders.Single();
                 check(accepted.Status==LiveOrderStatus.Working&&accepted.BrokerOrderNumber=="000812345"&&accepted.ResponseEvidence.Disposition==OrderResponseDisposition.Accepted,
                     scenario+": modern positive KRX ACK traverses actual form listeners and remains accepted before RT data");
-                if(scenario=="AA-clock8")fields=AA("09153212");
+                fields=AA(rawClock);
                 if(scenario=="AD-blank-average")fields=AD();
-                processor.Process(scenario.StartsWith("AD",StringComparison.Ordinal)?"AD":"AA",Utc.AddSeconds(2));
-                if(scenario=="AA-valid") {
+                processor.Process(scenario.StartsWith("AD",StringComparison.Ordinal)?"AD":"AA",utc.AddSeconds(2));
+                if(scenario=="AA-valid"||clock8) {
                     var filled=journal.Snapshot.Orders.Single();
                     check(!processor.Failed&&filled.Status==LiveOrderStatus.Filled&&filled.FilledQuantity==2&&journal.Snapshot.Executions.Count==1,
-                        scenario+": valid six-digit AA execution traverses the actual router and preserves a confirmed fill");
+                        scenario+": valid AA execution clock traverses the actual router and preserves a confirmed fill");
+                    check(parsedOrder!=null&&parsedOrder.Clock==(clock8?"151640":"091532")&&parsedOrder.OriginalClock==rawClock,
+                        scenario+": normalized six-digit execution clock retains its exact source clock separately");
+                    check(authorization.Active&&session.Armed&&Get<bool>(form,"monitoring")&&!journal.RecoveryRequired
+                        &&ReferenceEquals(Get<object>(form,"credentials"),credential)&&!Get<bool>(form,"realtimeFailed")&&wire.Sends==1,
+                        scenario+": a valid completed sell preserves authorized account monitoring without an automatic stop or resend");
+                    if(clock8)EvaluateNextCandidate(form,processor,realtime,wire,utc,values=>fields=values,check,scenario);
                 }else {
                     var failure=processor.LastFailure;
-                    check(processor.Failed&&failure!=null&&failure.FieldIndex==(scenario=="AA-clock8"?25:7),
+                    check(processor.Failed&&failure!=null&&failure.FieldIndex==(scenario=="AA-invalid-clock"?25:7),
                         scenario+": RT parser preserves the exact synthetic failure field without publishing a fabricated fill");
                     LiveOrderJournalState persisted;
                     using(var saved=File.OpenRead(path))persisted=(LiveOrderJournalState)new System.Xml.Serialization.XmlSerializer(typeof(LiveOrderJournalState)).Deserialize(saved);

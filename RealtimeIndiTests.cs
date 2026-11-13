@@ -142,11 +142,34 @@ namespace ShinhanNativeTrader {
                 &&fault.Contains("kind=AA")&&!fault.Contains("SECRET")&&!fault.Contains("1111"),
                 "invalid AA execution clock is identified separately from quantity and exception text");processor.Dispose();
 
-            fields=Order();fields[25]="09153000";
+            fields=Order();fields[25]="24609999";
             processor=new RealtimeEventProcessor(index=>Field(fields,index));processor.BindAccount("12345678901");processor.Process("AA",utc);
             Check(processor.Failed&&processor.LastFailure.FieldIndex==25&&processor.LastFailure.Code==RealtimeFailureCode.InvalidClock
-                &&processor.LastFailure.ValueShape==RealtimeValueShape.Digits8&&!processor.LastFailure.SafeDiagnostic.Contains("09153000"),
-                "unsupported eight-digit execution clock records its finite shape without guessing an AA encoding");processor.Dispose();
+                &&processor.LastFailure.ValueShape==RealtimeValueShape.Digits8&&!processor.LastFailure.SafeDiagnostic.Contains("24609999"),
+                "invalid eight-digit execution clock records its finite shape without inferring time from receipt");processor.Dispose();
+            foreach(var item in new[]{
+                new{Raw="15164025",Clock="151640"},new{Raw="00151640",Clock="151640"},
+                new{Raw="09153000",Clock="091530"},new{Raw="00091530",Clock="091530"},
+                new{Raw="09000000",Clock="090000"},new{Raw="15300099",Clock="153000"},
+                new{Raw="151640",Clock="151640"},new{Raw="001530",Clock="001530"}}) {
+                fields=Order();fields[25]=item.Raw;
+                CashOrderEvent execution=null;processor=new RealtimeEventProcessor(index=>Field(fields,index));processor.BindAccount("12345678901");
+                processor.OrderReceived+=value=>execution=value;processor.Process("AA",utc.AddHours(6));
+                Check(!processor.Failed&&processor.AccountStreamObserved&&execution!=null&&execution.Clock==item.Clock&&execution.OriginalClock==item.Raw,
+                    "valid numeric AA clock preserves its source and explicit normalized clock independently of receipt time: "+item.Raw);
+                Check(execution.ExecutionId=="F0004"&&execution.IndividualFillQuantity==1&&execution.IndividualFillPrice==69900
+                    &&execution.CumulativeFilledQuantity==4&&execution.OpenQuantity==6&&execution.ReceivedUtc==utc.AddHours(6),
+                    "clock normalization cannot change execution identity quantities price or observation timestamp: "+item.Raw);
+                processor.Dispose();
+            }
+            foreach(var invalidClock in new[]{"","24609999","15166012","151640X1","1516401","151640123","20261113","00153001","15300100","15:16:40","１５１６４０２５"}) {
+                fields=Order();fields[25]=invalidClock;int published=0;
+                processor=new RealtimeEventProcessor(index=>Field(fields,index));processor.BindAccount("12345678901");processor.OrderReceived+=value=>published++;
+                processor.Process("AA",utc);
+                Check(processor.Failed&&published==0&&!processor.AccountStreamObserved&&processor.LastFailure.Kind==RealtimeRecordKind.AA
+                    &&processor.LastFailure.FieldIndex==25&&processor.LastFailure.Code==RealtimeFailureCode.InvalidClock,
+                    "unsupported or malformed AA clock cannot publish an execution or create account readiness");processor.Dispose();
+            }
             fields=Balance();fields[7]="";
             processor=new RealtimeEventProcessor(index=>Field(fields,index));processor.BindAccount("12345678901");processor.Process("AD",utc);
             Check(processor.Failed&&processor.LastFailure.FieldIndex==7&&processor.LastFailure.Code==RealtimeFailureCode.InvalidNumber

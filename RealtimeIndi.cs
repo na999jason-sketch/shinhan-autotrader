@@ -25,7 +25,7 @@ namespace ShinhanNativeTrader {
         internal RealtimeQuote Copy(){return (RealtimeQuote)MemberwiseClone();}
     }
     public sealed class CashOrderEvent {
-        public string ProcessingCode,Code,BrokerOrderNumber,OriginalBrokerOrderNumber,ExecutionId,Clock,ProductCode,SideCode,TradeTypeCode,OrderStatusCode,OriginalResultCode;
+        public string ProcessingCode,Code,BrokerOrderNumber,OriginalBrokerOrderNumber,ExecutionId,Clock,OriginalClock,ProductCode,SideCode,TradeTypeCode,OrderStatusCode,OriginalResultCode;
         public int OrderQuantity,CumulativeFilledQuantity,IndividualFillQuantity,ConfirmedQuantity,OpenQuantity;
         public decimal OrderPrice,IndividualFillPrice;
         public DateTime ReceivedUtc;
@@ -100,7 +100,14 @@ namespace ShinhanNativeTrader {
         }
         static void Utc(DateTime value){if(value.Kind!=DateTimeKind.Utc)throw new ArgumentException("UTC realtime receipt time required.");}
         static bool AccountMatches(string incoming,string expected){return expected!=null&&incoming.Replace("-","")==expected;}
-        static bool Clock(string value){DateTime parsed;return DateTime.TryParseExact(value,"HHmmss",CultureInfo.InvariantCulture,DateTimeStyles.None,out parsed);}
+        public static string NormalizeExecutionClock(string raw) {
+            var value=(raw??"").Trim();
+            // Preserve the broker's clock; receipt time never chooses a slice
+            // or supplies a missing date. The two numeric eight-digit forms
+            // have disjoint regular-session interpretations.
+            var shape=RealtimeDiagnostics.ClockShape(value);
+            return shape=="digits6"||shape=="digits8"?RealtimeDiagnostics.NormalizeClock(value):"";
+        }
         public static RealtimeQuote ReadQuote(Func<int,object> read,DateTime utc){
             Utc(utc);var code=Symbol(Field(read,1,"SC"),"SC",1);var clock=Field(read,2,"SC");
             var price=Math.Abs(Number(Field(read,3,"SC"),"SC",3,true));
@@ -137,11 +144,13 @@ namespace ShinhanNativeTrader {
                     throw new RealtimeRecordException("AA",22,RealtimeFailureCode.InvalidExecution,result.ExecutionId);
                 result.IndividualFillQuantity=Quantity(Field(read,23,"AA"),"AA",23);
                 result.IndividualFillPrice=Math.Abs(Number(Field(read,24,"AA"),"AA",24,true));
-                result.Clock=Field(read,25,"AA");
+                var rawClock=Field(read,25,"AA");
+                result.Clock=NormalizeExecutionClock(rawClock);
                 if(result.IndividualFillQuantity<=0||result.IndividualFillQuantity>result.OrderQuantity)
                     throw new RealtimeRecordException("AA",23,RealtimeFailureCode.InvalidQuantity);
                 if(result.IndividualFillPrice<=0)throw new RealtimeRecordException("AA",24,RealtimeFailureCode.InvalidNumber);
-                if(!Clock(result.Clock))throw new RealtimeRecordException("AA",25,RealtimeFailureCode.InvalidClock,result.Clock);
+                if(result.Clock=="")throw new RealtimeRecordException("AA",25,RealtimeFailureCode.InvalidClock,rawClock);
+                result.OriginalClock=rawClock;
             }else{result.ExecutionId="";result.Clock=Field(read,21,"AA");}
             return result;
         }

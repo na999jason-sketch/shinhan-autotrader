@@ -87,7 +87,7 @@ static class ReportUiTests {
 
     static void Run(string data,string screenshot,bool windows) {
         using(var form=NewForm()) {
-            Check(form.Text.Contains("2.2.11"),"report regression runs against version 2.2.11");
+            Check(form.Text.Contains("2.2.12"),"report regression runs against version 2.2.12");
             Check(!Get<LiveTradingSession>(form,"authorization").Active,"startup has no live authorization");
             Call(form,"PrepareReports");
             Check(Reports(data).Length==0,"opening report folder before account data does not fabricate CSV");

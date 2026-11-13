@@ -252,7 +252,8 @@ namespace ShinhanNativeTrader {
                     &&!value.ExecutionId.All(c=>c=='0')&&value.ExecutionId.All(c=>char.IsLetterOrDigit(c)||c=='-'||c=='_')
                     &&value.IndividualFillQuantity>0&&value.IndividualFillQuantity<=value.CumulativeFilledQuantity
                     &&value.IndividualFillPrice>0&&value.OrderPrice==order.LimitPrice
-                    &&DateTime.TryParseExact(value.Clock,"HHmmss",CultureInfo.InvariantCulture,DateTimeStyles.None,out clock);
+                    &&DateTime.TryParseExact(value.Clock,"HHmmss",CultureInfo.InvariantCulture,DateTimeStyles.None,out clock)
+                    &&(string.IsNullOrEmpty(value.OriginalClock)||RealtimeRecordParser.NormalizeExecutionClock(value.OriginalClock)==value.Clock);
             }
             return true;
         }
@@ -269,8 +270,8 @@ namespace ShinhanNativeTrader {
             return string.IsNullOrEmpty(left)&&string.IsNullOrEmpty(right)||SameBrokerNumber(left,right);
         }
         static DateTime ObservationUtc(DateTime receivedUtc,LiveOrderRecord order) {
-            // ExecutionClock remains the provider's clock in CashOrderEvent.
-            // This journal time is explicitly an observation time, with no
+            // OriginalClock preserves provider precision in CashOrderEvent;
+            // Clock is its validated normalization. This journal time is an observation time, with no
             // fractional-second rounding or claim that PC time is broker time.
             return receivedUtc<order.UpdatedUtc?order.UpdatedUtc:receivedUtc;
         }
@@ -286,7 +287,7 @@ namespace ShinhanNativeTrader {
         void SignalUnknown(string message){if(Unknown!=null)Unknown(message);}
         static CashOrderEvent Copy(CashOrderEvent value) {
             return new CashOrderEvent{ProcessingCode=value.ProcessingCode,Code=value.Code,BrokerOrderNumber=value.BrokerOrderNumber,
-                OriginalBrokerOrderNumber=value.OriginalBrokerOrderNumber,ExecutionId=value.ExecutionId,Clock=value.Clock,ProductCode=value.ProductCode,
+                OriginalBrokerOrderNumber=value.OriginalBrokerOrderNumber,ExecutionId=value.ExecutionId,Clock=value.Clock,OriginalClock=value.OriginalClock,ProductCode=value.ProductCode,
                 SideCode=value.SideCode,TradeTypeCode=value.TradeTypeCode,OrderStatusCode=value.OrderStatusCode,OriginalResultCode=value.OriginalResultCode,
                 OrderQuantity=value.OrderQuantity,CumulativeFilledQuantity=value.CumulativeFilledQuantity,IndividualFillQuantity=value.IndividualFillQuantity,
                 ConfirmedQuantity=value.ConfirmedQuantity,OpenQuantity=value.OpenQuantity,OrderPrice=value.OrderPrice,IndividualFillPrice=value.IndividualFillPrice,ReceivedUtc=value.ReceivedUtc};
