@@ -47,13 +47,15 @@ namespace ShinhanNativeTrader {
         // MO2 remains diagnostic metadata: known conflicting bases invalidate
         // the row, while a missing echo never substitutes for request evidence.
         public readonly List<Holding> Holdings=new List<Holding>();
-        public bool BasisVerified,RequestBasisVerified;
+        public bool BasisVerified,RequestBasisVerified,RequestOrdinaryOnlyVerified;
         public readonly Dictionary<string,bool> BasisValidated=new Dictionary<string,bool>(StringComparer.Ordinal);
         public readonly Dictionary<string,string> BasisDiagnostics=new Dictionary<string,string>(StringComparer.Ordinal);
         // Bounded enum/shape classes only, never raw account response strings.
         public readonly Dictionary<string,string> BasisValueDiagnostics=new Dictionary<string,string>(StringComparer.Ordinal);
         public readonly Dictionary<string,int> SellableQuantities=new Dictionary<string,int>(StringComparer.Ordinal);
         public readonly Dictionary<string,bool> CashSourceValidated=new Dictionary<string,bool>(StringComparer.Ordinal);
+        public readonly Dictionary<string,bool> CashProfileCompatible=new Dictionary<string,bool>(StringComparer.Ordinal);
+        public readonly Dictionary<string,string> CashProfileDiagnostics=new Dictionary<string,string>(StringComparer.Ordinal);
         // MO11 has no buy/sell direction. It is not safe to copy it to either
         // Holding.BuyPending or Holding.SellPending, or to ignore it at preflight.
         public readonly Dictionary<string,int> UnfilledQuantities=new Dictionary<string,int>(StringComparer.Ordinal);
@@ -144,6 +146,9 @@ namespace ShinhanNativeTrader {
             // Average cost, trade basis, ordinary product, excluding ELW, and
             // both single/multi output are explicitly bound by this request.
             return new Dictionary<int,string>{{0,account.Trim()},{1,"01"},{2,password},{3,"1"},{4,"1"},{5,"1"},{6,"0"}};
+        }
+        public static Dictionary<int,string> OrdinaryHoldingsInputs(string account,string password) {
+            var fields=HoldingsInputs(account,password);fields[3]="5";return fields;
         }
         public static Dictionary<int,string> CapacityInputs(string account,string password,string code,decimal limitPrice) {
             Credentials(account,password);code=Code(code);
@@ -243,10 +248,20 @@ namespace ShinhanNativeTrader {
             return kind=="유통융자"||kind=="자기융자"||kind=="유통대주"||kind=="자기대주"||
                 kind=="차입매도"||kind=="매입자금"||kind=="예탁담보"||kind=="차입";
         }
-        public static BrokerHoldingsSnapshot ReadHoldings(IIndiTransport io,DateTime receivedUtc,bool tradeBasisRequested=false) {
+        static string CashKindDiagnostic(string kind) {
+            if(kind==null)return "Unavailable";if(kind=="")return "Blank";
+            if(kind=="보통")return "Ordinary";if(CreditKind(kind))return "Credit";
+            if(kind.Length<=2&&kind.All(c=>c>='0'&&c<='9'))return "Numeric"+kind.Length;
+            return "Unknown";
+        }
+        static string LoanDiagnostic(string raw,decimal? value) {
+            if(raw==null)return "Unavailable";if(raw=="")return "Blank";
+            return value.HasValue?(value.Value==0?"Zero":"Positive"):"Malformed";
+        }
+        public static BrokerHoldingsSnapshot ReadHoldings(IIndiTransport io,DateTime receivedUtc,bool tradeBasisRequested=false,bool ordinaryOnlyRequested=false) {
             if(io==null)throw new ArgumentNullException("io");Utc(receivedUtc);
             const string query="SABA609Q1";
-            var result=new BrokerHoldingsSnapshot {ReceivedUtc=receivedUtc,BrokerDate="",RequestBasisVerified=tradeBasisRequested};
+            var result=new BrokerHoldingsSnapshot {ReceivedUtc=receivedUtc,BrokerDate="",RequestBasisVerified=tradeBasisRequested,RequestOrdinaryOnlyVerified=ordinaryOnlyRequested};
             for(int row=0,count=Rows(io,query);row<count;row++) {
                 var code=Rules.Code(Multi(io,row,0,query));
                 if(code=="")throw new AccountQueryException(query+" invalid stock symbol multi[0].");
@@ -264,7 +279,8 @@ namespace ShinhanNativeTrader {
                 var unfilled=Quantity(Multi(io,row,11,query),query+" unfilled quantity[11]");
                 if(sellable>quantity)
                     throw new AccountQueryException(query+" orderable quantity exceeds trade-basis holdings multi[4/10].");
-                var loan=OptionalProofNumber(OptionalProofMulti(io,row,22,query),query+" loan amount[22]");
+                var loanRaw=OptionalProofMulti(io,row,22,query);
+                var loan=OptionalProofNumber(loanRaw,query+" loan amount[22]");
                 // The official description documents the literal '보통'. No
                 // undocumented numeric alias is assumed to mean cash stock.
                 var cash=basisValidated&&kind=="보통"&&loan.HasValue&&loan.Value==0;
@@ -280,6 +296,8 @@ namespace ShinhanNativeTrader {
                 result.SellableQuantities.Add(code,(int)sellable);
                 result.UnfilledQuantities.Add(code,(int)unfilled);
                 result.CashSourceValidated.Add(code,cash);
+                result.CashProfileCompatible.Add(code,!CreditKind(kind)&&(string.IsNullOrEmpty(loanRaw)||loan.HasValue&&loan.Value==0));
+                result.CashProfileDiagnostics.Add(code,"Kind="+CashKindDiagnostic(kind)+";Loan="+LoanDiagnostic(loanRaw,loan));
             }
             // The callback must be tied to the documented trade-basis request,
             // even if rows echo '1'. Missing/unknown echoes are not promoted to
@@ -295,6 +313,34 @@ namespace ShinhanNativeTrader {
             result.RealizedProfit=OptionalSingleNumber(io,16,query);
             result.UnrealizedProfit=OptionalSingleNumber(io,19,query);
             return result;
+        }
+        static bool RecentHoldings(BrokerHoldingsSnapshot value,DateTime utc,int maxAgeSeconds) {
+            return value!=null&&value.RequestStartedUtc.Kind==DateTimeKind.Utc&&value.ReceivedUtc.Kind==DateTimeKind.Utc
+                &&value.RequestStartedUtc<=value.ReceivedUtc&&value.ReceivedUtc<=utc
+                &&utc-value.ReceivedUtc<=TimeSpan.FromSeconds(maxAgeSeconds)
+                &&MarketTime.ToKorea(value.ReceivedUtc).Date==MarketTime.ToKorea(utc).Date;
+        }
+        // SI3=5 establishes selection of ordinary positions, not trade quantity.
+        // Actual quantities always remain those of the separate SI3=1 response.
+        public static bool IsOrdinaryCashSource(BrokerHoldingsSnapshot trade,BrokerHoldingsSnapshot ordinary,string code,DateTime utc,int maxAgeSeconds=120) {
+            Utc(utc);if(maxAgeSeconds<0||maxAgeSeconds>120)throw new ArgumentOutOfRangeException("maxAgeSeconds");
+            if(Rules.Code(code)!=code||string.IsNullOrEmpty(code)||!RecentHoldings(trade,utc,maxAgeSeconds)
+                ||!trade.RequestBasisVerified||!trade.BasisVerified)return false;
+            bool basis;if(!trade.BasisValidated.TryGetValue(code,out basis)||!basis)return false;
+            var position=trade.Holdings.SingleOrDefault(x=>x.Code==code);
+            if(position==null||position.Quantity<=0||position.AvgPrice<=0||position.CreditQty!=0)return false;
+            bool direct;if(trade.CashSourceValidated.TryGetValue(code,out direct)&&direct)return true;
+            if(!RecentHoldings(ordinary,utc,maxAgeSeconds)||!ordinary.RequestOrdinaryOnlyVerified)return false;
+            bool compatible;
+            if(!trade.CashProfileCompatible.TryGetValue(code,out compatible)||!compatible
+                ||!ordinary.CashProfileCompatible.TryGetValue(code,out compatible)||!compatible)return false;
+            string category;
+            if(ordinary.BasisDiagnostics.TryGetValue(code,out category)&&(category=="CreditBalanceCode3"||category=="BondBalanceCode4"))return false;
+            var selected=ordinary.Holdings.SingleOrDefault(x=>x.Code==code);
+            int tradeQty,ordinaryQty,tradePending,ordinaryPending;
+            return selected!=null&&selected.CreditQty==0&&selected.Quantity==position.Quantity&&selected.AvgPrice==position.AvgPrice
+                &&trade.SellableQuantities.TryGetValue(code,out tradeQty)&&ordinary.SellableQuantities.TryGetValue(code,out ordinaryQty)&&tradeQty==ordinaryQty
+                &&trade.UnfilledQuantities.TryGetValue(code,out tradePending)&&ordinary.UnfilledQuantities.TryGetValue(code,out ordinaryPending)&&tradePending==ordinaryPending;
         }
         public static AccountCashSnapshot ReadCash(IIndiTransport io,DateTime receivedUtc) {
             if(io==null)throw new ArgumentNullException("io");Utc(receivedUtc);

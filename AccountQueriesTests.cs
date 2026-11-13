@@ -59,6 +59,8 @@ namespace ShinhanNativeTrader {
             Check(inputs.Count==4&&inputs[0]==account&&inputs[1]=="01"&&inputs[2]==password&&inputs[3]=="1","cash query sends cash account fields only");
             inputs=AccountQueries.HoldingsInputs(account,password);
             Check(inputs.Count==7&&inputs[0]==account&&inputs[1]=="01"&&inputs[2]==password&&inputs[3]=="1"&&inputs[4]=="1"&&inputs[5]=="1"&&inputs[6]=="0","holdings query explicitly requests average-cost trade-basis cash product with complete output excluding ELW");
+            inputs=AccountQueries.OrdinaryHoldingsInputs(account,password);
+            Check(inputs.Count==7&&inputs[3]=="5"&&inputs[4]=="1"&&inputs[5]=="1"&&inputs[6]=="0","ordinary selection requests the documented SI3=5 complete subset separately from trade quantities");
             inputs=AccountQueries.CapacityInputs(account,password,"005930",70000m);
             Check(inputs.Count==9&&inputs[3]=="A005930"&&inputs[4]=="1"&&inputs[5]=="2"&&inputs[6]=="0"&&inputs[7]=="00"&&inputs[8]=="70000","capacity query uses regular cash limit order at requested price");
             var prior=CultureInfo.CurrentCulture;
@@ -248,7 +250,54 @@ namespace ShinhanNativeTrader {
             totals=AccountValuation.From(new Holding[0]);Check(totals.IsComplete&&totals.MarketValue==0&&totals.UnrealizedProfit==0&&!totals.ReturnPercent.HasValue,"empty account portfolio has zero values without division by zero");
             foreach(var type in new[]{typeof(AccountCashSnapshot),typeof(AccountOrderCapacity),typeof(BrokerOrderRow),typeof(BrokerOrdersSnapshot),typeof(BrokerHoldingsSnapshot)})
                 Check(!type.GetFields().Any(f=>f.Name.IndexOf("account",StringComparison.OrdinalIgnoreCase)>=0||f.Name.IndexOf("password",StringComparison.OrdinalIgnoreCase)>=0),"broker DTO has no credential fields: "+type.Name);
+            OrdinaryCashProof(utc);
             return checks;
+        }
+        static BrokerHoldingsSnapshot Proof(Response io,DateTime utc,bool ordinary,bool bound=true) {
+            var snapshot=AccountQueries.ReadHoldings(io,utc,!ordinary&&bound,ordinary&&bound);
+            snapshot.RequestStartedUtc=utc.AddMilliseconds(-100);return snapshot;
+        }
+        static void OrdinaryCashProof(DateTime utc) {
+            var io=new Response();io.Holding(0,kind:"");io.SetRow(0,22,"");
+            var trade=Proof(io,utc,false);io.SetRow(0,2,"5");var ordinary=Proof(io,utc,true);
+            Check(trade.BasisVerified&&!trade.CashSourceValidated["005930"]&&!ordinary.BasisVerified&&ordinary.RequestOrdinaryOnlyVerified,
+                "ordinary selection proof is distinct from missing cash metadata and never supplies trade-basis authority");
+            Check(AccountQueries.IsOrdinaryCashSource(trade,ordinary,"005930",utc),"matching explicit ordinary-only response resolves missing row-kind and loan metadata without inventing zeroes");
+            Check(trade.Holdings[0].Quantity==7&&trade.SellableQuantities["005930"]==7&&!trade.CashSourceValidated["005930"],"fallback does not rewrite trade positions or their direct metadata validation");
+            Check(trade.CashProfileDiagnostics["005930"]=="Kind=Blank;Loan=Blank","unknown cash metadata reports finite field-specific categories");
+            Check(!AccountQueries.IsOrdinaryCashSource(trade,null,"005930",utc),"missing subset response cannot establish cash eligibility");
+            ordinary.RequestOrdinaryOnlyVerified=false;
+            Check(!AccountQueries.IsOrdinaryCashSource(trade,ordinary,"005930",utc),"an unbound subset response cannot establish cash eligibility");ordinary.RequestOrdinaryOnlyVerified=true;
+            Check(!AccountQueries.IsOrdinaryCashSource(trade,ordinary,"000660",utc),"another code cannot inherit a matched cash source");
+            ordinary.Holdings[0].Quantity=6;
+            Check(!AccountQueries.IsOrdinaryCashSource(trade,ordinary,"005930",utc),"different ordinary-subset quantity cannot classify an aggregate trade position");ordinary.Holdings[0].Quantity=7;
+            ordinary.Holdings[0].AvgPrice=69999;
+            Check(!AccountQueries.IsOrdinaryCashSource(trade,ordinary,"005930",utc),"different average cost prevents combining unrelated rows");ordinary.Holdings[0].AvgPrice=70000;
+            ordinary.SellableQuantities["005930"]=6;
+            Check(!AccountQueries.IsOrdinaryCashSource(trade,ordinary,"005930",utc),"subset orderable quantity must agree rather than replace trade quantity");ordinary.SellableQuantities["005930"]=7;
+            ordinary.UnfilledQuantities["005930"]=1;
+            Check(!AccountQueries.IsOrdinaryCashSource(trade,ordinary,"005930",utc),"different unfilled quantities cannot establish a matched row");ordinary.UnfilledQuantities["005930"]=0;
+            Check(!AccountQueries.IsOrdinaryCashSource(trade,ordinary,"005930",utc.AddSeconds(121)),"display eligibility from the subset expires rather than persisting indefinitely");
+            Check(!AccountQueries.IsOrdinaryCashSource(trade,ordinary,"005930",utc.AddSeconds(-1)),"future receipt evidence cannot establish a cash source");
+            ordinary.ReceivedUtc=utc.AddDays(-1);ordinary.RequestStartedUtc=ordinary.ReceivedUtc.AddMilliseconds(-100);
+            Check(!AccountQueries.IsOrdinaryCashSource(trade,ordinary,"005930",utc),"yesterday's ordinary subset cannot classify today's trade position");
+            foreach(var kind in new[]{"", "00", "0", "UNKNOWN"}) {
+                io=new Response();io.Holding(0,kind:kind);io.SetRow(0,22,"");trade=Proof(io,utc,false);
+                io.SetRow(0,2,"5");ordinary=Proof(io,utc,true);
+                Check(AccountQueries.IsOrdinaryCashSource(trade,ordinary,"005930",utc),"trusted ordinary-only selection works without guessing an undocumented kind alias");
+            }
+            foreach(var loan in new[]{"1","-1","SECRET12345678901"}) {
+                io=new Response();io.Holding(0,kind:"");io.SetRow(0,22,loan);trade=Proof(io,utc,false);
+                io.SetRow(0,2,"5");ordinary=Proof(io,utc,true);
+                Check(!AccountQueries.IsOrdinaryCashSource(trade,ordinary,"005930",utc),"nonzero or malformed loan remains a contradiction despite the ordinary filter");
+                Check(!trade.CashProfileDiagnostics["005930"].Contains("SECRET")&&!trade.CashProfileDiagnostics["005930"].Contains("12345678901"),"loan diagnosis never copies untrusted provider values");
+            }
+            io=new Response();io.Holding(0,kind:"유통융자");trade=Proof(io,utc,false);io.SetRow(0,2,"5");ordinary=Proof(io,utc,true);
+            Check(!AccountQueries.IsOrdinaryCashSource(trade,ordinary,"005930",utc),"explicit credit classification is not overridden by a cash-only request");
+            io=new Response();io.Holding(0,kind:"");io.SetRow(0,22,"");trade=Proof(io,utc,false);
+            io.SetRow(0,2,"3");ordinary=Proof(io,utc,true);
+            Check(!AccountQueries.IsOrdinaryCashSource(trade,ordinary,"005930",utc),"explicit credit-balance response metadata conflicts with ordinary selection");
+            Reject(()=>AccountQueries.IsOrdinaryCashSource(trade,ordinary,"005930",utc,121),"callers cannot extend eligibility beyond its bounded age");
         }
     }
 }

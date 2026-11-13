@@ -90,28 +90,49 @@ namespace ShinhanNativeTrader {
             return values.OrderByDescending(value=>value.RankScore).ThenBy(value=>value.Code,StringComparer.Ordinal).Take(capacity).ToList().AsReadOnly();
         }
         public static Candidate EvaluateLive(PremarketReference reference,RealtimeQuote quote,StrategySettings settings,DateTime utcNow) {
+            string status;return EvaluateLive(reference,quote,settings,utcNow,out status);
+        }
+        public static string LiveStatus(PremarketReference reference,RealtimeQuote quote,StrategySettings settings,DateTime utcNow) {
+            string status;EvaluateLive(reference,quote,settings,utcNow,out status);return status;
+        }
+        static string Number(decimal value){return value.ToString("0.####",CultureInfo.InvariantCulture);}
+        public static Candidate EvaluateLive(PremarketReference reference,RealtimeQuote quote,StrategySettings settings,DateTime utcNow,out string status) {
             if(utcNow.Kind!=DateTimeKind.Utc)throw new ArgumentException("UTC evaluation time is required.");
             if(settings==null)throw new ArgumentNullException("settings");
             var strategy=settings.Copy();strategy.Validate();
-            if(reference==null||quote==null||!reference.Matches(strategy))return null;
+            status="사전분석 자료 확인 대기";
+            if(reference==null)return null;
+            if(!reference.Matches(strategy)){status="전략 변경 / 사전분석 재준비 필요";return null;}
             var korea=MarketTime.ToKorea(utcNow);
-            if(reference.TargetDateKorea!=korea.Date||!Rules.ValidTime(korea)||quote.Code!=reference.Code
-                ||quote.ReceivedUtc.Kind!=DateTimeKind.Utc||quote.ReceivedUtc>utcNow||utcNow-quote.ReceivedUtc>TimeSpan.FromSeconds(45)
+            if(reference.TargetDateKorea!=korea.Date){status="대상 거래일 불일치 / 사전분석 재준비 필요";return null;}
+            if(!Rules.ValidTime(korea)){status="장전·장외 / 주문 운영시간 대기";return null;}
+            if(quote==null||!quote.SequenceConfirmed){status="실시간 연속 시세 확인 대기";return null;}
+            if(quote.Code!=reference.Code){status="종목별 시세 확인 대기";return null;}
+            if(quote.MarketCode!="1"){status="정규장 시세 확인 대기";return null;}
+            if(quote.ReceivedUtc.Kind!=DateTimeKind.Utc||quote.ReceivedUtc>utcNow||utcNow-quote.ReceivedUtc>TimeSpan.FromSeconds(45)
                 ||MarketTime.ToKorea(quote.ReceivedUtc).Date!=reference.TargetDateKorea
-                ||!quote.SequenceConfirmed||quote.MarketCode!="1"
-                ||!MarketTime.CanUseQuote(quote.ToReply(),quote.ReceivedUtc)||!MarketTime.CanUseQuote(quote.ToReply(),utcNow)
-                ||quote.Price<strategy.MinPrice||quote.Price>strategy.MaxPrice||quote.Price<=reference.PriorHigh
-                ||quote.CumulativeVolume<0||quote.CumulativeVolume!=decimal.Truncate(quote.CumulativeVolume))return null;
+                ||!MarketTime.CanUseQuote(quote.ToReply(),quote.ReceivedUtc)||!MarketTime.CanUseQuote(quote.ToReply(),utcNow)) {
+                status="최신 체결시각 확인 대기";return null;
+            }
+            if(quote.Price<strategy.MinPrice||quote.Price>strategy.MaxPrice){status="설정 가격범위 밖 / 매수 제외";return null;}
+            if(quote.Price<=reference.PriorHigh){status="현재가 "+Number(quote.Price)+" / 돌파기준 "+Number(reference.PriorHigh)+" 미돌파";return null;}
+            if(quote.CumulativeVolume<0||quote.CumulativeVolume!=decimal.Truncate(quote.CumulativeVolume)) {
+                status="누적거래량 확인 대기";return null;
+            }
             try {
-                if(quote.CumulativeVolume<reference.AverageVolume*strategy.VolumeMultiplier)return null;
+                decimal requiredVolume=reference.AverageVolume*strategy.VolumeMultiplier;
+                if(quote.CumulativeVolume<requiredVolume) {
+                    status="누적거래량 "+Number(quote.CumulativeVolume)+" / 기준 "+Number(requiredVolume)+" 미달";return null;
+                }
                 decimal ratio=quote.CumulativeVolume/reference.AverageVolume;
                 decimal score=decimal.Round((quote.Price/reference.PriorHigh-1m)*100m+(ratio-1m)*3m,2);
+                status="매수 조건 충족 / 주문 전 계좌 확인 필요";
                 return new Candidate{Code=reference.Code,Name=reference.Name,Price=quote.Price,Score=score,
                     SignalDate=korea.ToString("yyyyMMdd",CultureInfo.InvariantCulture),
                     Reason="완료봉 기준 "+reference.LastCompletedBarDate+" / "+strategy.FastPeriod+"일선>"+strategy.SlowPeriod
                         +"일선 + 직전"+strategy.BreakoutPeriod+"봉 고점 "+reference.PriorHigh.ToString("0.####",CultureInfo.InvariantCulture)
                         +" 돌파 + 당일 누적거래량 "+ratio.ToString("0.##",CultureInfo.InvariantCulture)+"배"};
-            }catch(OverflowException){return null;}
+            }catch(OverflowException){status="전략 계산 범위 확인 필요";return null;}
         }
     }
 }

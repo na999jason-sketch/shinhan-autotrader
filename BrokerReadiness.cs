@@ -38,7 +38,8 @@ namespace ShinhanNativeTrader {
         readonly Dictionary<string,Tuple<int,DateTime>> balanceSellable=new Dictionary<string,Tuple<int,DateTime>>(StringComparer.Ordinal);
         readonly Dictionary<string,TradingDateEvidence> tradingDates=new Dictionary<string,TradingDateEvidence>(StringComparer.Ordinal);
         List<Holding> holdings;
-        Stamp holdingTime,cashTime,orderTime,brokerDateTime;
+        Stamp holdingTime,cashTime,orderTime,brokerDateTime,ordinaryTime;
+        BrokerHoldingsSnapshot tradeBalanceEvidence,ordinaryEvidence;
         AccountCashSnapshot cash;
         BrokerOrdersSnapshot orders;
         string brokerDate;
@@ -168,9 +169,28 @@ namespace ShinhanNativeTrader {
                 // account exposure for either new buys or strategy sales.
                 // A verified empty frame is allowed only through the parser's
                 // explicitly bound trade-basis request context.
-                holdings=values;holdingTime=stamp;holdingsTradeBasis=basisVerified;sellable.Clear();foreach(var pair in next)sellable[pair.Key]=pair.Value;
+                holdings=values;holdingTime=stamp;holdingsTradeBasis=basisVerified;tradeBalanceEvidence=CopyBalance(value);sellable.Clear();foreach(var pair in next)sellable[pair.Key]=pair.Value;
                 brokerDate=value.BrokerDate;brokerDateValidated=value.BrokerDateValidated;brokerDateTime=stamp;AdvanceEpoch();return true;
             }
+        }
+
+        static BrokerHoldingsSnapshot CopyBalance(BrokerHoldingsSnapshot value) {
+            var copy=new BrokerHoldingsSnapshot{BasisVerified=value.BasisVerified,RequestBasisVerified=value.RequestBasisVerified,
+                RequestOrdinaryOnlyVerified=value.RequestOrdinaryOnlyVerified,RequestStartedUtc=value.RequestStartedUtc,ReceivedUtc=value.ReceivedUtc};
+            copy.Holdings.AddRange(CopyHoldings(value.Holdings));
+            foreach(var x in value.BasisValidated)copy.BasisValidated.Add(x.Key,x.Value);
+            foreach(var x in value.BasisDiagnostics)copy.BasisDiagnostics.Add(x.Key,x.Value);
+            foreach(var x in value.SellableQuantities)copy.SellableQuantities.Add(x.Key,x.Value);
+            foreach(var x in value.UnfilledQuantities)copy.UnfilledQuantities.Add(x.Key,x.Value);
+            foreach(var x in value.CashSourceValidated)copy.CashSourceValidated.Add(x.Key,x.Value);
+            foreach(var x in value.CashProfileCompatible)copy.CashProfileCompatible.Add(x.Key,x.Value);
+            foreach(var x in value.CashProfileDiagnostics)copy.CashProfileDiagnostics.Add(x.Key,x.Value);
+            return copy;
+        }
+        public bool ObserveOrdinaryBalance(BrokerHoldingsSnapshot value) {
+            if(value==null)throw new ArgumentNullException("value");
+            var stamp=new Stamp(value.RequestStartedUtc,value.ReceivedUtc);var copy=CopyBalance(value);
+            lock(sync){if(!Newer(ordinaryTime,stamp))return false;ordinaryEvidence=copy;ordinaryTime=stamp;AdvanceEpoch();return true;}
         }
 
         static bool Fresh(Stamp stamp,DateTime now,DateTime barrier){return stamp!=null&&stamp.Started>barrier&&stamp.Received<=now&&now-stamp.Received<=TimeSpan.FromSeconds(5);}
@@ -269,11 +289,12 @@ namespace ShinhanNativeTrader {
                     result.Require(operatingRemainingLimit>0&&amount<=operatingRemainingLimit-reserved,"보유 원가·미체결 예약금을 반영한 운용한도 확인 필요");
                 } else if(effective==LiveOrderKind.Sell) {
                     Sellable value;var position=holdings==null?null:holdings.SingleOrDefault(x=>x.Code==intent.Code);
-                    bool sf=sellable.TryGetValue(intent.Code,out value)&&Fresh(value.Time,nowUtc,barrier)&&value.Validated&&position!=null&&position.CreditQty==0&&value.Quantity<=position.Quantity
+                    bool fallback=Fresh(ordinaryTime,nowUtc,barrier)&&AccountQueries.IsOrdinaryCashSource(tradeBalanceEvidence,ordinaryEvidence,intent.Code,nowUtc,5);
+                    bool sf=sellable.TryGetValue(intent.Code,out value)&&Fresh(value.Time,nowUtc,barrier)&&(value.Validated||fallback)&&position!=null&&position.CreditQty==0&&value.Quantity<=position.Quantity
                         &&holdingTime!=null&&value.Time.Started==holdingTime.Started&&value.Time.Received==holdingTime.Received;
                     Tuple<int,DateTime> ad;
                     if(sf&&balanceSellable.TryGetValue(intent.Code,out ad)&&ad.Item2<=nowUtc&&nowUtc-ad.Item2<=TimeSpan.FromSeconds(5)&&ad.Item1!=value.Quantity)sf=false;
-                    checks.SellableQuantityVerified=sf;if(sf){checks.SellableQuantity=value.Quantity;stamps.Add(value.Time.Received);}
+                    checks.SellableQuantityVerified=sf;if(sf){checks.SellableQuantity=value.Quantity;stamps.Add(value.Time.Received);if(!value.Validated&&fallback)stamps.Add(ordinaryTime.Received);}
                     result.Require(sf,"현재 현물 매도가능수량 확인 필요");result.Require(sf&&intent.Quantity<=checks.SellableQuantity,"실제 매도가능수량 범위 확인 필요");
                 }
                 checks.SnapshotUtc=stamps.Count==0?DateTime.SpecifyKind(DateTime.MinValue,DateTimeKind.Utc):stamps.Min();

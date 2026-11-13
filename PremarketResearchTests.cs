@@ -89,6 +89,15 @@ namespace ShinhanNativeTrader {
             Check(PremarketResearch.EvaluateLive(reference,Quote(price:12500),settings,Now)==null,"touching the previous high is not a breakout");
             Check(PremarketResearch.EvaluateLive(reference,Quote(volume:129),settings,Now)==null
                 &&PremarketResearch.EvaluateLive(reference,Quote(volume:130),settings,Now)!=null,"actual cumulative volume must reach the completed-average multiplier including its exact boundary");
+            Check(PremarketResearch.LiveStatus(reference,Quote(price:12500),settings,Now)=="현재가 12500 / 돌파기준 12500 미돌파",
+                "a fresh observed quote below the breakout displays the actual unmet price threshold rather than a realtime wait");
+            Check(PremarketResearch.LiveStatus(reference,Quote(volume:129),settings,Now)=="누적거래량 129 / 기준 130 미달",
+                "a fresh breakout with insufficient actual volume displays the exact volume and threshold");
+            string liveStatus;var described=PremarketResearch.EvaluateLive(reference,Quote(),settings,Now,out liveStatus);
+            Check(described!=null&&described.Price==signal.Price&&described.Score==signal.Score&&liveStatus.Contains("매수 조건 충족"),
+                "entry status and candidate use the same decision path without changing eligibility or score");
+            Check(PremarketResearch.LiveStatus(reference,null,settings,Now)=="실시간 연속 시세 확인 대기",
+                "missing realtime evidence retains an explicit source-data wait");
             var quote=Quote();quote.SequenceConfirmed=false;
             Check(PremarketResearch.EvaluateLive(reference,quote,settings,Now)==null,"price-only or unconfirmed SC cannot promote preparation to an entry");
             quote=Quote();quote.MarketCode="2";
@@ -97,6 +106,8 @@ namespace ShinhanNativeTrader {
             Check(PremarketResearch.EvaluateLive(reference,quote,settings,Now)==null,"another symbol's live event cannot trigger a prepared stock");
             quote=Quote();quote.ReceivedUtc=Now.AddSeconds(-46);
             Check(PremarketResearch.EvaluateLive(reference,quote,settings,Now)==null,"old receipt timestamps cannot be refreshed by a convenient broker clock");
+            Check(PremarketResearch.LiveStatus(reference,quote,settings,Now)=="최신 체결시각 확인 대기",
+                "stale quotes cannot be described as merely waiting for a price breakout");
             quote=Quote();quote.Clock="091400";
             Check(PremarketResearch.EvaluateLive(reference,quote,settings,Now)==null,"stale broker trade clock cannot be refreshed by a new receipt timestamp");
             quote=Quote();quote.ReceivedUtc=Now.AddSeconds(1);
@@ -115,6 +126,10 @@ namespace ShinhanNativeTrader {
             Reject(()=>PremarketResearch.EvaluateLive(reference,Quote(),settings,DateTime.SpecifyKind(Now,DateTimeKind.Local)),"live evaluation requires explicit UTC");
             var edited=settings.Copy();edited.VolumeMultiplier=2;
             Check(PremarketResearch.EvaluateLive(reference,Quote(volume:1000),edited,Now)==null,"entry strategy edits require rebuilding a prepared reference even if the new threshold would pass");
+            Check(PremarketResearch.LiveStatus(reference,Quote(),edited,Now).Contains("전략 변경"),
+                "status reports strategy mismatch instead of applying a newly configured threshold to old research");
+            Check(PremarketResearch.LiveStatus(Reference(target:new DateTime(2026,11,12)),Quote(),settings,Now).Contains("대상 거래일 불일치"),
+                "status reports an old target day without implying that current live prices can revive its reference");
             edited=settings.Copy();edited.FastPeriod=4;
             Check(PremarketResearch.EvaluateLive(reference,Quote(),edited,Now)==null,"moving-average period edits cannot silently reuse old statistics");
             edited=settings.Copy();edited.StopLossPercent=5;

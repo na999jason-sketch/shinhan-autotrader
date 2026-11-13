@@ -31,6 +31,11 @@ namespace ShinhanNativeTrader {
             var snapshot=AccountQueries.ReadHoldings(io,Now.AddMilliseconds(-100),requestBound);
             snapshot.RequestStartedUtc=Now.AddMilliseconds(-200);return snapshot;
         }
+        static BrokerHoldingsSnapshot OrdinaryBalance(bool requestBound=true,Action<HoldingsResponse> configure=null) {
+            var io=new HoldingsResponse();io.Fields[2]="5";io.Fields[3]="";io.Fields[22]="";if(configure!=null)configure(io);
+            var snapshot=AccountQueries.ReadHoldings(io,Now.AddMilliseconds(-90),false,requestBound);
+            snapshot.RequestStartedUtc=Now.AddMilliseconds(-190);return snapshot;
+        }
         sealed class Fixture {
             public BrokerReadiness Data=new BrokerReadiness(new string('a',64),Fingerprint);
             public LiveOrderJournalState Journal=new LiveOrderJournalState{AccountFingerprint=Fingerprint};
@@ -223,7 +228,49 @@ namespace ShinhanNativeTrader {
             Reject(()=>new BrokerReadiness("12345678901",Fingerprint),"readiness never uses plaintext account numbers as stored account keys");
             Reject(()=>f.Data.ObserveCash(new AccountCashSnapshot{ReceivedUtc=Now.AddSeconds(-1)},Now),"a response cannot precede its request");
             Reject(()=>f.Data.Invalidate(DateTime.SpecifyKind(Now,DateTimeKind.Local)),"local clock timestamps cannot masquerade as UTC evidence");
+            OrdinarySourceChecks();
             return checks;
+        }
+        static void OrdinarySourceChecks() {
+            var trade=ParsedBalance("",true,io=>{io.Fields[3]="";io.Fields[22]="";});
+            var f=new Fixture();f.Data.ObserveTradeBalance(trade);
+            Check(!f.Evaluate(Sell(2)).Ready&&f.Evaluate().Ready,"missing row cash metadata blocks sales without changing existing buy exposure checks");
+            var ordinary=OrdinaryBalance();f.Data.ObserveOrdinaryBalance(ordinary);
+            var ready=f.Evaluate(Sell(2));
+            Check(ready.Ready&&ready.Checks.SellableQuantityVerified&&ready.Checks.SellableQuantity==2,"parser-produced bound ordinary subset plus fresh trade quantities establishes actual sellable shares");
+            ordinary.RequestOrdinaryOnlyVerified=false;ordinary.Holdings[0].Quantity=0;trade.Holdings[0].Quantity=0;
+            Check(f.Evaluate(Sell(2)).Ready,"caller mutation cannot change accepted copied ordinary or trade evidence");
+            foreach(var configure in new Action<HoldingsResponse>[] {
+                io=>io.Fields[0]="A000660",io=>{io.Fields[4]="1";io.Fields[10]="1";},io=>io.Fields[10]="1",io=>io.Fields[11]="1",io=>io.Fields[12]="69999",
+                io=>io.Fields[3]="유통융자",io=>io.Fields[22]="1",io=>io.Fields[22]="bad",io=>io.Fields[2]="3",io=>io.Fields[2]="4"
+            }) {
+                f=new Fixture();f.Data.ObserveTradeBalance(ParsedBalance("",true,io=>{io.Fields[3]="";io.Fields[22]="";}));
+                f.Data.ObserveOrdinaryBalance(OrdinaryBalance(true,configure));
+                Check(!f.Evaluate(Sell()).Ready,"mismatched or conflicting ordinary selection does not certify a sale");
+            }
+            f=new Fixture();f.Data.ObserveTradeBalance(ParsedBalance("",true,io=>{io.Fields[3]="";io.Fields[22]="";}));
+            f.Data.ObserveOrdinaryBalance(OrdinaryBalance(false));
+            Check(!f.Evaluate(Sell()).Ready,"rows from a request without verified ordinary-only scope never certify sellable quantity");
+            f=new Fixture();f.Data.ObserveTradeBalance(ParsedBalance("",false,io=>{io.Fields[3]="";io.Fields[22]="";}));
+            f.Data.ObserveOrdinaryBalance(OrdinaryBalance());
+            Check(!f.Evaluate(Sell()).Ready,"ordinary selection cannot substitute for trusted trade-basis quantity");
+            f=new Fixture();f.Data.ObserveTradeBalance(ParsedBalance("",true,io=>{io.Fields[3]="";io.Fields[22]="";}));
+            ordinary=OrdinaryBalance();ordinary.RequestStartedUtc=Now.AddSeconds(-7);ordinary.ReceivedUtc=Now.AddSeconds(-6);
+            f.Data.ObserveOrdinaryBalance(ordinary);
+            Check(!f.Evaluate(Sell()).Ready,"ordinary proof older than five seconds cannot certify an order even when display proof would still be recent");
+            f=new Fixture();f.Data.ObserveOrdinaryBalance(OrdinaryBalance());
+            f.Data.Invalidate(Now.AddMilliseconds(-150));
+            trade=ParsedBalance("",true,io=>{io.Fields[3]="";io.Fields[22]="";});trade.RequestStartedUtc=Now.AddMilliseconds(-100);trade.ReceivedUtc=Now.AddMilliseconds(-50);
+            f.Data.ObserveTradeBalance(trade);
+            Check(!f.Evaluate(Sell()).Checks.SellableQuantityVerified,"an account change after the ordinary request requires a new subset rather than reusing old classification");
+            f=new Fixture();f.Data.ObserveTradeBalance(ParsedBalance("",true,io=>{io.Fields[3]="";io.Fields[22]="1";}));
+            f.Data.ObserveOrdinaryBalance(OrdinaryBalance());
+            Check(!f.Evaluate(Sell()).Ready,"positive financing amount on the trade source is not overwritten by an ordinary subset");
+            f=new Fixture();f.Data.ObserveTradeBalance(ParsedBalance("",true,io=>{io.Fields[3]="";io.Fields[22]="";}));
+            f.Data.ObserveOrdinaryBalance(OrdinaryBalance());ready=f.Evaluate(Sell());
+            Check(ready.Ready&&ready.EvidenceStillCurrent(),"ordinary proof participates in the normal current-evidence token");
+            ordinary=OrdinaryBalance();ordinary.RequestStartedUtc=Now;ordinary.ReceivedUtc=Now.AddMilliseconds(50);f.Data.ObserveOrdinaryBalance(ordinary);
+            Check(!ready.EvidenceStillCurrent(),"new ordinary evidence invalidates a previously built order proof before send");
         }
     }
 }

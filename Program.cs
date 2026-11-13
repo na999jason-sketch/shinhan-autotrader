@@ -16,7 +16,7 @@ namespace ShinhanNativeTrader {
         public AccountUserActionException(string message):base(message){}
     }
     internal static class Program {
-        internal const string Version="2.2.2";
+        internal const string Version="2.2.3";
         [STAThread]
         static int Main(string[] args) {
             if(args.Contains("--selftest")) {
@@ -143,7 +143,7 @@ namespace ShinhanNativeTrader {
         AccountCredentialSession credentials;
         AccountCashSnapshot cash;
         BrokerOrdersSnapshot brokerOrders;
-        BrokerHoldingsSnapshot tradeHoldings;
+        BrokerHoldingsSnapshot tradeHoldings,ordinaryHoldings;
         LiveOrderJournal journal;
         LiveOrderGateway gateway;
         RealtimeIndi realtime;
@@ -158,6 +158,7 @@ namespace ShinhanNativeTrader {
         string boundKey,lastReportKey;
         string gateDetail="실주문 미시작";
         string lastBasisDiagnostic;
+        string lastCashProfileDiagnostic;
         DateTime? lastBasisDiagnosticUtc;
         DateTime? lastRealtimeDiagnosticUtc;
         string lastSavedReportPath;
@@ -346,7 +347,10 @@ namespace ShinhanNativeTrader {
             state.Text="실계좌 매매기준 잔고·주문가능금액·주문 조회 중";Log("실계좌 조회 세션 시작. 조회만으로 실주문을 시작하지 않습니다.");
         }
         void CreateGateway(){if(gateway!=null||journal==null)return;gateway=new LiveOrderGateway(journal,api.CreateLiveOrderWire());gateway.OrderChanged+=OnGatewayOrderChanged;}
-        void QueueAccountRefresh(){if(credentials==null||accountReads.Count!=0)return;accountReads.Enqueue("TRADEHOLDINGS");accountReads.Enqueue("CASH");accountReads.Enqueue("ORDERS");nextAccountReadUtc=DateTime.UtcNow.AddSeconds(60);}
+        void QueueAccountRefresh(){if(credentials==null||accountReads.Count!=0)return;accountReads.Enqueue("TRADEHOLDINGS");accountReads.Enqueue("ORDINARYHOLDINGS");accountReads.Enqueue("CASH");accountReads.Enqueue("ORDERS");nextAccountReadUtc=DateTime.UtcNow.AddSeconds(60);}
+        void ReadAccountKind(string kind,DateTime now) {
+            credentials.Use((number,secret)=>kind=="TRADEHOLDINGS"?api.TradeHoldings(number,secret):kind=="ORDINARYHOLDINGS"?api.OrdinaryHoldings(number,secret):kind=="CASH"?api.Cash(number,secret):api.Orders(number,secret,MarketTime.ToKorea(now).ToString("yyyyMMdd",CultureInfo.InvariantCulture)));
+        }
         void Arm() {
             RequireConnected();RequireStorage();
             if(configuration.BudgetLimit<=0)throw new AccountUserActionException("전략·운용한도에서 0원보다 큰 운용한도를 저장하십시오.");
@@ -450,9 +454,10 @@ namespace ShinhanNativeTrader {
             foreach(var prepared in watchedReferences.ToList()) {
                 if(holdings.Any(x=>x.Code==prepared.Code&&x.Quantity>0)||buyQuotes.Any(x=>x.Code==prepared.Code)
                     ||entry!=null&&entry.Intent!=null&&entry.Intent.Code==prepared.Code)continue;
-                if(!realtime.TryGetQuote(prepared.Code,now,out quote))continue;
-                var candidate=PremarketResearch.EvaluateLive(prepared,quote,configuration.Strategy,now);
-                if(candidate==null)continue;
+                if(!realtime.TryGetQuote(prepared.Code,now,out quote)){SetCandidateStatus(prepared.Code,"실시간 연속 시세 확인 대기");continue;}
+                string status;var candidate=PremarketResearch.EvaluateLive(prepared,quote,configuration.Strategy,now,out status);
+                if(candidate==null){SetCandidateStatus(prepared.Code,status);continue;}
+                SetCandidateStatus(prepared.Code,status);
                 string key="entry-"+MarketTime.ToKorea(now).ToString("yyyyMMdd",CultureInfo.InvariantCulture)+"-"+candidate.Code;
                 if(journal==null||journal.Snapshot.Orders.Any(x=>x.ClientKey==key))continue;
                 buyQuotes.Enqueue(candidate);SetCandidateStatus(candidate.Code,"실시간 돌파·거래량 확인 / 계좌 재조회 대기");
@@ -471,8 +476,8 @@ namespace ShinhanNativeTrader {
             sellDecisions.Clear();RefreshAccount();
         }
         void CloseGateway(){if(gateway!=null){var previous=gateway;gateway=null;previous.OrderChanged-=OnGatewayOrderChanged;previous.Dispose();}orderAcknowledgementPending=false;}
-        void ReleaseAccount(){authorization.Revoke();CloseGateway();DisposeRealtime();accountEvents=null;readiness=null;if(journal!=null){journal.Dispose();journal=null;}if(credentials!=null){credentials.Dispose();credentials=null;}boundKey=null;account.ReadOnly=false;}
-        void ClearAccountData(){holdings.Clear();priceReceivedUtc.Clear();quoteDue.Clear();sellDecisions.Clear();balanceSignatures.Clear();cash=null;brokerOrders=null;tradeHoldings=null;holdingsReceivedUtc=null;lastBasisDiagnostic=null;lastSavedReportPath=null;lastReportSavedUtc=null;initialReportComplete=false;if(!reportWriteFault)reportStatus.Text="보고서: 계좌 조회 응답 대기 (CSV)";blockedSignals.Clear();RefreshAccount();RefreshOrders();}
+        void ReleaseAccount(){authorization.Revoke();CloseGateway();DisposeRealtime();accountEvents=null;readiness=null;ordinaryHoldings=null;if(journal!=null){journal.Dispose();journal=null;}if(credentials!=null){credentials.Dispose();credentials=null;}boundKey=null;account.ReadOnly=false;}
+        void ClearAccountData(){holdings.Clear();priceReceivedUtc.Clear();quoteDue.Clear();sellDecisions.Clear();balanceSignatures.Clear();cash=null;brokerOrders=null;tradeHoldings=null;ordinaryHoldings=null;holdingsReceivedUtc=null;lastBasisDiagnostic=null;lastCashProfileDiagnostic=null;lastSavedReportPath=null;lastReportSavedUtc=null;initialReportComplete=false;if(!reportWriteFault)reportStatus.Text="보고서: 계좌 조회 응답 대기 (CSV)";blockedSignals.Clear();RefreshAccount();RefreshOrders();}
         void CloseSession() {
             DateTime day=session.SessionDateKorea??MarketTime.NowKorea.Date;string reason=session.CloseReason;
             authorization.Revoke();if(readiness!=null)readiness.SetAuthorization(false);UpdateOrderStatus();
@@ -513,7 +518,7 @@ namespace ShinhanNativeTrader {
             if(monitoring&&credentials!=null&&now>=nextAccountReadUtc)QueueAccountRefresh();
             if(accountReads.Count>0&&credentials!=null) {
                 string kind=accountReads.Dequeue();
-                credentials.Use((number,secret)=>kind=="TRADEHOLDINGS"?api.TradeHoldings(number,secret):kind=="CASH"?api.Cash(number,secret):api.Orders(number,secret,MarketTime.ToKorea(now).ToString("yyyyMMdd",CultureInfo.InvariantCulture)));return;
+                ReadAccountKind(kind,now);return;
             }
             var due=monitoring&&(ActiveSession||!scanning)?holdings.Where(x=>x.Quantity>0&&(!quoteDue.ContainsKey(x.Code)||quoteDue[x.Code]<=now)).OrderBy(x=>quoteDue.ContainsKey(x.Code)?quoteDue[x.Code]:DateTime.MinValue).FirstOrDefault():null;
             bool research=buyQuotes.Count>0||(scanning&&scans.Count>0);
@@ -573,6 +578,11 @@ namespace ShinhanNativeTrader {
                 if(tradeHoldings.BasisVerified)state.Text="매매기준 실계좌 잔고 "+holdings.Count+"종목 / 기존·신규 보유 함께 감시";
                 else{state.Text="잔고 조회 계속 / 주문 잔고기준 확인 대기 · "+holdings.Count+"종목 표시";UpdateOrderStatus("조회 계속 / 주문 잔고기준 확인 대기");}
                 return;
+            }
+            if(reply.Kind=="ORDINARYHOLDINGS") {
+                ordinaryHoldings=reply.TradeHoldings;if(ordinaryHoldings==null)throw new InvalidOperationException("보통잔고 조회 응답이 없습니다.");
+                if(readiness!=null&&stamped)readiness.ObserveOrdinaryBalance(ordinaryHoldings);
+                sellDecisions.Clear();LogBasisDiagnostic();FinishPreflight("ORDINARYHOLDINGS");RefreshAccount();return;
             }
             if(reply.Kind=="HOLDINGS") {
                 if(tradeHoldings==null)ApplyHoldings(reply.Holdings,stamped?(DateTime?)reply.ReceivedUtc:null);
@@ -636,15 +646,23 @@ namespace ShinhanNativeTrader {
             basisStatus.Text="잔고 검증: "+(tradeHoldings.BasisVerified?"정상 조회 응답 확인 / 실제 주문가능금액·매도가능수량은 주문 직전 재확인":
                 tradeHoldings.RequestBasisVerified?"조회 설정과 응답이 일치하지 않아 재확인 필요":"계좌 조회 요청·응답 확인 대기");
             var now=DateTime.UtcNow;
+            int cashReady=holdings.Count(held=>HoldingSourcePendingAt(held,now)==null);
+            basisStatus.Text="현물 구분 "+cashReady+"/"+holdings.Count+" / "+basisStatus.Text;
+            string cashDiagnostic="현물 구분 대조: 보통잔고 요청="+(ordinaryHoldings!=null&&ordinaryHoldings.RequestOrdinaryOnlyVerified?"확인":"대기")+"; "+string.Join("; ",holdings.Select(held=> {
+                string detail;return held.Code+" "+(tradeHoldings.CashProfileDiagnostics.TryGetValue(held.Code,out detail)?detail:"Unavailable")+"; 대조="+(HoldingSourcePendingAt(held,now)==null?"확인":"대기");
+            }));
+            if(cashDiagnostic!=lastCashProfileDiagnostic){lastCashProfileDiagnostic=cashDiagnostic;Log(cashDiagnostic);}
             if(line+details!=lastBasisDiagnostic||!lastBasisDiagnosticUtc.HasValue||now-lastBasisDiagnosticUtc.Value>=TimeSpan.FromMinutes(1)) {
                 lastBasisDiagnostic=line+details;lastBasisDiagnosticUtc=now;Log(line);Log(details);
             }
         }
-        string HoldingSourcePending(Holding held) {
+        string HoldingSourcePending(Holding held) {return HoldingSourcePendingAt(held,DateTime.UtcNow);}
+        string HoldingSourcePendingAt(Holding held,DateTime utc) {
             if(tradeHoldings==null)return null;
             bool verified;
             if(!tradeHoldings.BasisVerified||!tradeHoldings.BasisValidated.TryGetValue(held.Code,out verified)||!verified)return "주문 잔고기준 확인 대기";
-            if(!tradeHoldings.CashSourceValidated.TryGetValue(held.Code,out verified)||!verified)return "현물 잔고구분 확인 대기";
+            if((!tradeHoldings.CashSourceValidated.TryGetValue(held.Code,out verified)||!verified)
+                &&!AccountQueries.IsOrdinaryCashSource(tradeHoldings,ordinaryHoldings,held.Code,utc))return "현물 잔고구분 확인 대기";
             return null;
         }
         bool ValidEntrySignal(Candidate candidate,RealtimeQuote quote,DateTime now) {
@@ -672,7 +690,9 @@ namespace ShinhanNativeTrader {
         }
         void RestartPreflight(DateTime now,bool delay) {
             if(entry==null)return;entry.Reads.Clear();entry.WaitingFor=null;entry.Capacity=null;entry.Attempts++;
-            entry.Reads.Enqueue("BARS");entry.Reads.Enqueue("TRADEHOLDINGS");entry.Reads.Enqueue("CASH");entry.Reads.Enqueue("ORDERS");
+            entry.Reads.Enqueue("BARS");
+            if(entry.Intent.Kind==LiveOrderKind.Sell||entry.Intent.Kind==LiveOrderKind.Amend)entry.Reads.Enqueue("ORDINARYHOLDINGS");
+            entry.Reads.Enqueue("CASH");entry.Reads.Enqueue("TRADEHOLDINGS");entry.Reads.Enqueue("ORDERS");
             if(entry.Intent.Kind==LiveOrderKind.Buy||entry.Intent.Kind==LiveOrderKind.Amend)entry.Reads.Enqueue("CAPACITY");
             entry.NotBeforeUtc=delay?now.AddSeconds(Math.Min(15,entry.Attempts*3)):now.AddMilliseconds(1);
             accountReads.Clear();preflightDirty=false;readiness.Invalidate(now);
@@ -692,8 +712,8 @@ namespace ShinhanNativeTrader {
             }
             entry.Reads.Dequeue();entry.WaitingFor=kind;
             if(kind=="BARS"){requestedScan=false;api.Bars(entry.Intent.Code,2);return;}
-            credentials.Use((number,secret)=>kind=="TRADEHOLDINGS"?api.TradeHoldings(number,secret):kind=="CASH"?api.Cash(number,secret)
-                :kind=="ORDERS"?api.Orders(number,secret,MarketTime.ToKorea(now).ToString("yyyyMMdd",CultureInfo.InvariantCulture)):api.Capacity(number,secret,entry.Intent.Code,entry.Intent.LimitPrice));
+            if(kind=="CAPACITY")credentials.Use((number,secret)=>api.Capacity(number,secret,entry.Intent.Code,entry.Intent.LimitPrice));
+            else ReadAccountKind(kind,now);
         }
         void SubmitPending(DateTime now) {
             var pending=entry;if(pending==null||!LiveStarted||readiness==null||journal==null)return;
@@ -792,7 +812,7 @@ namespace ShinhanNativeTrader {
             if(previous!=reason)Log("매도 판정 "+held.Code+" / "+reason);
         }
         string EvaluateHoldingSell(Holding held,IndiReply quote,DateTime utc) {
-            string pending=HoldingSourcePending(held);
+            string pending=HoldingSourcePendingAt(held,utc);
             if(pending!=null){SetHoldingDecision(held,pending);return null;}
             if(held.Quantity<=0)pending="보유수량 없음";
             else if(held.AvgPrice<=0)pending="평균단가 확인 대기";

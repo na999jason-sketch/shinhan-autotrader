@@ -271,7 +271,7 @@ namespace ShinhanNativeTrader {
             if(count!=decimal.Truncate(count)||count>limit)throw new InvalidOperationException("Indi row count outside supported range.");
             return (int)count;
         }
-        public static IndiReply Read(IIndiTransport io,string kind,string code,Action<string,string,string> quoteTrace=null,decimal? requestedPrice=null,bool tradeBasisRequested=false) {
+        public static IndiReply Read(IIndiTransport io,string kind,string code,Action<string,string,string> quoteTrace=null,decimal? requestedPrice=null,bool tradeBasisRequested=false,bool ordinaryOnlyRequested=false) {
             Func<int,string> single=col=>{
                 try{return Convert.ToString(io.Invoke("GetSingleData",col),CultureInfo.InvariantCulture)??"";}
                 catch(Exception ex){throw new FieldFailure("GetSingleData index="+col+" failed",ex);}
@@ -334,8 +334,8 @@ namespace ShinhanNativeTrader {
                 if(reply.Price<=0)throw new FieldFailure("TR_1110_11 price single[24] must be positive");
                 reply.Clock="";reply.HasTradeClock=false;
                 reply.Message="조회 가격: 거래시각 미제공, 자동매매 사용 제외";
-            }else if(kind=="TRADEHOLDINGS") {
-                reply.TradeHoldings=AccountQueries.ReadHoldings(io,DateTime.UtcNow,tradeBasisRequested);reply.Holdings=reply.TradeHoldings.Holdings;
+            }else if(kind=="TRADEHOLDINGS"||kind=="ORDINARYHOLDINGS") {
+                reply.TradeHoldings=AccountQueries.ReadHoldings(io,DateTime.UtcNow,tradeBasisRequested,ordinaryOnlyRequested);reply.Holdings=reply.TradeHoldings.Holdings;
                 reply.Count=reply.Holdings.Count;
             }else if(kind=="CASH") {
                 reply.Cash=AccountQueries.ReadCash(io,DateTime.UtcNow);reply.Count=1;
@@ -368,7 +368,7 @@ namespace ShinhanNativeTrader {
         sealed class Snapshot { public int Id;public int? ProviderErrorState;public IndiReply Reply;public Exception Error;public DateTime ReceivedUtc; }
         sealed class Pending {
             public string Kind,Code;public int? Id;
-            public bool TradeBasisRequested;
+            public bool TradeBasisRequested,OrdinaryOnlyRequested;
             public decimal? RequestedPrice;
             public DateTime RequestStartedUtc;
             public readonly List<Snapshot> Early=new List<Snapshot>();
@@ -407,6 +407,16 @@ namespace ShinhanNativeTrader {
             if(result!=null&&!(result is bool)&&result is IConvertible&&Convert.ToString(result,CultureInfo.InvariantCulture)=="0")
                 throw new InvalidOperationException(method+" returned zero.");
         }
+        static bool VerifiedHoldingsRequest(string kind,string expectedKind,string query,IDictionary<int,string> input,bool settersConfirmed,string expectedBasis) {
+            string accountNumber,secret,product,basis,unit,selection,output;
+            return kind==expectedKind&&string.Equals(query,"SABA609Q1",StringComparison.OrdinalIgnoreCase)
+                &&settersConfirmed&&input!=null&&input.Count==7
+                &&input.TryGetValue(0,out accountNumber)&&accountNumber!=null&&accountNumber.Length==11&&accountNumber.All(c=>c>='0'&&c<='9')
+                &&input.TryGetValue(2,out secret)&&!string.IsNullOrWhiteSpace(secret)&&secret.Length<=9&&!secret.Any(char.IsControl)
+                &&input.TryGetValue(1,out product)&&product=="01"
+                &&input.TryGetValue(3,out basis)&&basis==expectedBasis&&input.TryGetValue(4,out unit)&&unit=="1"
+                &&input.TryGetValue(5,out selection)&&selection=="1"&&input.TryGetValue(6,out output)&&output=="0";
+        }
         public bool Begin(string kind,string query,IDictionary<int,string> input,string code,decimal? requestedPrice=null) {
             if(disposed)throw new ObjectDisposedException("IndiRequestCoordinator");
             if(failed)throw new InvalidOperationException("Indi requests halted after an earlier error; reconnect required.");
@@ -415,7 +425,7 @@ namespace ShinhanNativeTrader {
             // the fields actually sent, never a caller-mutated dictionary.
             if(input!=null)input=new SortedDictionary<int,string>(input);
             var current=new Pending{Kind=kind,Code=code,RequestedPrice=requestedPrice};pending=current;
-            if((kind=="HOLDINGS"||kind=="TRADEHOLDINGS"||kind=="CASH"||kind=="CAPACITY"||kind=="ORDERS")&&input!=null) {
+            if((kind=="HOLDINGS"||kind=="TRADEHOLDINGS"||kind=="ORDINARYHOLDINGS"||kind=="CASH"||kind=="CAPACITY"||kind=="ORDERS")&&input!=null) {
                 var accountIndex=kind=="ORDERS"?1:0;
                 current.Sensitive=input.Where(x=>x.Key==accountIndex||x.Key==2).Select(x=>x.Value).ToArray();
                 foreach(var value in current.Sensitive)if(!string.IsNullOrWhiteSpace(value))sessionSensitive.Add(value);
@@ -438,14 +448,8 @@ namespace ShinhanNativeTrader {
                 // The documented trade-basis request scopes its successful
                 // response. Optional echo metadata is not the authority; an
                 // explicitly contradictory returned basis still blocks orders.
-                string accountNumber,secret,product,basis,unit,selection,output;
-                current.TradeBasisRequested=kind=="TRADEHOLDINGS"&&string.Equals(query,"SABA609Q1",StringComparison.OrdinalIgnoreCase)
-                    &&settersConfirmed&&input!=null&&input.Count==7
-                    &&input.TryGetValue(0,out accountNumber)&&accountNumber!=null&&accountNumber.Length==11&&accountNumber.All(c=>c>='0'&&c<='9')
-                    &&input.TryGetValue(2,out secret)&&!string.IsNullOrWhiteSpace(secret)&&secret.Length<=9&&!secret.Any(char.IsControl)
-                    &&input.TryGetValue(1,out product)&&product=="01"
-                    &&input.TryGetValue(3,out basis)&&basis=="1"&&input.TryGetValue(4,out unit)&&unit=="1"
-                    &&input.TryGetValue(5,out selection)&&selection=="1"&&input.TryGetValue(6,out output)&&output=="0";
+                current.TradeBasisRequested=VerifiedHoldingsRequest(kind,"TRADEHOLDINGS",query,input,settersConfirmed,"1");
+                current.OrdinaryOnlyRequested=VerifiedHoldingsRequest(kind,"ORDINARYHOLDINGS",query,input,settersConfirmed,"5");
                 stage="RequestData";
                 current.RequestStartedUtc=DateTime.UtcNow;
                 object raw=io.Invoke("RequestData");
@@ -482,7 +486,8 @@ namespace ShinhanNativeTrader {
             else {
                 try{snapshot.Reply=IndiResponseParser.Read(io,current.Kind,current.Code,
                     (symbol,clock,price)=>Log(IndiDiagnosticFormatter.FormatQuote(current.Kind,symbol,clock,price,sessionSensitive)),current.RequestedPrice,
-                    current.TradeBasisRequested&&diagnostic!=null&&diagnostic.ErrorState==0);}
+                    current.TradeBasisRequested&&diagnostic!=null&&diagnostic.ErrorState==0,
+                    current.OrdinaryOnlyRequested&&diagnostic!=null&&diagnostic.ErrorState==0);}
                 catch(Exception ex){snapshot.Error=ex;}
             }
             if(!current.Id.HasValue) {
@@ -590,6 +595,7 @@ namespace ShinhanNativeTrader {
         }
         public bool Cash(string account,string password){return Request("CASH","SABA602Q1",AccountQueries.CashInputs(account,password),"");}
         public bool TradeHoldings(string account,string password){return Request("TRADEHOLDINGS","SABA609Q1",AccountQueries.HoldingsInputs(account,password),"");}
+        public bool OrdinaryHoldings(string account,string password){return Request("ORDINARYHOLDINGS","SABA609Q1",AccountQueries.OrdinaryHoldingsInputs(account,password),"");}
         public bool Orders(string account,string password,string date){return Request("ORDERS","SABA231Q1",AccountQueries.OrdersInputs(account,password,date),date);}
         public bool Capacity(string account,string password,string code,decimal limitPrice) {
             code=ValidateCode(code);

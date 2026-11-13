@@ -200,9 +200,112 @@ static class PremarketUiTests {
         }
     }
 
+    static BrokerHoldingsSnapshot CashProfileSnapshot(bool ordinary,bool verified=true) {
+        var now=DateTime.UtcNow;
+        var source=new BrokerHoldingsSnapshot{RequestStartedUtc=now.AddMilliseconds(-10),ReceivedUtc=now,
+            BasisVerified=!ordinary,RequestBasisVerified=!ordinary,RequestOrdinaryOnlyVerified=ordinary&&verified};
+        source.Holdings.Add(new Holding{Code="069500",Name="SYNTHETIC ETF A",Quantity=2,AvgPrice=140940,Price=ordinary?100:86295});
+        source.Holdings.Add(new Holding{Code="305720",Name="SYNTHETIC ETF B",Quantity=8,AvgPrice=14350,Price=ordinary?200:13205});
+        foreach(var held in source.Holdings) {
+            source.BasisValidated[held.Code]=!ordinary;
+            source.BasisDiagnostics[held.Code]=ordinary?"OrdinaryBalanceCode5":"Blank";
+            source.CashSourceValidated[held.Code]=false;
+            source.CashProfileCompatible[held.Code]=true;
+            source.CashProfileDiagnostics[held.Code]="Kind=Numeric1;Loan=Blank";
+            source.SellableQuantities[held.Code]=(int)held.Quantity;source.UnfilledQuantities[held.Code]=0;
+        }
+        return source;
+    }
+    static void OrdinaryReply(MainForm form,BrokerHoldingsSnapshot source) {
+        Call(form,"Reply",new IndiReply{Kind="ORDINARYHOLDINGS",TradeHoldings=source,
+            RequestStartedUtc=source.RequestStartedUtc,ReceivedUtc=source.ReceivedUtc});
+    }
+    static string SellDecision(MainForm form,Holding held) {
+        var utc=Opening.AddSeconds(1);
+        // The strategy uses a deterministic exchange clock. Restore the real
+        // receipt stamps before testing the actual form's current-time display.
+        var stamps=new[]{Get<BrokerHoldingsSnapshot>(form,"tradeHoldings"),Get<BrokerHoldingsSnapshot>(form,"ordinaryHoldings")}
+            .Where(source=>source!=null).Select(source=>Tuple.Create(source,source.RequestStartedUtc,source.ReceivedUtc)).ToList();
+        foreach(var stamp in stamps){stamp.Item1.RequestStartedUtc=utc.AddMilliseconds(-10);stamp.Item1.ReceivedUtc=utc;}
+        try {
+            return (string)Call(form,"EvaluateHoldingSell",held,
+                new IndiReply{Code=held.Code,Price=held.Price,Clock="090001",HasTradeClock=true},utc);
+        }finally {
+            foreach(var stamp in stamps){stamp.Item1.RequestStartedUtc=stamp.Item2;stamp.Item1.ReceivedUtc=stamp.Item3;}
+        }
+    }
+    static void OrdinarySourceStatus(string data) {
+        using(var form=NewForm()) {
+            Bind(form);
+            Check(Get<UnattendedSession>(form,"session").Tick(Opening,false)==UnattendedAction.StartScan,
+                "cash-source UI fixture opens only the in-memory session without scheduling a request");
+            var trade=CashProfileSnapshot(false);
+            Call(form,"Reply",new IndiReply{Kind="TRADEHOLDINGS",TradeHoldings=trade,
+                RequestStartedUtc=trade.RequestStartedUtc,ReceivedUtc=trade.ReceivedUtc});
+            var held=Get<List<Holding>>(form,"holdings");
+            Check(held.Count==2&&held.All(x=>SellDecision(form,x)==null&&(string)Call(form,"HoldingDecision",x)=="현물 잔고구분 확인 대기"),
+                "unknown cash metadata initially leaves both existing holdings waiting for an ordinary-position source");
+
+            var missing=CashProfileSnapshot(true);missing.Holdings.Clear();OrdinaryReply(form,missing);
+            Check(held.All(x=>SellDecision(form,x)==null&&(string)Call(form,"HoldingDecision",x)=="현물 잔고구분 확인 대기"),
+                "an ordinary-only response missing the holdings cannot confirm their cash source");
+            var mismatch=CashProfileSnapshot(true);mismatch.Holdings[0].Quantity=1;mismatch.SellableQuantities["069500"]=1;mismatch.Holdings.RemoveAt(1);
+            OrdinaryReply(form,mismatch);
+            Check(held.All(x=>SellDecision(form,x)==null&&(string)Call(form,"HoldingDecision",x)=="현물 잔고구분 확인 대기"),
+                "mismatched ordinary quantities or a missing symbol keep the original holdings blocked");
+            OrdinaryReply(form,CashProfileSnapshot(true,false));
+            Check(held.All(x=>SellDecision(form,x)==null&&(string)Call(form,"HoldingDecision",x)=="현물 잔고구분 확인 대기"),
+                "matching ordinary rows without verified request provenance do not confirm a cash position");
+
+            OrdinaryReply(form,CashProfileSnapshot(true));
+            Check(held.All(x=>!string.IsNullOrEmpty(SellDecision(form,x))&&((string)Call(form,"HoldingDecision",x)).Contains("손절 -6")),
+                "verified ordinary-only selection lets both existing holdings reach their configured six-percent stop-loss decision");
+            Call(form,"RefreshAccount");
+            Check(ReferenceEquals(Get<BrokerHoldingsSnapshot>(form,"tradeHoldings"),trade)
+                &&held[0].Quantity==2&&held[0].AvgPrice==140940&&held[0].Price==86295
+                &&held[1].Quantity==8&&held[1].AvgPrice==14350&&held[1].Price==13205,
+                "ordinary selection verifies classification without replacing original trade quantities cost or market prices");
+            var grid=Get<DataGridView>(form,"holdingsGrid");
+            Check(grid.Rows.Count==2&&grid.Rows.Cast<DataGridViewRow>().All(row=>Convert.ToString(row.Cells["매도판정"].Value,CultureInfo.InvariantCulture).Contains("손절 -6"))
+                &&Convert.ToString(grid.Rows[0].Cells["평균단가"].Value,CultureInfo.InvariantCulture)=="140,940"
+                &&Convert.ToString(grid.Rows[0].Cells["현재가"].Value,CultureInfo.InvariantCulture)=="86,295",
+                "actual holdings grid displays the stop decisions with unchanged original prices");
+            Check(Get<IndiApi>(form,"api")==null&&Get<RealtimeIndi>(form,"realtime")==null&&Get<LiveOrderGateway>(form,"gateway")==null
+                &&Get<LiveOrderJournal>(form,"journal")==null&&Get<object>(form,"entry")==null,
+                "cash-source decision regression activates no broker realtime or order transport");
+            Close(form,data);
+        }
+    }
+    static void CandidateStatus(MainForm form,PremarketReference reference) {
+        var fields=new Dictionary<int,object>{{1,reference.Code},{2,"090000"},{3,reference.PriorHigh.ToString(CultureInfo.InvariantCulture)},{7,"100"},{17,"1"}};
+        var processor=new RealtimeEventProcessor(index=>fields[index]);processor.Track(reference.Code);
+        var realtime=(RealtimeIndi)FormatterServices.GetUninitializedObject(typeof(RealtimeIndi));
+        Set(realtime,"processor",processor);Set(realtime,"watch",new HashSet<string>(StringComparer.Ordinal){reference.Code});
+        Set(form,"realtime",realtime);Get<HashSet<string>>(form,"trackedQuotes").Add(reference.Code);
+        var row=Get<DataGridView>(form,"candidatesGrid").Rows.Cast<DataGridViewRow>()
+            .Single(item=>Convert.ToString(item.Cells["코드"].Value,CultureInfo.InvariantCulture)==reference.Code);
+        try {
+            processor.Process("SC",Opening);fields[2]="090001";fields[7]="101";processor.Process("SC",Opening.AddSeconds(1));
+            Call(form,"EvaluatePreparedSignals",Opening.AddSeconds(1));
+            Check(Convert.ToString(row.Cells["주문상태"].Value,CultureInfo.InvariantCulture).Contains("미돌파"),
+                "confirmed live quotes update the actual candidate row with its unmet price-breakout condition");
+            fields[2]="090002";fields[3]=(reference.PriorHigh+10).ToString(CultureInfo.InvariantCulture);fields[7]="102";processor.Process("SC",Opening.AddSeconds(2));
+            Call(form,"EvaluatePreparedSignals",Opening.AddSeconds(2));
+            Check(Convert.ToString(row.Cells["주문상태"].Value,CultureInfo.InvariantCulture).Contains("누적거래량")
+                &&Convert.ToString(row.Cells["주문상태"].Value,CultureInfo.InvariantCulture).Contains("미달"),
+                "candidate row distinguishes a sufficient breakout price from insufficient live cumulative volume");
+            fields[2]="090003";fields[7]=(reference.AverageVolume*2).ToString(CultureInfo.InvariantCulture);processor.Process("SC",Opening.AddSeconds(3));
+            Call(form,"EvaluatePreparedSignals",Opening.AddSeconds(3));
+            Check(Convert.ToString(row.Cells["주문상태"].Value,CultureInfo.InvariantCulture).Contains("매수 조건 충족"),
+                "candidate row identifies satisfied live price and volume conditions before account preflight");
+            Check(Get<Queue<Candidate>>(form,"buyQuotes").Count==0&&Get<LiveOrderGateway>(form,"gateway")==null&&Get<LiveOrderJournal>(form,"journal")==null
+                &&Get<object>(form,"entry")==null,"candidate status changes cannot queue or transmit an order without an order journal");
+        }finally {Call(form,"DisposeRealtime");}
+    }
+
     static void Run(string data,string screenshot) {
         using(var form=NewForm()) {
-            Check(form.Text.Contains("2.2.2"),"premarket regression runs against version 2.2.2");
+            Check(form.Text.Contains("2.2.3"),"premarket regression runs against version 2.2.3");
             Check(!Get<LiveTradingSession>(form,"authorization").Active,"application startup never authorizes live orders");
             var fixture=new Fixture(form);Bind(form);
             Call(form,"BeginResearch",Opening.AddHours(-10),false);
@@ -258,6 +361,7 @@ static class PremarketUiTests {
             Call(form,"Reply",new IndiReply{Kind="QUOTE",Code="069500",Price=71000,HasTradeClock=false,Clock=""});
             Check(Get<Label>(form,"state").Text.Contains("조회 전용")&&Get<Label>(form,"state").Text.Contains("실시간 SC 상태는 별도")
                 &&Get<Label>(form,"quoteStatus").Text==streamStatus,"manual snapshot's missing clock is described separately from realtime SC status");
+            CandidateStatus(form,reference);
             Call(form,"UpdateResearchStatus",Opening.AddSeconds(1));
             if(screenshot!=null)Capture(form,screenshot);
 
@@ -312,6 +416,7 @@ static class PremarketUiTests {
             Close(form,data);
         }
         RealtimeStatus(data);
+        OrdinarySourceStatus(data);
     }
 
     [STAThread] static int Main(string[] arguments) {

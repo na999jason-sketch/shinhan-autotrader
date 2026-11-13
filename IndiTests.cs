@@ -67,8 +67,67 @@ namespace ShinhanNativeTrader {
         static void Reject(Action action,string name){bool rejected=false;try{action();}catch(InvalidOperationException){rejected=true;}Check(rejected,name);}
         static bool BeginQuote(IndiRequestCoordinator requests){return requests.Begin("QUOTE","SC",new Dictionary<int,string>{{0,"005930"}},"005930");}
         static bool BeginSnapshot(IndiRequestCoordinator requests){return requests.Begin("SNAPSHOT","TR_1110_11",new Dictionary<int,string>{{0,"005930"}},"005930");}
+        static void OrdinaryHoldingsProvenance() {
+            const string number="12345678901",secret="5678";
+            var fake=new FakeIndi();fake.TradeHolding("5");fake.Fields["m:0:3"]="";fake.Fields["m:0:22"]="";
+            fake.Diagnostic.Message="계좌"+number+" 암호"+secret;
+            var requests=new IndiRequestCoordinator(fake);IndiReply reply=null;int fatal=0;string trace="";
+            requests.Done+=value=>reply=value;requests.Fatal+=value=>fatal++;requests.Trace+=value=>trace+=value;
+            Check(requests.Begin("ORDINARYHOLDINGS","SABA609Q1",AccountQueries.OrdinaryHoldingsInputs(number,secret),""),"ordinary-only query accepts its documented full SI3=5 profile");
+            fake.Data(99);Check(reply==null&&requests.Busy,"ordinary-only evidence waits for its matching accepted request ID");
+            fake.Data(7);
+            Check(reply!=null&&reply.Kind=="ORDINARYHOLDINGS"&&reply.Holdings.Count==1&&reply.TradeHoldings.RequestOrdinaryOnlyVerified,"normal correlated SI3=5 response proves filtered ordinary membership without guessing blank metadata");
+            Check(!reply.TradeHoldings.BasisVerified&&!reply.TradeHoldings.RequestBasisVerified,"ordinary-only membership never substitutes for SI3=1 quantity-basis authority");
+            Check(reply.TradeHoldings.RequestStartedUtc.Kind==DateTimeKind.Utc&&reply.TradeHoldings.ReceivedUtc.Kind==DateTimeKind.Utc
+                &&reply.TradeHoldings.RequestStartedUtc<=reply.TradeHoldings.ReceivedUtc,"ordinary-only evidence retains actual request and callback UTC timestamps");
+            Check(!trace.Contains(number)&&!trace.Contains(secret),"ordinary-only request diagnostics redact credentials at every stage");requests.Dispose();
+
+            fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+            fake.DuringRequest=()=>fake.Data(7);
+            Check(requests.Begin("ORDINARYHOLDINGS","SABA609Q1",AccountQueries.OrdinaryHoldingsInputs(number,secret),"")
+                &&reply!=null&&reply.TradeHoldings.RequestOrdinaryOnlyVerified&&reply.Holdings.Count==0,"matching reentrant ordinary-only response binds proof before the native request returns");requests.Dispose();
+            for(int field=0;field<7;field++) {
+                fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+                var input=AccountQueries.OrdinaryHoldingsInputs(number,secret);
+                input[field]=field==0?"bad":field==1?"02":field==2?"":field==3?"1":field==4?"2":field==5?"0":"1";
+                requests.Begin("ORDINARYHOLDINGS","SABA609Q1",input,"");fake.Data(7);
+                Check(reply!=null&&!reply.TradeHoldings.RequestOrdinaryOnlyVerified,"changed ordinary-only request field cannot mint SI3=5 provenance: "+field);requests.Dispose();
+            }
+            for(int partial=0;partial<2;partial++) {
+                fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+                var input=AccountQueries.OrdinaryHoldingsInputs(number,secret);if(partial==0)input.Remove(6);else input[7]="unsupported";
+                requests.Begin("ORDINARYHOLDINGS","SABA609Q1",input,"");fake.Data(7);
+                Check(reply!=null&&!reply.TradeHoldings.RequestOrdinaryOnlyVerified,"missing or additional request fields cannot prove ordinary-only scope: "+partial);requests.Dispose();
+            }
+            fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+            requests.Begin("ORDINARYHOLDINGS","SABA200QB",AccountQueries.OrdinaryHoldingsInputs(number,secret),"");fake.Data(7);
+            Check(reply!=null&&!reply.TradeHoldings.RequestOrdinaryOnlyVerified,"different query cannot inherit ordinary-only provenance");requests.Dispose();
+            fake=new FakeIndi{QueryReadbackOverride="SABA200QB"};requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+            Check(!requests.Begin("ORDINARYHOLDINGS","SABA609Q1",AccountQueries.OrdinaryHoldingsInputs(number,secret),"")&&requests.Failed&&reply==null,"ordinary-only query-name readback mismatch fails before native request acceptance");requests.Dispose();
+            for(int ambiguous=0;ambiguous<2;ambiguous++) {
+                fake=new FakeIndi{OverrideSetterReturns=true,QuerySetterReturn=ambiguous==0?null:(object)true,FieldSetterReturn=ambiguous==0?(object)true:(object)1};
+                requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+                requests.Begin("ORDINARYHOLDINGS","SABA609Q1",AccountQueries.OrdinaryHoldingsInputs(number,secret),"");fake.Data(7);
+                Check(reply!=null&&!reply.TradeHoldings.RequestOrdinaryOnlyVerified,"unknown setter return can display but cannot prove ordinary-only scope: "+ambiguous);requests.Dispose();
+            }
+            for(int unknown=0;unknown<2;unknown++) {
+                fake=new FakeIndi{DiagnosticThrows=unknown==0};if(unknown==1)fake.Diagnostic.ErrorState=null;
+                requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+                requests.Begin("ORDINARYHOLDINGS","SABA609Q1",AccountQueries.OrdinaryHoldingsInputs(number,secret),"");
+                if(unknown==0)fake.Data(7);else fake.DeliverWithoutSettingStatus(7);
+                Check(reply!=null&&!reply.TradeHoldings.RequestOrdinaryOnlyVerified,"unknown response error state cannot prove ordinary-only membership: "+unknown);requests.Dispose();
+            }
+            fake=new FakeIndi{ResponseErrorState=2};requests=new IndiRequestCoordinator(fake);reply=null;fatal=0;requests.Done+=value=>reply=value;requests.Fatal+=value=>fatal++;
+            requests.Begin("ORDINARYHOLDINGS","SABA609Q1",AccountQueries.OrdinaryHoldingsInputs(number,secret),"");fake.Data(7);
+            Check(reply==null&&fatal==1&&requests.Failed,"ordinary-only provider error never becomes membership evidence");requests.Dispose();
+            fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+            var mutable=AccountQueries.OrdinaryHoldingsInputs(number,secret);fake.DuringSetField=()=>mutable[3]="3";
+            requests.Begin("ORDINARYHOLDINGS","SABA609Q1",mutable,"");fake.Data(7);
+            Check(reply!=null&&reply.TradeHoldings.RequestOrdinaryOnlyVerified,"ordinary-only provenance uses the accepted private snapshot when caller fields mutate during COM setters");requests.Dispose();
+        }
         public static int Run() {
             checks=0;
+            OrdinaryHoldingsProvenance();
             var fake=new FakeIndi();fake.Quote();var requests=new IndiRequestCoordinator(fake);
             int received=0,fatal=0;IndiReply reply=null;
             requests.Done+=value=>{received++;reply=value;};requests.Fatal+=reason=>fatal++;
