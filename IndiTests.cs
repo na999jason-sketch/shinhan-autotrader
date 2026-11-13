@@ -13,17 +13,18 @@ namespace ShinhanNativeTrader {
             public object RequestReturn;
             public int DiagnosticReads;
             public readonly IndiDiagnosticSnapshot Diagnostic=new IndiDiagnosticSnapshot{CommState=0,ErrorState=0,ErrorCode="0",Message=""};
-            public bool SetQueryAccepted=true,SetFieldAccepted=true;
+            public bool SetQueryAccepted=true,SetFieldAccepted=true,OverrideSetterReturns;
+            public object QuerySetterReturn,FieldSetterReturn;
             public string QueryName,QueryReadbackOverride;
             public string ThrowMethod;
-            public Action DuringRequest;
+            public Action DuringRequest,DuringSetField;
             public readonly Dictionary<string,object> Fields=new Dictionary<string,object>();
             public object Invoke(string method,params object[] args) {
                 if(method==ThrowMethod)throw new InvalidOperationException("account-123-password-SECRET");
                 switch(method) {
-                    case "SetQueryName":QueryName=Convert.ToString(args[0],CultureInfo.InvariantCulture);return SetQueryAccepted;
+                    case "SetQueryName":QueryName=Convert.ToString(args[0],CultureInfo.InvariantCulture);return OverrideSetterReturns?QuerySetterReturn:(object)SetQueryAccepted;
                     case "GetQueryName":return QueryReadbackOverride??QueryName;
-                    case "SetSingleData":return SetFieldAccepted;
+                    case "SetSingleData":if(DuringSetField!=null)DuringSetField();return OverrideSetterReturns?FieldSetterReturn:(object)SetFieldAccepted;
                     case "RequestData":RequestCount++;if(DuringRequest!=null)DuringRequest();if(ErrorAfterRequest)Diagnostic.ErrorState=2;return OverrideRequestReturn?RequestReturn:Id;
                     case "GetMultiRowCount":return Rows;
                     case "GetSingleData":return Field("s:"+args[0]);
@@ -97,8 +98,8 @@ namespace ShinhanNativeTrader {
             Check(!accountTrace.Contains("12345678901")&&!accountTrace.Contains("5678"),"cash diagnostics redact account and password in every stage");requests.Dispose();
 
             // Replay the 2.1 regression: ReceiveData succeeds, but the basis
-            // field differs from the documented code. Positions stay visible,
-            // account queries continue, and unknown data cannot authorize orders.
+            // field differs from the documented echo. Positions stay visible,
+            // and only the complete correlated successful request scopes them.
             fake=new FakeIndi{OverrideRequestReturn=true,RequestReturn=(short)3799};fake.TradeHolding("");
             requests=new IndiRequestCoordinator(fake);received=0;fatal=0;
             requests.Done+=value=>{received++;reply=value;};requests.Fatal+=reason=>fatal++;
@@ -106,8 +107,8 @@ namespace ShinhanNativeTrader {
             fake.Data(3798);Check(received==0&&requests.Busy,"609 unknown-basis regression preserves request ID matching");
             fake.Data(3799);
             Check(received==1&&fatal==0&&!requests.Failed&&!requests.Busy&&reply.Holdings.Count==1,"a successful unknown-basis response no longer halts or discards readable holdings");
-            Check(reply.Holdings[0].Quantity==2&&reply.Holdings[0].Price==71000&&!reply.TradeHoldings.BasisVerified
-                &&!reply.TradeHoldings.BasisValidated["005930"],"unknown basis stays unverified despite the bound request and signed current price is preserved as a price");
+            Check(reply.Holdings[0].Quantity==2&&reply.Holdings[0].Price==71000&&reply.TradeHoldings.BasisVerified
+                &&reply.TradeHoldings.RequestBasisVerified&&reply.TradeHoldings.BasisValidated["005930"],"a successful complete trade-basis request binds readable positions without requiring an optional echo code");
             Check(reply.TradeHoldings.RequestStartedUtc.Kind==DateTimeKind.Utc&&reply.TradeHoldings.RequestStartedUtc<=reply.TradeHoldings.ReceivedUtc,"unknown-basis display retains real coordinator evidence timestamps");
             fake.OverrideRequestReturn=false;fake.Id=3800;fake.Fields["s:1"]="1000000";fake.Fields["s:20"]="800000";fake.Fields["s:30"]="500000";
             Check(requests.Begin("CASH","SABA602Q1",AccountQueries.CashInputs("12345678901","5678"),""),"cash can be requested after a readable basis-unconfirmed balance");
@@ -143,6 +144,23 @@ namespace ShinhanNativeTrader {
                 if(unavailable==0)fake.Data(7);else fake.DeliverWithoutSettingStatus(7);
                 Check(reply!=null&&reply.Holdings.Count==0&&!reply.TradeHoldings.BasisVerified,"unavailable callback error status cannot certify a request-bound empty balance: "+unavailable);requests.Dispose();
             }
+            for(int malformed=0;malformed<4;malformed++) {
+                fake=new FakeIndi();fake.TradeHolding("1");requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+                var fields=AccountQueries.HoldingsInputs("12345678901","5678");
+                if(malformed==0)fields.Remove(0);else if(malformed==1)fields[0]="bad";else if(malformed==2)fields[2]="";else fields[7]="undocumented";
+                requests.Begin("TRADEHOLDINGS","SABA609Q1",fields,"");fake.Data(7);
+                Check(reply!=null&&reply.Holdings.Count==1&&!reply.TradeHoldings.RequestBasisVerified&&!reply.TradeHoldings.BasisVerified,"even code1 cannot certify an incomplete or unsupported request profile: "+malformed);requests.Dispose();
+            }
+            for(int ambiguous=0;ambiguous<2;ambiguous++) {
+                fake=new FakeIndi{OverrideSetterReturns=true,QuerySetterReturn=ambiguous==0?null:(object)true,FieldSetterReturn=ambiguous==0?(object)true:(object)1};
+                fake.TradeHolding("1");requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+                requests.Begin("TRADEHOLDINGS","SABA609Q1",AccountQueries.HoldingsInputs("12345678901","5678"),"");fake.Data(7);
+                Check(reply!=null&&!reply.TradeHoldings.BasisVerified,"ambiguous setter return cannot mint account evidence despite readable data: "+ambiguous);requests.Dispose();
+            }
+            fake=new FakeIndi();fake.TradeHolding("");requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+            var originalInputs=AccountQueries.HoldingsInputs("12345678901","5678");fake.DuringSetField=()=>originalInputs[3]="2";
+            requests.Begin("TRADEHOLDINGS","SABA609Q1",originalInputs,"");fake.Data(7);
+            Check(reply!=null&&reply.TradeHoldings.RequestBasisVerified&&reply.TradeHoldings.BasisVerified,"provenance uses the private accepted field snapshot rather than caller changes during COM setters");requests.Dispose();
 
             fake=new FakeIndi();fake.Diagnostic.Message="계좌12345678901 암호5678";requests=new IndiRequestCoordinator(fake);received=0;accountTrace="";
             requests.Trace+=value=>accountTrace+=value;requests.Done+=value=>{received++;reply=value;};

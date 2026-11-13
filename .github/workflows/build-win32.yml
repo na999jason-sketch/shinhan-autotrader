@@ -47,6 +47,9 @@ jobs:
       - name: Windows report UI persistence regression (synthetic data, no Indi)
         run: ./tests/report-ui/run.ps1
 
+      - name: Windows premarket preparation and opening transition (synthetic data, no Indi)
+        run: ./tests/premarket-ui/run.ps1
+
       - name: Native COM connection point integration (production subscriptions, no Indi)
         run: ./tests/native-com/run.ps1
 

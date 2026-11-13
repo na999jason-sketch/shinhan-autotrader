@@ -184,6 +184,9 @@ namespace ShinhanNativeTrader {
             Row(report,"평가 기준","평가손익·수익률은 수수료·세금 제외. 실현손익을 추정하지 않음.");
             Row(report,"실현손익 기준","증권사 응답값을 기록하며 날짜 미검증·불일치는 미확인으로 표시.");
             Row(report,"잔고 조회상태",holdingsKnown?"응답 수신":Unknown);
+            Row(report,"주문 잔고기준 검증",tradeHoldings==null?Unknown:tradeHoldings.BasisVerified?"매매기준 확인":"미확인: 주문 근거로 사용하지 않음");
+            Row(report,"매매기준 요청·응답 확인",tradeHoldings==null?Unknown:tradeHoldings.RequestBasisVerified?"확인":"미확인");
+            Row(report,"잔고 기준값 진단",tradeHoldings==null?Unknown:AccountQueries.BasisDiagnosticsSummary(tradeHoldings));
             Row(report,"보유 종목 수",holdingsKnown?(object)values.Count:null);
             Row(report,"총 매입금액",total==null?null:(object)total.CostBasis);
             Row(report,"총 평가금액",total==null?null:(object)total.MarketValue);

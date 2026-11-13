@@ -42,13 +42,16 @@ namespace ShinhanNativeTrader {
     }
 
     public sealed class BrokerHoldingsSnapshot {
-        // SI3 requests trade basis. A received row is certified as that basis
-        // only when its actual MO2 is the documented one-character code '1'.
-        // Unknown basis rows remain displayable, but cannot certify readiness.
+        // Quantity basis comes from a successfully bound SI3=1 full request and
+        // its correlated successful callback, as verified by the coordinator.
+        // MO2 remains diagnostic metadata: known conflicting bases invalidate
+        // the row, while a missing echo never substitutes for request evidence.
         public readonly List<Holding> Holdings=new List<Holding>();
-        public bool BasisVerified;
+        public bool BasisVerified,RequestBasisVerified;
         public readonly Dictionary<string,bool> BasisValidated=new Dictionary<string,bool>(StringComparer.Ordinal);
         public readonly Dictionary<string,string> BasisDiagnostics=new Dictionary<string,string>(StringComparer.Ordinal);
+        // Bounded enum/shape classes only, never raw account response strings.
+        public readonly Dictionary<string,string> BasisValueDiagnostics=new Dictionary<string,string>(StringComparer.Ordinal);
         public readonly Dictionary<string,int> SellableQuantities=new Dictionary<string,int>(StringComparer.Ordinal);
         public readonly Dictionary<string,bool> CashSourceValidated=new Dictionary<string,bool>(StringComparer.Ordinal);
         // MO11 has no buy/sell direction. It is not safe to copy it to either
@@ -217,6 +220,25 @@ namespace ShinhanNativeTrader {
                 default:return "Unknown";
             }
         }
+        static string BasisValueDiagnostic(string basis) {
+            if(basis==null)return "Unavailable";
+            if(basis.Length==0)return "Blank";
+            if(basis.Length!=1)return "UnsupportedLength";
+            return basis[0]>='0'&&basis[0]<='9'?"Code"+basis:"UnsupportedCharacter";
+        }
+        public static string BasisDiagnosticsSummary(BrokerHoldingsSnapshot snapshot) {
+            if(snapshot==null)return "SABA609Q1 MO2 enum: SnapshotUnavailable";
+            var categories=new[]{"Code0","Code1","Code2","Code3","Code4","Code5","Code6","Code7","Code8","Code9",
+                "Blank","Unavailable","UnsupportedLength","UnsupportedCharacter"};
+            var counts=categories.ToDictionary(x=>x,x=>0,StringComparer.Ordinal);
+            foreach(var holding in snapshot.Holdings) {
+                string category;
+                if(holding==null||holding.Code==null||!snapshot.BasisValueDiagnostics.TryGetValue(holding.Code,out category))category="Unavailable";
+                if(!counts.ContainsKey(category??""))category="UnsupportedCharacter";
+                counts[category]++;
+            }
+            return "SABA609Q1 MO2 enum: "+string.Join("; ",categories.Select(x=>x+"="+counts[x].ToString(CultureInfo.InvariantCulture)));
+        }
         static bool CreditKind(string kind) {
             return kind=="유통융자"||kind=="자기융자"||kind=="유통대주"||kind=="자기대주"||
                 kind=="차입매도"||kind=="매입자금"||kind=="예탁담보"||kind=="차입";
@@ -224,14 +246,15 @@ namespace ShinhanNativeTrader {
         public static BrokerHoldingsSnapshot ReadHoldings(IIndiTransport io,DateTime receivedUtc,bool tradeBasisRequested=false) {
             if(io==null)throw new ArgumentNullException("io");Utc(receivedUtc);
             const string query="SABA609Q1";
-            var result=new BrokerHoldingsSnapshot {ReceivedUtc=receivedUtc,BrokerDate=""};
+            var result=new BrokerHoldingsSnapshot {ReceivedUtc=receivedUtc,BrokerDate="",RequestBasisVerified=tradeBasisRequested};
             for(int row=0,count=Rows(io,query);row<count;row++) {
                 var code=Rules.Code(Multi(io,row,0,query));
                 if(code=="")throw new AccountQueryException(query+" invalid stock symbol multi[0].");
                 if(result.SellableQuantities.ContainsKey(code))
                     throw new AccountQueryException(query+" duplicate stock symbol multi[0]; cash/credit rows cannot be merged safely.");
                 var basis=OptionalProofMulti(io,row,2,query);
-                var basisValidated=basis=="1";
+                var explicitNonTrade=basis=="2"||basis=="3"||basis=="4"||basis=="5";
+                var basisValidated=tradeBasisRequested&&!explicitNonTrade;
                 var kind=OptionalProofMulti(io,row,3,query);
                 var quantity=Quantity(Multi(io,row,4,query),query+" holding quantity[4]");
                 // These fields are unsettled trades and settlement-day stock,
@@ -253,14 +276,15 @@ namespace ShinhanNativeTrader {
                     CreditQty=CreditKind(kind)||(loan.HasValue&&loan.Value>0)?quantity:0m});
                 result.BasisValidated.Add(code,basisValidated);
                 result.BasisDiagnostics.Add(code,BasisDiagnostic(basis));
+                result.BasisValueDiagnostics.Add(code,BasisValueDiagnostic(basis));
                 result.SellableQuantities.Add(code,(int)sellable);
                 result.UnfilledQuantities.Add(code,(int)unfilled);
                 result.CashSourceValidated.Add(code,cash);
             }
-            // An empty response needs explicit request-context evidence from
-            // the coordinator, never vacuous All(). That evidence cannot
-            // override an unknown or conflicting basis in a returned row.
-            result.BasisVerified=result.Holdings.Count==0?tradeBasisRequested:result.BasisValidated.Values.All(x=>x);
+            // The callback must be tied to the documented trade-basis request,
+            // even if rows echo '1'. Missing/unknown echoes are not promoted to
+            // that enum. Explicit nontrade metadata remains a contradiction.
+            result.BasisVerified=tradeBasisRequested&&result.BasisValidated.Values.All(x=>x);
             string brokerDate;
             try {brokerDate=Single(io,0,query);}catch(AccountQueryException){brokerDate="";}
             DateTime parsed;

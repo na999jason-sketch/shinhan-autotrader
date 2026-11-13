@@ -7,6 +7,30 @@ namespace ShinhanNativeTrader {
         static int checks;
         static readonly DateTime Now=new DateTime(2026,11,12,0,15,30,DateTimeKind.Utc);
         static readonly string Fingerprint=Convert.ToBase64String(new byte[32]);
+        sealed class HoldingsResponse : IIndiTransport {
+            public event Action<int> ReceiveData {add{} remove{}}
+            public event Action<int> ReceiveSysMsg {add{} remove{}}
+            public event Action<string> Error {add{} remove{}}
+            public bool BasisUnavailable;
+            public readonly Dictionary<int,object> Fields=new Dictionary<int,object> {
+                {0,"A005930"},{1,"Test holding"},{2,""},{3,"보통"},{4,"2"},
+                {10,"2"},{11,"0"},{12,"70000"},{13,"70000"},{22,"0"}
+            };
+            public object Invoke(string name,params object[] args) {
+                if(name=="GetMultiRowCount")return 1;
+                if(name=="GetSingleData")return "";
+                if(name!="GetMultiData"||Convert.ToInt32(args[0])!=0)throw new InvalidOperationException("Unexpected offline holdings getter.");
+                var field=Convert.ToInt32(args[1]);
+                if(field==2&&BasisUnavailable)throw new InvalidOperationException("Optional metadata unavailable.");
+                object value;return Fields.TryGetValue(field,out value)?value:"";
+            }
+            public void Dispose(){}
+        }
+        static BrokerHoldingsSnapshot ParsedBalance(string basis,bool requestBound,Action<HoldingsResponse> configure=null) {
+            var io=new HoldingsResponse();io.Fields[2]=basis;if(configure!=null)configure(io);
+            var snapshot=AccountQueries.ReadHoldings(io,Now.AddMilliseconds(-100),requestBound);
+            snapshot.RequestStartedUtc=Now.AddMilliseconds(-200);return snapshot;
+        }
         sealed class Fixture {
             public BrokerReadiness Data=new BrokerReadiness(new string('a',64),Fingerprint);
             public LiveOrderJournalState Journal=new LiveOrderJournalState{AccountFingerprint=Fingerprint};
@@ -120,6 +144,47 @@ namespace ShinhanNativeTrader {
             Check(!f.Evaluate().Ready,"an unbound empty query response is not assumed to be a complete trade-basis balance");
             empty=new BrokerHoldingsSnapshot{BasisVerified=true,RequestStartedUtc=Now.AddMilliseconds(-100),ReceivedUtc=Now};f.Data.ObserveTradeBalance(empty);
             Check(f.Evaluate().Ready,"an explicitly request-bound empty trade-basis frame permits a new buy after the last position has been sold");
+
+            foreach(var basis in new[]{"","0","9"}) {
+                f=new Fixture();f.Data.ObserveTradeBalance(ParsedBalance(basis,true));
+                Check(f.Evaluate().Ready&&f.Evaluate(Sell(2)).Ready,
+                    "parser-produced request-bound holdings can support buys and sales despite missing or unknown optional MO2 metadata");
+            }
+            f=new Fixture();f.Data.ObserveTradeBalance(ParsedBalance("",true,io=>io.BasisUnavailable=true));
+            Check(f.Evaluate().Ready&&f.Evaluate(Sell(2)).Ready,
+                "an unavailable optional MO2 getter does not override accepted trade-basis request context");
+            foreach(var basis in new[]{"","1"}) {
+                f=new Fixture();f.Data.ObserveTradeBalance(ParsedBalance(basis,false));
+                Check(!f.Evaluate().Ready&&!f.Evaluate(Sell()).Ready,
+                    "a parser snapshot without bound accepted request context cannot authorize orders even when MO2 echoes code one");
+            }
+            foreach(var basis in new[]{"2","3","4","5"}) {
+                f=new Fixture();f.Data.ObserveTradeBalance(ParsedBalance(basis,true));
+                Check(!f.Evaluate().Ready&&!f.Evaluate(Sell()).Ready,
+                    "explicit non-trade basis metadata still contradicts a bound request and prevents account orders");
+            }
+            f=new Fixture();f.Data.ObserveTradeBalance(ParsedBalance("",true));
+            f.Data.ObserveCash(new AccountCashSnapshot{Cash100Orderable=0,ReceivedUtc=Now},Now.AddMilliseconds(-100));
+            Check(!f.Evaluate().Ready&&f.Evaluate(Sell()).Ready,
+                "request-bound unknown metadata does not bypass actual buying power or unnecessarily require cash for a verified sale");
+            f=new Fixture();f.Data.ObserveTradeBalance(ParsedBalance("0",true));
+            f.Data.ObserveCapacity(new AccountOrderCapacity{Code="000660",LimitPrice=10000,Ratio=100,ReceivedUtc=Now},Now.AddMilliseconds(-100));
+            Check(!f.Evaluate().Ready&&f.Evaluate(Sell()).Ready,
+                "request-bound holdings cannot expand the broker's zero permitted purchase quantity");
+            f=new Fixture();f.Data.ObserveTradeBalance(ParsedBalance("",true,io=>io.Fields[11]="1"));
+            Check(!f.Evaluate().Ready&&!f.Evaluate(Sell()).Ready,
+                "request context cannot hide unmatched actual unfilled quantities from order reconciliation");
+            foreach(var field in new[]{3,22}) {
+                f=new Fixture();f.Data.ObserveTradeBalance(ParsedBalance("",true,io=>io.Fields[field]=""));
+                Check(!f.Evaluate(Sell()).Ready,"request-bound unknown MO2 cannot waive ordinary cash-kind or no-loan source checks");
+            }
+            foreach(var field in new[]{4,10,11}) {
+                f=new Fixture();f.Data.Invalidate(Now.AddMilliseconds(-500));bool rejected=false;
+                try{f.Data.ObserveTradeBalance(ParsedBalance("",true,io=>io.Fields[field]=field==4?"-1":field==10?"3":"malformed"));}
+                catch(InvalidOperationException){rejected=true;}
+                Check(rejected&&!f.Evaluate().Ready&&!f.Evaluate(Sell()).Ready,
+                    "malformed required position, possible or unfilled quantity never becomes accepted readiness evidence");
+            }
 
             f=new Fixture();Check(f.Evaluate(Sell(2)).Ready&&f.Evaluate(Sell(2)).Checks.SellableQuantity==2,"a supported fresh trade-basis quantity can support a bounded cash-stock sale");
             Check(!f.Evaluate(Sell(3)).Ready,"settlement or total holding quantity cannot expand verified sellable quantity");

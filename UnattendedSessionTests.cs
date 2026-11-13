@@ -78,6 +78,33 @@ namespace ShinhanNativeTrader {
             Check(plan.Tick(K(12,10),false)==UnattendedAction.Wait&&!plan.SessionDateKorea.HasValue,"clock rollback before arming cannot start an earlier session");
             Check(plan.Tick(K(13,9),false)==UnattendedAction.StartScan,"waiting plan resumes when time catches up");
             Reject(()=>plan.ScanCompleted(new DateTime(2026,11,13,10,0,0)),"completion also requires explicit UTC");
+
+            plan=new UnattendedSession(rescanDuringSession:false);plan.Arm(K(12,20));
+            Check(!plan.RescanDuringSession&&plan.Tick(K(13,8,59),false)==UnattendedAction.Wait
+                &&plan.Tick(K(13,9),false)==UnattendedAction.StartScan,"one-scan mode still waits for opening before establishing its session");
+            plan.ScanCompleted(K(13,9,5));
+            Check(!plan.ScanRunning&&!plan.NextScanUtc.HasValue&&plan.Tick(K(13,9,6),false)==UnattendedAction.Wait
+                &&plan.Tick(K(13,9,25),false)==UnattendedAction.Wait&&plan.Tick(K(13,12),false)==UnattendedAction.Wait,
+                "completed one-scan mode cannot rescan on immediate or overdue idle ticks");
+            plan.Arm(K(13,12,1));plan.ScanCompleted(K(13,12,2));
+            Check(plan.Tick(K(13,12,3),false)==UnattendedAction.Wait&&!plan.NextScanUtc.HasValue,
+                "repeated arming and duplicate completion cannot reset a completed day's scan");
+            Check(plan.Tick(K(13,15,20),true)==UnattendedAction.CloseSession&&plan.CloseReason=="MarketWindowEnded",
+                "completed one-scan mode still closes at the market boundary while work is busy");
+            plan.ScanCompleted(K(13,15,21));plan.SessionClosed();
+            Check(plan.Tick(K(16,9),false)==UnattendedAction.StartScan&&plan.SessionDateKorea==new DateTime(2026,11,16),
+                "acknowledged close permits exactly a fresh session scan on the next weekday");
+
+            plan=new UnattendedSession(rescanDuringSession:false);plan.Arm(K(13,10));plan.Tick(K(13,10),false);plan.ScanCompleted(K(13,10,1));
+            plan.Disarm();plan.Arm(K(13,10,2));
+            Check(plan.Tick(K(13,10,2),false)==UnattendedAction.StartScan,
+                "explicit disarm and rearm clear one-scan completion for a deliberate same-day restart");
+            plan.ScanCompleted(K(13,10,3));
+            Check(plan.Tick(K(13,10,2),false)==UnattendedAction.CloseSession&&plan.CloseReason=="ClockMovedBackwards",
+                "completed one-scan mode preserves backward-clock protection");
+            plan=new UnattendedSession(rescanDuringSession:false);plan.Arm(K(13,10));plan.Tick(K(13,10),false);plan.ScanCompleted(K(13,10,1));
+            Check(plan.Tick(K(16,10),true)==UnattendedAction.CloseSession&&plan.CloseReason=="SessionDateChanged"
+                &&plan.SessionDateKorea==new DateTime(2026,11,13),"completed one-scan mode closes its original day before adopting a later date");
             return checks;
         }
     }

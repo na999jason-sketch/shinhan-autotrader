@@ -140,6 +140,7 @@ namespace ShinhanNativeTrader {
                     throw new IndiConnectionException("설치된 Indi의 StartIndi 초기화 서명이 지원되지 않습니다.");
                 string starter=IndiInstallation.FindStarter(Type.GetTypeFromProgID("GIEXPERTCONTROL.GiExpertControlCtrl.1",true).GUID);
                 if(starter==null)throw new IndiConnectionException("등록된 신한 Indi 설치 폴더에서 giexpertstarter.exe를 찾지 못했습니다.");
+                log(IndiInstallation.DescribeBalanceSchema(starter));
                 // A running Helper establishes the shared service, not this newly-created
                 // OCX instance. Follow the C# sample's per-control initialization call.
                 bool started=dispatch.Initialize(starter);
@@ -410,6 +411,9 @@ namespace ShinhanNativeTrader {
             if(disposed)throw new ObjectDisposedException("IndiRequestCoordinator");
             if(failed)throw new InvalidOperationException("Indi requests halted after an earlier error; reconnect required.");
             if(Busy){Log("Rejected request while another TR is pending.");return false;}
+            // COM can pump callbacks. Bind provenance to a private snapshot of
+            // the fields actually sent, never a caller-mutated dictionary.
+            if(input!=null)input=new SortedDictionary<int,string>(input);
             var current=new Pending{Kind=kind,Code=code,RequestedPrice=requestedPrice};pending=current;
             if((kind=="HOLDINGS"||kind=="TRADEHOLDINGS"||kind=="CASH"||kind=="CAPACITY"||kind=="ORDERS")&&input!=null) {
                 var accountIndex=kind=="ORDERS"?1:0;
@@ -419,19 +423,27 @@ namespace ShinhanNativeTrader {
             var stage="SetQueryName";
             try {
                 Diagnose(current,"before "+query);
-                Accepted(io.Invoke("SetQueryName",query),"SetQueryName");
+                object selected=io.Invoke("SetQueryName",query);Accepted(selected,"SetQueryName");
+                bool settersConfirmed=selected is bool&&(bool)selected;
                 stage="GetQueryName";
                 var actualQuery=io.Invoke("GetQueryName") as string;
                 if(actualQuery==null||!string.Equals(actualQuery.Trim(),query,StringComparison.OrdinalIgnoreCase))
                     throw new InvalidOperationException("Installed Indi did not retain the requested query name.");
                 Log("Query name readback verified: "+query);
                 stage="SetSingleData";
-                if(input!=null)foreach(var field in input.OrderBy(x=>x.Key))Accepted(io.Invoke("SetSingleData",field.Key,field.Value),"SetSingleData");
-                // A successful, complete trade-basis request can scope an empty
-                // holdings response. It must never override a conflicting row.
-                string product,basis,unit,selection,output;
+                if(input!=null)foreach(var field in input.OrderBy(x=>x.Key)) {
+                    object accepted=io.Invoke("SetSingleData",field.Key,field.Value);Accepted(accepted,"SetSingleData");
+                    settersConfirmed=settersConfirmed&&accepted is bool&&(bool)accepted;
+                }
+                // The documented trade-basis request scopes its successful
+                // response. Optional echo metadata is not the authority; an
+                // explicitly contradictory returned basis still blocks orders.
+                string accountNumber,secret,product,basis,unit,selection,output;
                 current.TradeBasisRequested=kind=="TRADEHOLDINGS"&&string.Equals(query,"SABA609Q1",StringComparison.OrdinalIgnoreCase)
-                    &&input!=null&&input.TryGetValue(1,out product)&&product=="01"
+                    &&settersConfirmed&&input!=null&&input.Count==7
+                    &&input.TryGetValue(0,out accountNumber)&&accountNumber!=null&&accountNumber.Length==11&&accountNumber.All(c=>c>='0'&&c<='9')
+                    &&input.TryGetValue(2,out secret)&&!string.IsNullOrWhiteSpace(secret)&&secret.Length<=9&&!secret.Any(char.IsControl)
+                    &&input.TryGetValue(1,out product)&&product=="01"
                     &&input.TryGetValue(3,out basis)&&basis=="1"&&input.TryGetValue(4,out unit)&&unit=="1"
                     &&input.TryGetValue(5,out selection)&&selection=="1"&&input.TryGetValue(6,out output)&&output=="0";
                 stage="RequestData";

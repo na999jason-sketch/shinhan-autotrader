@@ -8,7 +8,7 @@ namespace ShinhanNativeTrader {
     // The caller must finish its closing work before acknowledging SessionClosed.
     public sealed class UnattendedSession {
         readonly TimeSpan rescanDelay;
-        DateTime? lastObservedUtc, closedThroughKorea;
+        DateTime? lastObservedUtc, closedThroughKorea, completedScanDateKorea;
 
         public bool Armed { get; private set; }
         public bool Closing { get; private set; }
@@ -17,11 +17,13 @@ namespace ShinhanNativeTrader {
         public DateTime? NextScanUtc { get; private set; }
         public string CloseReason { get; private set; }
         public int RescanMinutes { get; private set; }
+        public bool RescanDuringSession { get; private set; }
 
-        public UnattendedSession(int rescanMinutes = 20) {
+        public UnattendedSession(int rescanMinutes = 20,bool rescanDuringSession = true) {
             if(rescanMinutes < 1 || rescanMinutes > 240)
                 throw new ArgumentOutOfRangeException("rescanMinutes", "Rescan interval must be between 1 and 240 minutes.");
             RescanMinutes=rescanMinutes;
+            RescanDuringSession=rescanDuringSession;
             rescanDelay=TimeSpan.FromMinutes(rescanMinutes);
         }
 
@@ -51,13 +53,13 @@ namespace ShinhanNativeTrader {
             RequireUtc(utc);
             if(Armed)return; // Repeated button clicks cannot reset an active session.
             Armed=true;Closing=false;ScanRunning=false;
-            SessionDateKorea=null;closedThroughKorea=null;CloseReason=null;
+            SessionDateKorea=null;closedThroughKorea=null;completedScanDateKorea=null;CloseReason=null;
             lastObservedUtc=utc;NextScanUtc=NextOpeningUtc(utc);
         }
         public void Disarm() {
             Armed=false;Closing=false;ScanRunning=false;
             SessionDateKorea=null;NextScanUtc=null;CloseReason=null;
-            lastObservedUtc=null;closedThroughKorea=null;
+            lastObservedUtc=null;closedThroughKorea=null;completedScanDateKorea=null;
         }
         UnattendedAction Close(string reason) {
             Closing=true;CloseReason=reason;NextScanUtc=null;
@@ -83,6 +85,7 @@ namespace ShinhanNativeTrader {
                     NextScanUtc=NextOpeningUtc(utc);return UnattendedAction.Wait;
                 }
             }
+            if(!RescanDuringSession&&completedScanDateKorea==korea.Date)return UnattendedAction.Wait;
             if(workBusy || ScanRunning || (NextScanUtc.HasValue && utc<NextScanUtc.Value))return UnattendedAction.Wait;
             if(!SessionDateKorea.HasValue)SessionDateKorea=korea.Date;
             ScanRunning=true;NextScanUtc=null;
@@ -96,7 +99,8 @@ namespace ShinhanNativeTrader {
             if(!Armed || Closing || !ScanRunning || !SessionDateKorea.HasValue)return;
             if(lastObservedUtc.HasValue && utc<lastObservedUtc.Value)return;
             lastObservedUtc=utc;ScanRunning=false;
-            NextScanUtc=utc.Add(rescanDelay);
+            if(RescanDuringSession)NextScanUtc=utc.Add(rescanDelay);
+            else {completedScanDateKorea=SessionDateKorea;NextScanUtc=null;}
         }
 
         public void SessionClosed() {
