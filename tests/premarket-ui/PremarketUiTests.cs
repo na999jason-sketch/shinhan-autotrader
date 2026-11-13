@@ -394,6 +394,8 @@ static class PremarketUiTests {
                     &&Get<TextBox>(form,"orderResponseDetails").Text.Contains("접수 응답과 주문번호 확인")
                     &&journal.RecoveryRequired&&journal.Snapshot.Orders.Single(order=>order.Id==accepted.Id).Status==LiveOrderStatus.Unknown,
                     "accepted broker identity remains visible while durable Unknown and recovery restrictions remain unchanged");
+                Check(Convert.ToString(current.Cells["미체결"].Value,CultureInfo.InvariantCulture)=="대사 필요",
+                    "an unknown local remainder is not presented as a current broker unfilled quantity");
                 historicalRow=grid.Rows.Cast<DataGridViewRow>().Single(row=>(row.Tag as LiveOrderRecord).Id==historical.Id);
                 grid.ClearSelection();grid.CurrentCell=historicalRow.Cells[0];historicalRow.Selected=true;Call(form,"RefreshOrders");
                 Check((grid.SelectedRows[0].Tag as LiveOrderRecord).Id==historical.Id&&Get<TextBox>(form,"orderResponseDetails").Text=="이전 버전: 상세 응답 미기록",

@@ -914,7 +914,8 @@ namespace ShinhanNativeTrader {
             }
             foreach(var order in localOrders.Where(x=>!LiveOrderProtocol.ValidBrokerNumber(x.BrokerOrderNumber)||!shown.Contains(OrderRowKey(x)))) {
                 string number=order.Status==LiveOrderStatus.NotSent?"미전송":!string.IsNullOrEmpty(order.BrokerOrderNumber)?order.BrokerOrderNumber:order.Status==LiveOrderStatus.Rejected?"접수 거절":"접수 미확인";
-                object open=order.Status==LiveOrderStatus.Rejected||order.Status==LiveOrderStatus.NotSent?(object)"해당 없음":order.Quantity-order.FilledQuantity-order.CancelledQuantity;
+                object open=order.Status==LiveOrderStatus.Rejected||order.Status==LiveOrderStatus.NotSent?(object)"해당 없음":
+                    order.Status==LiveOrderStatus.Unknown?"대사 필요":(object)(order.Quantity-order.FilledQuantity-order.CancelledQuantity);
                 string reason=LocalOrderResponseReason(order);
                 int index=ordersGrid.Rows.Add(number,order.Code,order.Kind,order.Quantity,order.FilledQuantity,open,order.LimitPrice,"미확인",LocalOrderStatusForRecord(order),reason);
                 ordersGrid.Rows[index].Tag=order;ordersGrid.Rows[index].Cells[9].ToolTipText=reason;
