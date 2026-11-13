@@ -146,6 +146,24 @@ namespace ShinhanNativeTrader {
             if(!original)result[21]="Y";
             return result;
         }
+        public static void ApplyInstalledSchema(LiveOrderIntent intent,SortedDictionary<int,string> fields,IndiOrderSchemaInfo schema) {
+            ValidateIntent(intent);
+            if(fields==null||schema==null||schema.QueryName!=QueryName(intent)||schema.Kind==IndiOrderSchemaKind.Unknown)
+                throw new InvalidOperationException("설치된 주문 정의를 확인할 수 없습니다.");
+            if(schema.Kind==IndiOrderSchemaKind.Legacy)return;
+            if(schema.Kind!=IndiOrderSchemaKind.Modern)throw new InvalidOperationException("지원되지 않는 주문 정의입니다.");
+            if(!schema.KrxRouteInputIndex.HasValue||string.IsNullOrEmpty(schema.KrxRouteCode))
+                throw new InvalidOperationException("설치된 주문 정의의 KRX 전송 코드가 확인되지 않았습니다.");
+            bool original=intent.Kind==LiveOrderKind.Amend||intent.Kind==LiveOrderKind.Cancel;
+            int expectedRoute=original?35:37;
+            if(schema.KrxRouteInputIndex.Value!=expectedRoute)
+                throw new InvalidOperationException("설치된 주문 방식 입력 위치가 일치하지 않습니다.");
+            fields[expectedRoute]=schema.KrxRouteCode;
+            // Actual 0x0208 definitions include conditional price and SOR
+            // original identity. Ordinary KRX limit orders use neither field.
+            if(!original&&schema.InputCount==39){fields[36]="";fields[38]="";}
+            else if(original&&schema.InputCount==38){fields[36]="";fields[37]="";}
+        }
     }
 
     public sealed class LiveOrderRecord {

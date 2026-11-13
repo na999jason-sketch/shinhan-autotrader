@@ -14,7 +14,7 @@ namespace ShinhanNativeTrader {
                 {7,"매도매수구분"},{8,"종목코드"},{9,"주문수량"},{10,"주문가격"},{11,"정규시간외구분코드"},{12,"호가유형코드"},{16,"원주문번호"}})values[entry.Key]=entry.Value;
             return values;
         }
-        static byte[] Definition(string query,string[] input,string[] output,bool unicode=false) {
+        static byte[] Definition(string query,string[] input,string[] output,bool unicode=false,ushort version=0x0207,string routeAlias="ord_meth_tp_code",int routeWidth=1,byte routeType=9) {
             using(var stream=new MemoryStream())using(var writer=new BinaryWriter(stream)) {
                 Action<string> text=value=> {
                     if(unicode){writer.Write((byte)255);writer.Write((ushort)65534);writer.Write((byte)value.Length);writer.Write(Encoding.Unicode.GetBytes(value));}
@@ -27,16 +27,24 @@ namespace ShinhanNativeTrader {
                     if(!classes.TryGetValue(name,out number)){classes.Add(name,next++);writer.Write((ushort)65535);writer.Write((ushort)1);writer.Write((ushort)name.Length);writer.Write(Encoding.ASCII.GetBytes(name));}
                     else writer.Write((ushort)(32768|number));next++;
                 };
-                writer.Write((ushort)0x0207);text(query);text("합성 주문 정의");text("113");text("Q2");writer.Write(new byte[19]);writer.Write((ushort)2);
+                writer.Write(version);text(query);text("합성 주문 정의");text("113");text("Q2");writer.Write(new byte[19]);writer.Write((ushort)2);
                 foreach(var section in new[]{new{Direction=1,Fields=input},new{Direction=2,Fields=output}}) {
                     folder("Record",section.Direction,1);classTag("CIONodeFolder");folder("RECORD",section.Direction,section.Fields.Length);
                     foreach(string label in section.Fields) {
                         classTag("CIONodeItem");writer.Write((byte)1);text(label);writer.Write((byte)2);writer.Write((byte)section.Direction);writer.Write(0);writer.Write(0);
-                        writer.Write((byte)9);writer.Write(20);text("");text("");
+                        bool route=version==0x0208&&label=="주문방식구분코드";
+                        string alias=route?routeAlias:version==0x0208&&label=="주문조건가격"?"ord_cond_price":version==0x0208&&label=="SOR원주문번호"?"sor_orig_ord_no":"";
+                        int width=route?routeWidth:version==0x0208&&label=="SOR원주문번호"?18:20;
+                        writer.Write(route?routeType:(byte)9);writer.Write(width);text(alias);text("");
                     }
                 }
                 writer.Flush();return stream.ToArray();
             }
+        }
+        static string[] CurrentInputs(string query) {
+            var values=Inputs(query=="SABA101U1"?39:38);
+            values[36]="주문조건가격";values[query=="SABA101U1"?37:35]="주문방식구분코드";values[query=="SABA101U1"?38:37]="SOR원주문번호";
+            return values;
         }
         public static int Run() {
             checks=0;var legacy=new[]{"주문번호","ORC주문번호","메세지구분","메세지1","메세지2","메세지3"};
@@ -62,6 +70,46 @@ namespace ShinhanNativeTrader {
             var amendHelper=Encoding.GetEncoding(949).GetBytes("*START,SABA102U1,x\nSI,35,주문방식코드,0:KRX^1:NXT,0\n*END");
             info=IndiOrderSchema.Inspect(Definition("SABA102U1",amend,modern),"SABA102U1",amendHelper);
             Check(info.Kind==IndiOrderSchemaKind.Modern&&info.KrxRouteInputIndex==35&&info.KrxRouteCode=="0","amendment route index uses independently verified SI35");
+            var actualNew=CurrentInputs("SABA101U1");var actualAmend=CurrentInputs("SABA102U1");
+            var modern208=Definition("SABA101U1",actualNew,modern,false,0x0208);
+            var amend208=Definition("SABA102U1",actualAmend,modern,false,0x0208);
+            var currentHelper=Encoding.GetEncoding(949).GetBytes("*START,SABA101U1,합성,0,0,0\nSI,37,주문방식구분코드,,\n*END\n*START,SABA102U1,합성,0,0,0\nSI,35,주문방식구분코드,0:SOR 1:KRX 2:NXT,\n*END\n");
+            info=IndiOrderSchema.Inspect(modern208,"SABA101U1",currentHelper);
+            Check(info.Kind==IndiOrderSchemaKind.Modern&&info.SerializationVersion==0x0208&&info.InputCount==39&&info.OutputCount==8,
+                "actual 0208 envelope with 39 new-order inputs and eight venue outputs is structurally recognized");
+            Check(info.KrxRouteCode==null,"a blank new-order Helper mapping alone does not guess a route");
+            info=IndiOrderSchema.Inspect(amend208,"SABA102U1",currentHelper);
+            Check(info.Kind==IndiOrderSchemaKind.Modern&&info.InputCount==38&&info.KrxRouteInputIndex==35&&info.KrxRouteCode=="1"&&info.RouteSource=="OwnHelper",
+                "current amendment definition and whitespace-separated Helper mapping establish KRX1");
+            info=IndiOrderSchema.Inspect(modern208,"SABA101U1",currentHelper,amend208);
+            Check(info.Kind==IndiOrderSchemaKind.Modern&&info.KrxRouteInputIndex==37&&info.KrxRouteCode=="1"&&info.RouteSource=="PeerMatched",
+                "same validated route alias label type and width bind the explicit amendment enum to new orders");
+            Check(info.Diagnostic.Contains("format=0208")&&info.Diagnostic.Contains("routeSource=PeerMatched"),"format and route provenance remain visible without resource contents");
+            Check(IndiOrderSchema.Inspect(modern208,"SABA101U1",currentHelper,amend208.Take(amend208.Length-1).ToArray()).KrxRouteCode==null,
+                "a truncated peer resource cannot supply a route");
+            Check(IndiOrderSchema.Inspect(modern208,"SABA101U1",currentHelper,Definition("SABA102U1",actualAmend,modern,false,0x0208,"different_domain")).KrxRouteCode==null,
+                "another internal alias cannot lend its route enum");
+            Check(IndiOrderSchema.Inspect(modern208,"SABA101U1",currentHelper,Definition("SABA102U1",actualAmend,modern,false,0x0208,"ord_meth_tp_code",2)).KrxRouteCode==null,
+                "a wider peer route field does not establish the same scalar domain");
+            Check(IndiOrderSchema.Inspect(modern208,"SABA101U1",currentHelper,Definition("SABA102U1",actualAmend,modern,false,0x0208,"ord_meth_tp_code",1,16)).KrxRouteCode==null,
+                "another peer scalar type does not establish a route");
+            Check(IndiOrderSchema.Inspect(modern208,"SABA101U1",currentHelper,Definition("SABA102U1",amend,modern)).KrxRouteCode==null,
+                "an old envelope cannot supply an unverified cross-query domain");
+            var ownHelper=Encoding.GetEncoding(949).GetBytes("*START,SABA101U1,x\nSI,37,주문방식구분코드,0:SOR 1:KRX 2:NXT,\n*END\n*START,SABA102U1,x\nSI,35,주문방식구분코드,0:SOR 1:KRX 2:NXT,\n*END");
+            info=IndiOrderSchema.Inspect(modern208,"SABA101U1",ownHelper,amend208);
+            Check(info.KrxRouteCode=="1"&&info.RouteSource=="OwnHelper","an explicit own mapping remains the primary route authority");
+            var conflictingHelper=Encoding.GetEncoding(949).GetBytes("*START,SABA101U1,x\nSI,37,주문방식구분코드,0:KRX 1:NXT,\n*END\n*START,SABA102U1,x\nSI,35,주문방식구분코드,0:SOR 1:KRX 2:NXT,\n*END");
+            info=IndiOrderSchema.Inspect(modern208,"SABA101U1",conflictingHelper,amend208);
+            Check(info.KrxRouteCode==null&&info.RouteSource=="Conflict","contradictory explicit own and peer mappings are never silently chosen");
+            var duplicateOwn=Encoding.GetEncoding(949).GetBytes("*START,SABA101U1,x\nSI,37,주문방식구분코드,0:KRX 1:KRX,\n*END\n*START,SABA102U1,x\nSI,35,주문방식구분코드,1:KRX,\n*END");
+            Check(IndiOrderSchema.Inspect(modern208,"SABA101U1",duplicateOwn,amend208).KrxRouteCode==null,"ambiguous own mappings cannot be hidden by a peer fallback");
+            var wrongTail=(string[])actualNew.Clone();wrongTail[38]="원주문번호";
+            Check(IndiOrderSchema.Inspect(Definition("SABA101U1",wrongTail,modern,false,0x0208),"SABA101U1",currentHelper,amend208).Kind==IndiOrderSchemaKind.Unknown,
+                "a missing SOR-original tail cannot masquerade as the actual current profile");
+            Check(IndiOrderSchema.Inspect(Definition("SABA101U1",input,modern,false,0x0208),"SABA101U1").Kind==IndiOrderSchemaKind.Unknown,
+                "0208 cannot reuse a guessed 38-field new-order profile");
+            Check(IndiOrderSchema.Inspect(Definition("SABA101U1",actualNew,modern,false,0x0209),"SABA101U1").Kind==IndiOrderSchemaKind.Unknown,
+                "another serialization marker is not assumed compatible");
             var shuffled=(string[])modern.Clone();shuffled[0]="KRX주문번호";shuffled[1]="SOR주문번호";
             Check(IndiOrderSchema.Inspect(Definition("SABA101U1",input,shuffled),"SABA101U1").Kind==IndiOrderSchemaKind.Unknown,"order-ID label order cannot be guessed from the set of strings");
             var bad=(string[])input.Clone();bad[7]="원주문번호";
@@ -108,6 +156,21 @@ namespace ShinhanNativeTrader {
                 File.Delete(Path.Combine(directory,"config","helpertrinfo.dat"));File.WriteAllBytes(primaryPath,helper);
                 info=IndiOrderSchema.ReadInstalled(starter,"SABA101U1");
                 Check(info.HelperSource=="Primary"&&info.KrxRouteCode=="1","primary helper works without a legacy config directory entry");
+                File.WriteAllBytes(Path.Combine(directory,"qry","saba101u1.xtr"),modern208);
+                File.WriteAllBytes(Path.Combine(directory,"qry","saba102u1.xtr"),amend208);
+                File.WriteAllBytes(primaryPath,currentHelper);
+                info=IndiOrderSchema.ReadInstalled(starter,"SABA101U1");
+                Check(info.Kind==IndiOrderSchemaKind.Modern&&info.SerializationVersion==0x0208&&info.KrxRouteInputIndex==37
+                    &&info.KrxRouteCode=="1"&&info.RouteSource=="PeerMatched"&&info.HelperSource=="Primary",
+                    "installed new-order inspection binds the independently parsed current amendment file and Helper enum");
+                File.Delete(Path.Combine(directory,"qry","saba102u1.xtr"));
+                Check(IndiOrderSchema.ReadInstalled(starter,"SABA101U1").KrxRouteCode==null,
+                    "missing installed peer definitions cannot be replaced by a cached or guessed enum");
+                File.WriteAllBytes(Path.Combine(directory,"qry","saba102u1.xtr"),amend208);
+                File.WriteAllBytes(Path.Combine(directory,"config","helpertrinfo.dat"),conflictingHelper);
+                info=IndiOrderSchema.ReadInstalled(starter,"SABA101U1");
+                Check(info.HelperSource=="Conflict"&&info.KrxRouteCode==null,
+                    "a contradictory peer-domain mapping in either installed Helper invalidates the resulting route");
                 Check(IndiOrderSchema.ReadInstalled(IndiInstallation.StarterFileName,"SABA101U1").Kind==IndiOrderSchemaKind.Unknown,"relative starter cannot select a local query");
                 Check(IndiOrderSchema.ReadInstalled(starter,"../SABA101U1").Kind==IndiOrderSchemaKind.Unknown,"query traversal never selects a file");
             }finally{Directory.Delete(directory,true);}

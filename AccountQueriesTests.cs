@@ -58,9 +58,9 @@ namespace ShinhanNativeTrader {
             var inputs=AccountQueries.CashInputs(account,password);
             Check(inputs.Count==4&&inputs[0]==account&&inputs[1]=="01"&&inputs[2]==password&&inputs[3]=="1","cash query sends cash account fields only");
             inputs=AccountQueries.HoldingsInputs(account,password);
-            Check(inputs.Count==7&&inputs[0]==account&&inputs[1]=="01"&&inputs[2]==password&&inputs[3]=="1"&&inputs[4]=="1"&&inputs[5]=="1"&&inputs[6]=="0","holdings query explicitly requests average-cost trade-basis cash product with complete output excluding ELW");
+            Check(inputs.Count==8&&inputs[0]==account&&inputs[1]=="01"&&inputs[2]==password&&inputs[3]=="1"&&inputs[4]=="1"&&inputs[5]=="1"&&inputs[6]=="0"&&inputs[7]=="1","holdings query explicitly requests average-cost trade-basis cash product with complete output excluding ELW and documented SI7=1 KRX quotations");
             inputs=AccountQueries.OrdinaryHoldingsInputs(account,password);
-            Check(inputs.Count==7&&inputs[3]=="5"&&inputs[4]=="1"&&inputs[5]=="1"&&inputs[6]=="0","ordinary selection requests the documented SI3=5 complete subset separately from trade quantities");
+            Check(inputs.Count==8&&inputs[3]=="5"&&inputs[4]=="1"&&inputs[5]=="1"&&inputs[6]=="0"&&inputs[7]=="1","ordinary selection requests the documented SI3=5 complete subset with SI7=1 KRX quotations separately from trade quantities");
             inputs=AccountQueries.CapacityInputs(account,password,"005930",70000m);
             Check(inputs.Count==9&&inputs[3]=="A005930"&&inputs[4]=="1"&&inputs[5]=="2"&&inputs[6]=="0"&&inputs[7]=="00"&&inputs[8]=="70000","capacity query uses regular cash limit order at requested price");
             var prior=CultureInfo.CurrentCulture;

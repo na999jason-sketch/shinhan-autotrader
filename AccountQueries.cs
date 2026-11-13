@@ -144,8 +144,9 @@ namespace ShinhanNativeTrader {
         public static Dictionary<int,string> HoldingsInputs(string account,string password) {
             Credentials(account,password);
             // Average cost, trade basis, ordinary product, excluding ELW, and
-            // both single/multi output are explicitly bound by this request.
-            return new Dictionary<int,string>{{0,account.Trim()},{1,"01"},{2,password},{3,"1"},{4,"1"},{5,"1"},{6,"0"}};
+            // both single/multi output and the installed 0x0208 definition's
+            // SI7=1 KRX quotation profile are explicitly bound by this request.
+            return new Dictionary<int,string>{{0,account.Trim()},{1,"01"},{2,password},{3,"1"},{4,"1"},{5,"1"},{6,"0"},{7,"1"}};
         }
         public static Dictionary<int,string> OrdinaryHoldingsInputs(string account,string password) {
             var fields=HoldingsInputs(account,password);fields[3]="5";return fields;

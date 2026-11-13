@@ -414,14 +414,15 @@ namespace ShinhanNativeTrader {
                 throw new InvalidOperationException(method+" returned zero.");
         }
         static bool VerifiedHoldingsRequest(string kind,string expectedKind,string query,IDictionary<int,string> input,bool settersConfirmed,string expectedBasis) {
-            string accountNumber,secret,product,basis,unit,selection,output;
+            string accountNumber,secret,product,basis,unit,selection,output,quoteKind;
             return kind==expectedKind&&string.Equals(query,"SABA609Q1",StringComparison.OrdinalIgnoreCase)
-                &&settersConfirmed&&input!=null&&input.Count==7
+                &&settersConfirmed&&input!=null&&input.Count==8
                 &&input.TryGetValue(0,out accountNumber)&&accountNumber!=null&&accountNumber.Length==11&&accountNumber.All(c=>c>='0'&&c<='9')
                 &&input.TryGetValue(2,out secret)&&!string.IsNullOrWhiteSpace(secret)&&secret.Length<=9&&!secret.Any(char.IsControl)
                 &&input.TryGetValue(1,out product)&&product=="01"
                 &&input.TryGetValue(3,out basis)&&basis==expectedBasis&&input.TryGetValue(4,out unit)&&unit=="1"
-                &&input.TryGetValue(5,out selection)&&selection=="1"&&input.TryGetValue(6,out output)&&output=="0";
+                &&input.TryGetValue(5,out selection)&&selection=="1"&&input.TryGetValue(6,out output)&&output=="0"
+                &&input.TryGetValue(7,out quoteKind)&&quoteKind=="1";
         }
         public bool Begin(string kind,string query,IDictionary<int,string> input,string code,decimal? requestedPrice=null) {
             return BeginCore(kind,query,input,code,requestedPrice,false);
@@ -597,7 +598,7 @@ namespace ShinhanNativeTrader {
                 if(log!=null)log("주문 전 중단: 설치된 신형 주문 정의의 KRX 전송 코드가 확인되지 않았습니다. 주문 정의 진단을 확인하십시오.");
                 throw new InvalidOperationException("설치된 주문 방식 코드가 확인되지 않았습니다.");
             }
-            fields[activeSchema.KrxRouteInputIndex.Value]=activeSchema.KrxRouteCode;
+            LiveOrderProtocol.ApplyInstalledSchema(intent,fields,activeSchema);
         }
         public int Send(LiveOrderIntent intent,LiveAccountCredentials credentials,LiveOrderPreflight checks,DateTime utc) {
             try {

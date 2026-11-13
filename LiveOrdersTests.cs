@@ -60,6 +60,26 @@ namespace ShinhanNativeTrader {
                 Check(fields[5]=="0"&&fields[6]=="00"&&fields[7]=="2"&&fields[8]=="A005930","buy is regular cash stock without credit/shorting");
                 Check(fields[9]=="10"&&fields[10]=="10000"&&fields[11]=="1"&&fields[12]=="2","explicit quantity and regular-session limit price are used");
                 Check(fields[16]==""&&fields[21]=="Y"&&!fields.ContainsKey(22),"new order requests result messages without bypassing validation flags");
+                var installedNew=new IndiOrderSchemaInfo{Kind=IndiOrderSchemaKind.Modern,QueryName="SABA101U1",InputCount=39,OutputCount=8,
+                    SerializationVersion=0x0208,KrxRouteInputIndex=37,KrxRouteCode="1",RouteSource="PeerMatched"};
+                foreach(var side in new[]{LiveOrderKind.Buy,LiveOrderKind.Sell}) {
+                    var routed=Buy("actual-route-"+side);routed.Kind=side;
+                    var routedFields=LiveOrderProtocol.BuildFields(routed,credentials);LiveOrderProtocol.ApplyInstalledSchema(routed,routedFields,installedNew);
+                    Check(routedFields[37]=="1"&&routedFields[7]==(side==LiveOrderKind.Buy?"2":"1"),"both new-order sides use the actual shared-domain KRX1 mapping rather than SOR0");
+                    Check(routedFields[36]==""&&routedFields[38]==""&&routedFields[21]=="Y"&&!routedFields.ContainsKey(22),"ordinary KRX limit order clears conditional/SOR fields without disabling broker checks");
+                }
+                var installedAmend=new IndiOrderSchemaInfo{Kind=IndiOrderSchemaKind.Modern,QueryName="SABA102U1",InputCount=38,OutputCount=8,
+                    SerializationVersion=0x0208,KrxRouteInputIndex=35,KrxRouteCode="1",RouteSource="OwnHelper"};
+                foreach(var kind in new[]{LiveOrderKind.Amend,LiveOrderKind.Cancel}) {
+                    var routed=Modify(kind,"actual-route-"+kind,"00000123");var routedFields=LiveOrderProtocol.BuildFields(routed,credentials);
+                    LiveOrderProtocol.ApplyInstalledSchema(routed,routedFields,installedAmend);
+                    Check(routedFields[35]=="1"&&routedFields[16]=="00000123"&&routedFields[36]==""&&routedFields[37]=="","actual 38-input KRX amend/cancel keeps its original exchange number and clears SOR identity");
+                }
+                Reject(()=>LiveOrderProtocol.ApplyInstalledSchema(Buy(),LiveOrderProtocol.BuildFields(Buy(),credentials),installedAmend),"new order cannot bind a different query's field positions");
+                installedNew.KrxRouteCode=null;
+                Reject(()=>LiveOrderProtocol.ApplyInstalledSchema(Buy(),LiveOrderProtocol.BuildFields(Buy(),credentials),installedNew),"unverified route still cannot become an emitted order field");
+                installedNew.KrxRouteCode="1";installedNew.KrxRouteInputIndex=35;
+                Reject(()=>LiveOrderProtocol.ApplyInstalledSchema(Buy(),LiveOrderProtocol.BuildFields(Buy(),credentials),installedNew),"a wrong new-order routing offset is rejected before field emission");
                 intent.Kind=LiveOrderKind.Sell;Check(LiveOrderProtocol.BuildFields(intent,credentials)[7]=="1","sell uses the official sell code");
                 intent=Modify(LiveOrderKind.Amend,"amend-a","00000123");fields=LiveOrderProtocol.BuildFields(intent,credentials);
                 Check(LiveOrderProtocol.QueryName(intent)=="SABA102U1"&&fields[7]=="3"&&fields[16]=="00000123","amend preserves original broker identifier including leading zeroes");

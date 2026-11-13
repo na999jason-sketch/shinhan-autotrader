@@ -69,6 +69,31 @@ namespace ShinhanNativeTrader {
         static void Reject(Action action,string name){bool rejected=false;try{action();}catch(InvalidOperationException){rejected=true;}Check(rejected,name);}
         static bool BeginQuote(IndiRequestCoordinator requests){return requests.Begin("QUOTE","SC",new Dictionary<int,string>{{0,"005930"}},"005930");}
         static bool BeginSnapshot(IndiRequestCoordinator requests){return requests.Begin("SNAPSHOT","TR_1110_11",new Dictionary<int,string>{{0,"005930"}},"005930");}
+        static void KrxHoldingsProvenance() {
+            foreach(bool ordinary in new[]{false,true}) {
+                string kind=ordinary?"ORDINARYHOLDINGS":"TRADEHOLDINGS";
+                foreach(string quoteKind in new[]{null,"","0","2","unsupported"}) {
+                    var fake=new FakeIndi();fake.TradeHolding(ordinary?"5":"1");
+                    var requests=new IndiRequestCoordinator(fake);IndiReply reply=null;requests.Done+=value=>reply=value;
+                    var inputs=ordinary?AccountQueries.OrdinaryHoldingsInputs("12345678901","5678"):AccountQueries.HoldingsInputs("12345678901","5678");
+                    if(quoteKind==null)inputs.Remove(7);else inputs[7]=quoteKind;
+                    requests.Begin(kind,"SABA609Q1",inputs,"");fake.Data(7);
+                    Check(reply!=null&&reply.Holdings.Count==1&&reply.Holdings[0].Quantity==2
+                        &&!reply.TradeHoldings.RequestBasisVerified&&!reply.TradeHoldings.RequestOrdinaryOnlyVerified,
+                        "omitted or changed SI7 never certifies the installed KRX holdings request while readable positions remain visible: "+kind+"/"+(quoteKind??"missing"));
+                    requests.Dispose();
+                }
+                var accepted=new FakeIndi();accepted.TradeHolding(ordinary?"5":"1");
+                var coordinator=new IndiRequestCoordinator(accepted);IndiReply result=null;coordinator.Done+=value=>result=value;
+                var mutable=ordinary?AccountQueries.OrdinaryHoldingsInputs("12345678901","5678"):AccountQueries.HoldingsInputs("12345678901","5678");
+                accepted.DuringSetField=()=>mutable[7]="0";
+                coordinator.Begin(kind,"SABA609Q1",mutable,"");accepted.Data(7);
+                Check(accepted.Inputs.Count==8&&accepted.Inputs[7]=="1"&&result!=null
+                    &&(ordinary?result.TradeHoldings.RequestOrdinaryOnlyVerified:result.TradeHoldings.RequestBasisVerified),
+                    "KRX input7 provenance uses the actual private request copy even if caller fields change during COM: "+kind);
+                coordinator.Dispose();
+            }
+        }
         static void OrdinaryHoldingsProvenance() {
             const string number="12345678901",secret="5678";
             var fake=new FakeIndi();fake.TradeHolding("5");fake.Fields["m:0:3"]="";fake.Fields["m:0:22"]="";
@@ -76,6 +101,7 @@ namespace ShinhanNativeTrader {
             var requests=new IndiRequestCoordinator(fake);IndiReply reply=null;int fatal=0;string trace="";
             requests.Done+=value=>reply=value;requests.Fatal+=value=>fatal++;requests.Trace+=value=>trace+=value;
             Check(requests.Begin("ORDINARYHOLDINGS","SABA609Q1",AccountQueries.OrdinaryHoldingsInputs(number,secret),""),"ordinary-only query accepts its documented full SI3=5 profile");
+            Check(fake.Inputs.Count==8&&fake.Inputs[7]=="1","ordinary-only native setters transmit all eight installed-profile fields including KRX quotation input7");
             fake.Data(99);Check(reply==null&&requests.Busy,"ordinary-only evidence waits for its matching accepted request ID");
             fake.Data(7);
             Check(reply!=null&&reply.Kind=="ORDINARYHOLDINGS"&&reply.Holdings.Count==1&&reply.TradeHoldings.RequestOrdinaryOnlyVerified,"normal correlated SI3=5 response proves filtered ordinary membership without guessing blank metadata");
@@ -88,16 +114,16 @@ namespace ShinhanNativeTrader {
             fake.DuringRequest=()=>fake.Data(7);
             Check(requests.Begin("ORDINARYHOLDINGS","SABA609Q1",AccountQueries.OrdinaryHoldingsInputs(number,secret),"")
                 &&reply!=null&&reply.TradeHoldings.RequestOrdinaryOnlyVerified&&reply.Holdings.Count==0,"matching reentrant ordinary-only response binds proof before the native request returns");requests.Dispose();
-            for(int field=0;field<7;field++) {
+            for(int field=0;field<8;field++) {
                 fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
                 var input=AccountQueries.OrdinaryHoldingsInputs(number,secret);
-                input[field]=field==0?"bad":field==1?"02":field==2?"":field==3?"1":field==4?"2":field==5?"0":"1";
+                input[field]=field==0?"bad":field==1?"02":field==2?"":field==3?"1":field==4?"2":field==5?"0":field==6?"1":"0";
                 requests.Begin("ORDINARYHOLDINGS","SABA609Q1",input,"");fake.Data(7);
                 Check(reply!=null&&!reply.TradeHoldings.RequestOrdinaryOnlyVerified,"changed ordinary-only request field cannot mint SI3=5 provenance: "+field);requests.Dispose();
             }
             for(int partial=0;partial<2;partial++) {
                 fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
-                var input=AccountQueries.OrdinaryHoldingsInputs(number,secret);if(partial==0)input.Remove(6);else input[7]="unsupported";
+                var input=AccountQueries.OrdinaryHoldingsInputs(number,secret);if(partial==0)input.Remove(6);else input[8]="unsupported";
                 requests.Begin("ORDINARYHOLDINGS","SABA609Q1",input,"");fake.Data(7);
                 Check(reply!=null&&!reply.TradeHoldings.RequestOrdinaryOnlyVerified,"missing or additional request fields cannot prove ordinary-only scope: "+partial);requests.Dispose();
             }
@@ -142,8 +168,8 @@ namespace ShinhanNativeTrader {
             fake.Data(0);fake.Data(7);Check(reply==null&&requests.Busy,"callbacks arriving during a rejected-read delay cannot create account evidence");
             inputs[0]="99999999999";inputs[2]="changed";inputs[3]="2";fake.Id=8;
             var beforeRetry=DateTime.UtcNow;
-            Check(requests.PollReadOnlyRetry(DateTime.UtcNow.AddSeconds(2))&&requests.Busy&&fake.RequestCount==2&&fake.QuerySetCount==2&&fake.FieldSetCount==14,"read recovery rebinds the complete query and every input once");
-            Check(fake.Inputs[0]==account&&fake.Inputs[2]==secret&&fake.Inputs[3]=="1","deferred recovery uses the original private input snapshot rather than caller mutations");
+            Check(requests.PollReadOnlyRetry(DateTime.UtcNow.AddSeconds(2))&&requests.Busy&&fake.RequestCount==2&&fake.QuerySetCount==2&&fake.FieldSetCount==16,"read recovery rebinds the complete query and all eight inputs once");
+            Check(fake.Inputs[0]==account&&fake.Inputs[2]==secret&&fake.Inputs[3]=="1"&&fake.Inputs[7]=="1","deferred recovery uses the original private KRX input snapshot rather than caller mutations");
             fake.Data(7);Check(reply==null&&requests.Busy,"a mismatched callback after recovery cannot complete the new accepted request");
             fake.Data(8);
             Check(reply!=null&&reply.TradeHoldings.BasisVerified&&reply.RequestStartedUtc>=beforeRetry&&reply.RequestStartedUtc<=DateTime.UtcNow,"recovered balance proof is tied to the new accepted ID and actual fresh request-start timestamp");
@@ -190,6 +216,7 @@ namespace ShinhanNativeTrader {
         }
         public static int Run() {
             checks=0;
+            KrxHoldingsProvenance();
             OrdinaryHoldingsProvenance();
             ReadOnlyGi004Recovery();
             var fake=new FakeIndi();fake.Quote();var requests=new IndiRequestCoordinator(fake);
@@ -227,6 +254,7 @@ namespace ShinhanNativeTrader {
             requests=new IndiRequestCoordinator(fake);received=0;fatal=0;
             requests.Done+=value=>{received++;reply=value;};requests.Fatal+=reason=>fatal++;
             Check(requests.Begin("TRADEHOLDINGS","SABA609Q1",AccountQueries.HoldingsInputs("12345678901","5678"),""),"609 trade-basis request accepts its actual callback independently of row certainty");
+            Check(fake.Inputs.Count==8&&fake.Inputs[7]=="1","trade-basis native setters transmit the actual installed eight-field KRX profile");
             fake.Data(3798);Check(received==0&&requests.Busy,"609 unknown-basis regression preserves request ID matching");
             fake.Data(3799);
             Check(received==1&&fatal==0&&!requests.Failed&&!requests.Busy&&reply.Holdings.Count==1,"a successful unknown-basis response no longer halts or discards readable holdings");
@@ -242,12 +270,12 @@ namespace ShinhanNativeTrader {
             fake.DuringRequest=()=>fake.Data(7);
             Check(requests.Begin("TRADEHOLDINGS","SABA609Q1",AccountQueries.HoldingsInputs("12345678901","5678"),"")
                 &&received==1&&reply.TradeHoldings.BasisVerified&&reply.Holdings.Count==0,"a matched reentrant empty response is scoped by the complete accepted trade-basis request");requests.Dispose();
-            foreach(var field in new[]{3,6}) {
+            foreach(var field in new[]{3,6,7}) {
                 fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);reply=null;
                 requests.Done+=value=>reply=value;
-                var partial=AccountQueries.HoldingsInputs("12345678901","5678");partial[field]=field==3?"2":"1";
+                var partial=AccountQueries.HoldingsInputs("12345678901","5678");partial[field]=field==3?"2":field==6?"1":"0";
                 requests.Begin("TRADEHOLDINGS","SABA609Q1",partial,"");fake.Data(7);
-                Check(reply!=null&&!reply.TradeHoldings.BasisVerified,"empty response cannot certify a different basis or suppressed multi output: input "+field);requests.Dispose();
+                Check(reply!=null&&!reply.TradeHoldings.BasisVerified,"empty response cannot certify a different basis, suppressed output or non-KRX quotation profile: input "+field);requests.Dispose();
             }
             fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);reply=null;
             requests.Done+=value=>reply=value;
@@ -270,7 +298,7 @@ namespace ShinhanNativeTrader {
             for(int malformed=0;malformed<4;malformed++) {
                 fake=new FakeIndi();fake.TradeHolding("1");requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
                 var fields=AccountQueries.HoldingsInputs("12345678901","5678");
-                if(malformed==0)fields.Remove(0);else if(malformed==1)fields[0]="bad";else if(malformed==2)fields[2]="";else fields[7]="undocumented";
+                if(malformed==0)fields.Remove(0);else if(malformed==1)fields[0]="bad";else if(malformed==2)fields[2]="";else fields[8]="undocumented";
                 requests.Begin("TRADEHOLDINGS","SABA609Q1",fields,"");fake.Data(7);
                 Check(reply!=null&&reply.Holdings.Count==1&&!reply.TradeHoldings.RequestBasisVerified&&!reply.TradeHoldings.BasisVerified,"even code1 cannot certify an incomplete or unsupported request profile: "+malformed);requests.Dispose();
             }
