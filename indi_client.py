@@ -60,8 +60,10 @@ class IndiClient(QObject):
         return self.tr.dynamicCall('GetMultiData(int, int)',row,col)
 
     def request(self, kind, fields=None):
+        if kind == 'order':
+            raise RuntimeError('실주문 비활성: 공식 주문·체결·미체결·주문가능액·복구 검증 전에는 주문할 수 없습니다.')
         if self.busy(): return False
-        qs = {'stocks':'stock_mst','bars':'TR_SCHART','quote':'SC','holdings':'SABA200QB','order':'SABA101U1'}
+        qs = {'stocks':'stock_mst','bars':'TR_SCHART','quote':'SC','holdings':'SABA200QB'}
         if kind not in qs: raise ValueError('unsupported query '+kind)
         self.tr.dynamicCall('SetQueryName(QString)',qs[kind])
         for i,val in (fields or []):
@@ -87,13 +89,7 @@ class IndiClient(QObject):
         return self.request('holdings',[(0,account),(1,'01'),(2,password)])
 
     def order(self, account,password,side,code,qty,price=0):
-        if side not in ('BUY','SELL') or qty<1:raise ValueError('invalid order')
-        # Market order is used only when explicitly armed in the GUI.
-        # This requires conservative sizing; price is only a reference, not a cap.
-        fields=[(0,account),(1,'01'),(2,password),(5,'0'),(6,'00'),
-                (7,'2' if side=='BUY' else '1'),(8,'A'+code),(9,str(qty)),
-                (11,'1'),(12,'1'),(13,'0'),(14,'0'),(21,'Y')]
-        return self.request('order',fields)
+        raise RuntimeError('실주문 비활성: 공식 주문·체결·미체결·주문가능액·복구 검증 전에는 주문할 수 없습니다.')
 
     def subscribe(self, code):
         if code in self.live_codes: return

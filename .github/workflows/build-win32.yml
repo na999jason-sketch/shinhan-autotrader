@@ -1,24 +1,77 @@
-
-name: Build Shinhan Native Win32
+name: Build and test Shinhan Native Win32
 
 on:
+  push:
+  pull_request:
   workflow_dispatch:
 
-jobs:
-  build:
-    runs-on: windows-2022
+permissions:
+  contents: read
 
+concurrency:
+  group: win32-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup MSBuild
-        uses: microsoft/setup-msbuild@v2
+      - uses: microsoft/setup-msbuild@v2
 
-      - name: Build Windows EXE
-        run: msbuild ShinhanNativeTrader.csproj /t:Rebuild /p:Configuration=Release /p:PlatformTarget=x86
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
-      - name: Upload EXE
+      - name: Build .NET Framework 4.8 x86 EXE
+        run: |
+          New-Item -ItemType Directory -Force reports | Out-Null
+          msbuild ShinhanNativeTrader.csproj /t:Rebuild /p:Configuration=Release /p:Platform=x86 /p:PlatformTarget=x86 /warnaserror /fl /flp:logfile=reports/msbuild.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/verify_x86.py bin/Release/ShinhanNativeTrader.exe --require-admin
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: C# account, order and unattended lifecycle tests (no OCX or account required)
+        run: |
+          $report = Join-Path $PWD 'reports/native-tests.txt'
+          $process = Start-Process -FilePath (Join-Path $PWD 'bin/Release/ShinhanNativeTrader.exe') -ArgumentList @('--selftest', '--selftest-report', ('"' + $report + '"')) -Wait -PassThru
+          if (Test-Path $report) { Get-Content $report }
+          else { throw 'Native test runner did not create a report.' }
+          if ($process.ExitCode -ne 0) { throw "Native tests failed (exit $($process.ExitCode))." }
+
+      - name: Windows report UI persistence regression (synthetic data, no Indi)
+        run: ./tests/report-ui/run.ps1
+
+      - name: Windows premarket preparation and opening transition (synthetic data, no Indi)
+        run: ./tests/premarket-ui/run.ps1
+
+      - name: Native COM connection point integration (production subscriptions, no Indi)
+        run: ./tests/native-com/run.ps1
+
+      - name: Windows UIPI WM_COPYDATA privilege boundary
+        run: ./tests/uipi/run.ps1
+
+      - name: Python regression and live order guard tests
+        run: |
+          python -m unittest discover -s tests -v 2>&1 | Tee-Object -FilePath reports/python-tests.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload validation reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-reports
+          path: reports/
+          if-no-files-found: warn
+
+      - name: Upload verified x86 EXE
         uses: actions/upload-artifact@v4
         with:
           name: ShinhanNativeTrader-Win32
           path: bin/Release/ShinhanNativeTrader.exe
+          if-no-files-found: error
