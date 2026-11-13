@@ -16,7 +16,7 @@ namespace ShinhanNativeTrader {
         public AccountUserActionException(string message):base(message){}
     }
     internal static class Program {
-        internal const string Version="2.2.0";
+        internal const string Version="2.2.1";
         [STAThread]
         static int Main(string[] args) {
             if(args.Contains("--selftest")) {
@@ -159,6 +159,7 @@ namespace ShinhanNativeTrader {
         string gateDetail="실주문 미시작";
         string lastBasisDiagnostic;
         DateTime? lastBasisDiagnosticUtc;
+        DateTime? lastRealtimeDiagnosticUtc;
         string lastSavedReportPath;
         DateTime? lastReportSavedUtc;
         bool reportWriteFault,reportSaving,initialReportComplete;
@@ -168,7 +169,7 @@ namespace ShinhanNativeTrader {
             Size=new Size(1370,860);MinimumSize=new Size(1120,730);Font=new Font("Malgun Gothic",9);
             holdingsGrid.Columns["매도판정"].FillWeight=170;
             var root=new TableLayoutPanel{Dock=DockStyle.Fill,ColumnCount=1,RowCount=6,Padding=new Padding(10)};
-            foreach(int height in new[]{35,100,114,40})root.RowStyles.Add(new RowStyle(SizeType.Absolute,height));
+            foreach(int height in new[]{35,100,138,40})root.RowStyles.Add(new RowStyle(SizeType.Absolute,height));
             root.RowStyles.Add(new RowStyle(SizeType.Percent,100));root.RowStyles.Add(new RowStyle(SizeType.Absolute,52));Controls.Add(root);
             UpdateOrderStatus();root.Controls.Add(orderGate,0,0);
             var buttons=new FlowLayoutPanel{Dock=DockStyle.Fill,WrapContents=true};root.Controls.Add(buttons,0,1);
@@ -184,6 +185,7 @@ namespace ShinhanNativeTrader {
             AddButton(buttons,"보고서 폴더",OpenReports);
             state.Text="Indi 연결 후 계좌를 조회하고 부재중 운영을 시작하십시오.";
             var statusArea=new FlowLayoutPanel{Dock=DockStyle.Fill,FlowDirection=FlowDirection.TopDown,WrapContents=false};
+            statusArea.SizeChanged+=(s,e)=>{quoteStatus.MaximumSize=new Size(Math.Max(400,statusArea.ClientSize.Width-12),0);};
             statusArea.Controls.Add(state);statusArea.Controls.Add(reportStatus);statusArea.Controls.Add(researchStatus);statusArea.Controls.Add(quoteStatus);statusArea.Controls.Add(basisStatus);root.Controls.Add(statusArea,0,2);
             var summary=new FlowLayoutPanel{Dock=DockStyle.Fill};summary.Controls.Add(portfolio);summary.Controls.Add(cashLabel);root.Controls.Add(summary,0,3);
             var tabs=new TabControl{Dock=DockStyle.Fill};root.Controls.Add(tabs,0,4);
@@ -256,6 +258,7 @@ namespace ShinhanNativeTrader {
                 previous.Faulted-=OnRealtimeFailure;previous.Invalidated-=OnRealtimeFailure;previous.Dispose();
             }
             trackedQuotes.Clear();balanceSignatures.Clear();
+            lastRealtimeDiagnosticUtc=null;
         }
         bool EnsureLiveQuote(string symbol) {
             if(realtime==null||!realtime.Connected||realtime.Failed)return false;
@@ -436,7 +439,13 @@ namespace ShinhanNativeTrader {
         void EvaluatePreparedSignals(DateTime now) {
             int ready=0;RealtimeQuote quote;
             if(realtime!=null)foreach(var symbol in trackedQuotes.ToList())if(realtime.TryGetQuote(symbol,now,out quote))ready++;
-            quoteStatus.Text="실시간 SC: 확인 "+ready+" / 등록 "+trackedQuotes.Count+(Rules.ValidTime(MarketTime.ToKorea(now))?" 종목 / 연속 체결·시각 확인 기준":" 종목 / 장전·장외 대기");
+            bool marketOpen=Rules.ValidTime(MarketTime.ToKorea(now));
+            string diagnostic=realtime==null?"실시간 채널 미연결":realtime.DiagnosticsSummary(now);
+            quoteStatus.Text="실시간 SC: 확인 "+ready+" / 등록 "+trackedQuotes.Count+(marketOpen?" 종목 / 연속 체결·시각 확인 기준":" 종목 / 장전·장외 대기")+Environment.NewLine+diagnostic;
+            quoteStatus.ForeColor=marketOpen&&trackedQuotes.Count>0&&ready==0?Color.DarkRed:Color.Black;
+            if(realtime!=null&&trackedQuotes.Count>0&&(!lastRealtimeDiagnosticUtc.HasValue||now-lastRealtimeDiagnosticUtc.Value>=TimeSpan.FromSeconds(ready==0?30:60))) {
+                Log("SC 진단: "+diagnostic);lastRealtimeDiagnosticUtc=now;
+            }
             if(!LiveStarted||!ActiveSession||realtime==null)return;
             foreach(var prepared in watchedReferences.ToList()) {
                 if(holdings.Any(x=>x.Code==prepared.Code&&x.Quantity>0)||buyQuotes.Any(x=>x.Code==prepared.Code)

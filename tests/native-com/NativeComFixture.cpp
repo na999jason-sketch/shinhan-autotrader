@@ -14,6 +14,7 @@ const DISPID DataEvent = 11;
 const DISPID SystemEvent = 17;
 const DISPID ShortEvent = 29;
 const DISPID VariantEvent = 31;
+const DISPID RealtimeEvent = 2;
 LONG liveObjects = 0;
 class Fixture;
 
@@ -41,13 +42,14 @@ class Fixture final : public IDispatch, public IConnectionPointContainer {
     ConnectionPoint point_;
     const DWORD ownerThread_;
     const wchar_t* buffer_ = L"initial-buffer";
+    bool realtimeBuffer_ = false;
 public:
     Fixture() : point_(this), ownerThread_(GetCurrentThreadId()) { InterlockedIncrement(&liveObjects); }
     ~Fixture() { InterlockedDecrement(&liveObjects); }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** value) override {
         if (value == nullptr) return E_POINTER;
         *value = nullptr;
-        if (iid == IID_IUnknown || iid == IID_IDispatch) *value = static_cast<IDispatch*>(this);
+        if (iid == IID_IUnknown || iid == IID_IDispatch || iid == TypedDispatchInterface) *value = static_cast<IDispatch*>(this);
         else if (iid == IID_IConnectionPointContainer) *value = static_cast<IConnectionPointContainer*>(this);
         else return E_NOINTERFACE;
         AddRef(); return S_OK;
@@ -76,6 +78,8 @@ public:
         for (UINT i = 0; i < ARRAYSIZE(methods); ++i) {
             if (_wcsicmp(names[0], methods[i]) == 0) { ids[0] = static_cast<DISPID>(i + 1); return S_OK; }
         }
+        if (_wcsicmp(names[0], L"GetSingleData") == 0) { ids[0] = 8; return S_OK; }
+        if (_wcsicmp(names[0], L"EmitRealtime") == 0) { ids[0] = 40; return S_OK; }
         ids[0] = DISPID_UNKNOWN; return DISP_E_UNKNOWNNAME;
     }
     HRESULT STDMETHODCALLTYPE Invoke(DISPID id, REFIID iid, LCID lcid, WORD flags, DISPPARAMS* args,
@@ -118,6 +122,37 @@ public:
         if(id == 7) {
             if(args->cArgs != 1) return DISP_E_BADPARAMCOUNT;
             return point_.EmitVariant(VariantEvent,args->rgvarg[0]);
+        }
+        if(id == 8) {
+            if(args->cArgs != 1) return DISP_E_BADPARAMCOUNT;
+            if(args->rgvarg[0].vt != VT_I2) return DISP_E_TYPEMISMATCH;
+            const SHORT index = args->rgvarg[0].iVal;
+            const wchar_t* text = L"";
+            switch(index) {
+                case 1:text = realtimeBuffer_ ? L"005930" : L"000660"; break;
+                case 2:text = realtimeBuffer_ ? L"09:48:50" : L"00:00:00"; break;
+                case 3:text = realtimeBuffer_ ? L"70000" : L"1"; break;
+                case 7:text = realtimeBuffer_ ? L"12345" : L"0"; break;
+                case 17:text = realtimeBuffer_ ? L"1" : L"4"; break;
+                default:return DISP_E_BADINDEX;
+            }
+            if(result != nullptr) {
+                result->vt = VT_BSTR; result->bstrVal = SysAllocString(text);
+                if(result->bstrVal == nullptr) return E_OUTOFMEMORY;
+            }
+            return S_OK;
+        }
+        if(id == 40) {
+            if(args->cArgs != 0) return DISP_E_BADPARAMCOUNT;
+            // Formal VARIANT callback carrying a BSTR, with the actual Indi RT
+            // DISPID. The quote buffer exists only for the callback duration.
+            VARIANT kind; VariantInit(&kind); kind.vt = VT_BSTR;
+            kind.bstrVal = SysAllocString(L"SC");
+            if(kind.bstrVal == nullptr) return E_OUTOFMEMORY;
+            realtimeBuffer_ = true;
+            const HRESULT emitted = point_.EmitVariant(RealtimeEvent,kind);
+            realtimeBuffer_ = false;
+            VariantClear(&kind); return emitted;
         }
         return DISP_E_MEMBERNOTFOUND;
     }

@@ -16,7 +16,7 @@ namespace ShinhanNativeTrader {
     }
 
     public sealed class RealtimeQuote {
-        public string Code,Clock,MarketCode;
+        public string Code,Clock,MarketCode,ClockShape;
         public decimal Price,CumulativeVolume;
         public DateTime ReceivedUtc;
         public bool SequenceConfirmed;
@@ -61,7 +61,7 @@ namespace ShinhanNativeTrader {
             if(price<=0)throw new InvalidOperationException("SC realtime price[3] must be positive.");
             var volume=Number(Field(read,7,"SC"),"SC cumulative volume[7]");
             if(volume!=decimal.Truncate(volume))throw new InvalidOperationException("SC cumulative volume[7] must be a whole-share amount.");
-            return new RealtimeQuote{Code=code,Clock=Clock(clock)?clock:"",Price=price,
+            return new RealtimeQuote{Code=code,Clock=RealtimeDiagnostics.NormalizeClock(clock),ClockShape=RealtimeDiagnostics.ClockShape(clock),Price=price,
                 CumulativeVolume=volume,MarketCode=Field(read,17,"SC"),ReceivedUtc=utc};
         }
         public static CashOrderEvent ReadOrder(Func<int,object> read,string account,DateTime utc){
@@ -112,6 +112,7 @@ namespace ShinhanNativeTrader {
         string account;bool disposed;
         public bool Failed {get;private set;}
         public bool AccountStreamObserved {get;private set;}
+        public RealtimeDiagnostics Diagnostics {get;}=new RealtimeDiagnostics();
         public event Action<RealtimeQuote> QuoteReceived;
         public event Action<CashOrderEvent> OrderReceived;
         public event Action<CashBalanceEvent> BalanceReceived;
@@ -120,22 +121,27 @@ namespace ShinhanNativeTrader {
         void Usable(){if(disposed)throw new ObjectDisposedException("RealtimeEventProcessor");if(Failed)throw new InvalidOperationException("Realtime processing failed; create a new session.");}
         public void BindAccount(string number){Usable();if(number==null||number.Length!=11||number.Any(c=>c<'0'||c>'9'))throw new ArgumentException("An eleven digit account is required.");if(account!=null&&account!=number)throw new InvalidOperationException("Create a new realtime session to change accounts.");account=number;}
         public void Track(string code){Usable();if(Rules.Code(code)!=code||string.IsNullOrEmpty(code))throw new ArgumentException("A normalized stock symbol is required.");if(!quotes.ContainsKey(code))quotes[code]=null;}
-        public void Untrack(string code){quotes.Remove(code);}
-        public void Invalidate(){foreach(var code in quotes.Keys.ToList())quotes[code]=null;AccountStreamObserved=false;}
+        public void Untrack(string code){quotes.Remove(code);if(Diagnostics.LastCode==code)Diagnostics.Invalidate();}
+        public void Invalidate(){foreach(var code in quotes.Keys.ToList())quotes[code]=null;AccountStreamObserved=false;Diagnostics.Invalidate();}
         public void Fail(string reason){if(Failed||disposed)return;Failed=true;Invalidate();try{if(Faulted!=null)Faulted(reason);}catch{}}
         public void Process(object kind,DateTime utc){
             if(disposed||Failed)return;
+            Diagnostics.RecordCallback(kind,utc);
             var type=kind as string;if(type==null){Fail("실시간 이벤트 형식이 지원되지 않습니다.");return;}
             try {
                 if(type=="SC") {
                     var quote=RealtimeRecordParser.ReadQuote(read,utc);RealtimeQuote previous;
-                    if(!quotes.TryGetValue(quote.Code,out previous))return;
+                    if(!quotes.TryGetValue(quote.Code,out previous)){Diagnostics.ObserveQuote(quote,RealtimeQuoteState.Untracked);return;}
                     bool validClock=!string.IsNullOrEmpty(quote.Clock)&&quote.MarketCode=="1";
                     bool advancing=previous!=null&&previous.MarketCode=="1"&&!string.IsNullOrEmpty(previous.Clock)&&validClock
                         &&((string.CompareOrdinal(quote.Clock,previous.Clock)>0&&quote.CumulativeVolume>=previous.CumulativeVolume)
                             ||quote.Clock==previous.Clock&&quote.CumulativeVolume>previous.CumulativeVolume);
                     bool regressed=previous!=null&&(string.CompareOrdinal(quote.Clock,previous.Clock)<0||quote.CumulativeVolume<previous.CumulativeVolume);
                     quote.SequenceConfirmed=validClock&&!regressed&&(advancing||previous!=null&&previous.SequenceConfirmed);
+                    var state=string.IsNullOrEmpty(quote.Clock)?RealtimeQuoteState.InvalidClock:
+                        quote.MarketCode!="1"?RealtimeQuoteState.NonRegularMarket:regressed?RealtimeQuoteState.Regressed:
+                        quote.SequenceConfirmed?RealtimeQuoteState.Confirmed:previous==null?RealtimeQuoteState.FirstTick:RealtimeQuoteState.Replay;
+                    Diagnostics.ObserveQuote(quote,state);
                     quotes[quote.Code]=quote.Copy();if(QuoteReceived!=null)QuoteReceived(quote.Copy());
                 }else if(type=="AA") {
                     var value=RealtimeRecordParser.ReadOrder(read,account,utc);if(value==null)return;AccountStreamObserved=true;if(OrderReceived!=null)OrderReceived(value);
@@ -168,6 +174,7 @@ namespace ShinhanNativeTrader {
         public bool AccountSubscribed {get;private set;}
         public bool AccountStreamObserved {get{return processor.AccountStreamObserved;}}
         public int QuoteSubscriptionCount {get{return watch.Count;}}
+        public string DiagnosticsSummary(DateTime utc){return processor.Diagnostics.Describe(utc);}
         public RealtimeIndi(Control surface,Action<string> trace){
             this.surface=surface??throw new ArgumentNullException("surface");this.trace=trace??(message=>{});ownerThread=Thread.CurrentThread.ManagedThreadId;
             processor=new RealtimeEventProcessor(index=>read.GetSingleData(checked((short)index)));

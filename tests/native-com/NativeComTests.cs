@@ -129,6 +129,27 @@ internal static class NativeComTests {
                 try{invalidVariant.AddVariantCallback(31,VarEnum.VT_BSTR,value=>{});}catch(ArgumentException){wrongVariant=true;}
                 Check(wrongVariant&&invalidVariant.Count==0&&Number(source,"GetSinkCount")==0,"BSTR-only declaration is refused for formal VARIANT events");
             }
+            var quoteAdapter=new IndiReadOnlyDispatch(source);
+            int realtimeCallbacks=0, realtimeThread=0;
+            object realtimeKind=null;
+            var quoteFields=new Dictionary<int,string>();
+            using(var realtime=new ComEventSubscriptions(source,EventInterface)) {
+                realtime.AddVariantCallback(2,VarEnum.VT_VARIANT,value=>{
+                    realtimeCallbacks++;realtimeKind=value;realtimeThread=Thread.CurrentThread.ManagedThreadId;
+                    foreach(var index in new[]{1,2,3,7,17})
+                        quoteFields[index]=(string)quoteAdapter.Invoke("GetSingleData",index);
+                });
+                Invoke(source,"EmitRealtime");
+                Check(realtimeCallbacks==1&&realtimeKind is string&&(string)realtimeKind=="SC","actual RT DISPID2 delivers a BSTR inside its formal VARIANT callback");
+                Check(realtimeThread==Thread.CurrentThread.ManagedThreadId,"RT callback and typed field getters execute synchronously on the owning STA");
+                Check(quoteFields[1]=="005930"&&quoteFields[2]=="09:48:50"&&quoteFields[3]=="70000"&&quoteFields[7]=="12345"&&quoteFields[17]=="1","RT callback copies documented SC fields through production typed GetSingleData including an eight-character exchange clock");
+                Check((string)quoteAdapter.Invoke("GetSingleData",2)=="00:00:00"&&quoteFields[2]=="09:48:50","later native buffer changes cannot replace the clock already copied inside RT callback");
+                GC.Collect();GC.WaitForPendingFinalizers();GC.Collect();
+                Invoke(source,"EmitRealtime");
+                Check(realtimeCallbacks==2&&quoteFields[3]=="70000","DISPID2 subscription and same-source quote reads survive forced collection");
+                realtime.Dispose();Invoke(source,"EmitRealtime");
+                Check(realtimeCallbacks==2&&Number(source,"GetSinkCount")==0,"exact RT callback detach prevents later field processing and releases its connection");
+            }
         } finally {
             subscriptions.Dispose();
             Marshal.FinalReleaseComObject(source);

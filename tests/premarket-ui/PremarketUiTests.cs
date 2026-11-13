@@ -4,6 +4,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.Serialization;
 using System.Text;
 using System.Windows.Forms;
 using ShinhanNativeTrader;
@@ -138,9 +139,40 @@ static class PremarketUiTests {
         foreach(Control child in owner.Controls){yield return child;foreach(var nested in All(child))yield return nested;}
     }
 
+    static void RealtimeStatus(string data) {
+        using(var form=NewForm()) {
+            var fields=new Dictionary<int,object>{{1,"005930"},{2,"09:00:00"},{3,"70000"},{7,"100"},{17,"1"}};
+            var processor=new RealtimeEventProcessor(index=>fields[index]);processor.Track("005930");
+            // Deliberately bypass the COM constructor: only the in-memory
+            // processor and status labels run. No OCX or registration API exists.
+            var realtime=(RealtimeIndi)FormatterServices.GetUninitializedObject(typeof(RealtimeIndi));
+            Set(realtime,"processor",processor);Set(realtime,"watch",new HashSet<string>(StringComparer.Ordinal){"005930"});
+            Set(form,"realtime",realtime);Get<HashSet<string>>(form,"trackedQuotes").Add("005930");
+            Call(form,"EvaluatePreparedSignals",Opening);
+            string status=Get<Label>(form,"quoteStatus").Text;
+            Check(status.Contains("확인 0 / 등록 1")&&status.Contains("콜백 없음")&&Get<Label>(form,"quoteStatus").ForeColor==System.Drawing.Color.DarkRed,
+                "registered quotes with zero callbacks are identified in red rather than described as an entry-signal wait");
+            processor.Process("SC",Opening);
+            Call(form,"EvaluatePreparedSignals",Opening);
+            Check(Get<Label>(form,"quoteStatus").Text.Contains("확인 0 / 등록 1"),"one actual callback still waits for sequence progression");
+            fields[2]="09:00:01";fields[7]="101";processor.Process("SC",Opening.AddSeconds(1));
+            Call(form,"EvaluatePreparedSignals",Opening.AddSeconds(1));
+            status=Get<Label>(form,"quoteStatus").Text;
+            Check(status.Contains("확인 1 / 등록 1")&&status.Contains("정상")&&Get<Label>(form,"quoteStatus").ForeColor==System.Drawing.Color.Black,
+                "advancing colon-formatted exchange clocks establish a confirmed realtime quote in the actual form status");
+            fields[2]="unrecognized";processor.Process("SC",Opening.AddSeconds(2));
+            Call(form,"EvaluatePreparedSignals",Opening.AddSeconds(2));
+            status=Get<Label>(form,"quoteStatus").Text;
+            Check(status.Contains("확인 0 / 등록 1")&&status.Contains("시각 형식"),"received SC with an invalid clock is distinguished from missing callbacks and cannot remain trade-ready");
+            Check(!processor.Failed&&Get<LiveOrderGateway>(form,"gateway")==null&&Get<LiveOrderJournal>(form,"journal")==null
+                &&Get<object>(form,"entry")==null&&!Get<LiveTradingSession>(form,"authorization").Active,"realtime status regression never constructs an order transport or authorizes a live order");
+            Close(form,data);
+        }
+    }
+
     static void Run(string data,string screenshot) {
         using(var form=NewForm()) {
-            Check(form.Text.Contains("2.2.0"),"premarket regression runs against version 2.2.0");
+            Check(form.Text.Contains("2.2.1"),"premarket regression runs against version 2.2.1");
             Check(!Get<LiveTradingSession>(form,"authorization").Active,"application startup never authorizes live orders");
             var fixture=new Fixture(form);Bind(form);
             Call(form,"BeginResearch",Opening.AddHours(-10),false);
@@ -249,6 +281,7 @@ static class PremarketUiTests {
             CheckNoOrderTransport(form,"partial opening transition never creates a financial order from historical bars");
             Close(form,data);
         }
+        RealtimeStatus(data);
     }
 
     [STAThread] static int Main(string[] arguments) {
