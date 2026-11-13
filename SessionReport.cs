@@ -64,6 +64,21 @@ namespace ShinhanNativeTrader {
         static string Flag(string value) {
             return !string.IsNullOrEmpty(value)&&value.Length<=2&&value.All(c=>c>='0'&&c<='9')?value:Unknown;
         }
+        static string RejectionMetadataShape(string value) {
+            return string.IsNullOrWhiteSpace(value)?"Blank":value.All(character=>character=='0')?"Zero":"Present";
+        }
+        static string BrokerStatusClass(string value) {
+            // Keep the vendor's documented finite statuses; never export
+            // arbitrary provider text that might contain account credentials.
+            return value=="의뢰"||value=="접수"||value=="확인"||value=="거부"?value:
+                string.IsNullOrWhiteSpace(value)?"Blank":"Other";
+        }
+        static string FillConfirmationComparison(BrokerOrderRow order) {
+            bool full=order.Quantity>0&&order.FilledQuantity==order.Quantity&&order.OpenQuantity==0;
+            if(full&&!order.TerminalConfirmationCompatible)return "전량체결 수량·확인명세 충돌";
+            return order.HasRejectionConflict?"거부명세 확인 필요":order.ConfirmationKind==BrokerConfirmationKind.Unavailable?"확인구분 공란":
+                order.ConfirmationKind==BrokerConfirmationKind.Unknown?"확인구분 미검증":"정상코드";
+        }
         static string TradingDate(string value) {
             DateTime date;
             return DateTime.TryParseExact(value,"yyyyMMdd",CultureInfo.InvariantCulture,DateTimeStyles.None,out date)
@@ -213,12 +228,15 @@ namespace ShinhanNativeTrader {
             Row(report,"거래일",orders==null?Unknown:TradingDate(orders.TradingDate));
             Row(report,"응답 범위",orders!=null&&orders.IsComplete?"완료 확인":"완료 여부 미검증");
             Row(report,"개별 체결번호",orders!=null&&orders.HasExecutionIds?"제공":"미제공 또는 미검증");
-            Row(report,"주문번호","원주문번호","코드","매매구분","주문수량","주문가격","누적체결수량","평균체결가격","미체결수량","확인수량","확인구분");
+            Row(report,"주문번호","원주문번호","코드","매매구분","주문수량","주문가격","누적체결수량","평균체결가격","미체결수량","확인수량","확인구분",
+                "거부코드 형태","거부코드명 형태","상태명 분류","확인구분 분류","체결·확인 대조");
             if(orders!=null)foreach(var order in orders.Orders) {
                 if(order==null)throw new InvalidOperationException("A broker order report row is missing.");
                 Row(report,BrokerNumber(order.OrderNumber),BrokerNumber(order.OriginalOrderNumber),Symbol(order.Code),
                     Side(order.SideCode),order.Quantity,order.LimitPrice,order.FilledQuantity,
-                    order.AverageFillPrice,order.OpenQuantity,order.ConfirmedQuantity,Flag(order.ConfirmationCode));
+                    order.AverageFillPrice,order.OpenQuantity,order.ConfirmedQuantity,Flag(order.ConfirmationCode),
+                    RejectionMetadataShape(order.RejectCode),RejectionMetadataShape(order.RejectName),BrokerStatusClass(order.StatusName),
+                    order.ConfirmationShape,FillConfirmationComparison(order));
             }
             Row(report);
             Row(report,"프로그램 실주문 기록(접수·체결 구분)");

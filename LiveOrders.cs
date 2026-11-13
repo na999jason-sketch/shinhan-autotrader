@@ -193,9 +193,11 @@ namespace ShinhanNativeTrader {
     }
     // A terminal broker aggregate is a separate evidence source. It does not
     // create an individual execution ID or add its total to existing AA fills.
+    public enum BrokerFillConfirmationBasis { NormalCode, IndependentFullFillWithoutConfirmation }
     public sealed class BrokerFillCheckpoint {
         public string AccountFingerprint,TradingDate,BrokerOrderNumber,Code,QueryName;
         public string ProductCode,CreditCode,SideCode,ConfirmationCode;
+        public BrokerFillConfirmationBasis ConfirmationBasis;
         public LiveOrderKind TradeKind;
         public int OrderQuantity,FilledQuantity;
         public decimal LimitPrice,AverageFillPrice;
@@ -541,7 +543,7 @@ namespace ShinhanNativeTrader {
                     ||evidence.RequestStartedUtc<=order.UpdatedUtc||evidence.RequestStartedUtc<copy.LastBrokerChangeUtc
                     ||!LiveOrderProtocol.BrokerNumbersEqual(order.BrokerOrderNumber,row.OrderNumber)||row.Code!=order.Code
                     ||row.SideCode!=(order.TradeKind==LiveOrderKind.Buy?"2":"1")||row.ProductCode!="01"||row.CreditCode!="00"
-                    ||row.ConfirmationCode!="0"||row.Quantity!=order.Quantity||row.LimitPrice!=order.LimitPrice
+                    ||!row.TerminalConfirmationCompatible||row.Quantity!=order.Quantity||row.LimitPrice!=order.LimitPrice
                     ||row.FilledQuantity!=order.Quantity||row.OpenQuantity!=0||row.ConfirmedQuantity!=0||row.AutoCancelledQuantity!=0
                     ||!AbsentBrokerNumber(row.OriginalOrderNumber)||row.HasRejection||order.CancelledQuantity!=0
                     ||row.AverageFillPrice<=0||(order.TradeKind==LiveOrderKind.Buy?row.AverageFillPrice>order.LimitPrice:row.AverageFillPrice<order.LimitPrice)
@@ -553,6 +555,8 @@ namespace ShinhanNativeTrader {
                 var checkpoint=new BrokerFillCheckpoint{AccountFingerprint=copy.AccountFingerprint,TradingDate=order.TradingDate,
                     BrokerOrderNumber=order.BrokerOrderNumber,Code=order.Code,QueryName=evidence.QueryName,
                     ProductCode=row.ProductCode,CreditCode=row.CreditCode,SideCode=row.SideCode,ConfirmationCode=row.ConfirmationCode,
+                    ConfirmationBasis=row.ConfirmationKind==BrokerConfirmationKind.Normal?BrokerFillConfirmationBasis.NormalCode:
+                        BrokerFillConfirmationBasis.IndependentFullFillWithoutConfirmation,
                     TradeKind=order.TradeKind,OrderQuantity=order.Quantity,FilledQuantity=order.Quantity,
                     LimitPrice=order.LimitPrice,AverageFillPrice=row.AverageFillPrice,RequestStartedUtc=evidence.RequestStartedUtc,
                     ReceivedUtc=evidence.ReceivedUtc,ObservedUtc=utc,PreviousOrderUpdatedUtc=order.UpdatedUtc,PreviousBrokerChangeUtc=copy.LastBrokerChangeUtc};
@@ -584,7 +588,9 @@ namespace ShinhanNativeTrader {
                 &&point.OrderQuantity==order.Quantity&&point.FilledQuantity==order.Quantity&&order.FilledQuantity==order.Quantity&&order.CancelledQuantity==0
                 &&point.LimitPrice==order.LimitPrice&&point.AverageFillPrice>0
                 &&(order.TradeKind==LiveOrderKind.Buy?point.AverageFillPrice<=order.LimitPrice:point.AverageFillPrice>=order.LimitPrice)
-                &&point.ProductCode=="01"&&point.CreditCode=="00"&&point.SideCode==(order.TradeKind==LiveOrderKind.Buy?"2":"1")&&point.ConfirmationCode=="0"
+                &&point.ProductCode=="01"&&point.CreditCode=="00"&&point.SideCode==(order.TradeKind==LiveOrderKind.Buy?"2":"1")
+                &&(point.ConfirmationBasis==BrokerFillConfirmationBasis.NormalCode&&point.ConfirmationCode=="0"
+                    ||point.ConfirmationBasis==BrokerFillConfirmationBasis.IndependentFullFillWithoutConfirmation&&string.IsNullOrWhiteSpace(point.ConfirmationCode))
                 &&point.RequestStartedUtc.Kind==DateTimeKind.Utc&&point.ReceivedUtc.Kind==DateTimeKind.Utc&&point.ObservedUtc.Kind==DateTimeKind.Utc
                 &&point.PreviousOrderUpdatedUtc.Kind==DateTimeKind.Utc&&point.PreviousBrokerChangeUtc.Kind==DateTimeKind.Utc
                 &&point.PreviousOrderUpdatedUtc>=order.CreatedUtc&&point.RequestStartedUtc>point.PreviousOrderUpdatedUtc

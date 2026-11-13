@@ -24,11 +24,33 @@ namespace ShinhanNativeTrader {
         public bool OrderSemanticsVerified { get { return false; } }
     }
 
+    public enum BrokerConfirmationKind { Normal, Rejected, Unavailable, Unknown }
+
     public sealed class BrokerOrderRow {
         public string OrderNumber,OriginalOrderNumber,Code,Name,SideCode,AmendCancelCode;
         public string ProductCode,CreditCode,OrderClock,FillClock,RejectCode,RejectName,ConfirmationCode,StatusName;
         public decimal Quantity,LimitPrice,FilledQuantity,AverageFillPrice,OpenQuantity,ConfirmedQuantity,AutoCancelledQuantity;
         public bool HasRejection { get { return ConfirmationCode=="1"||ConfirmationCode=="2"||ConfirmationCode=="3"; } }
+        // SABA231Q1 MO21 is a one-character enum. A missing echo is unavailable
+        // metadata, never code 0; other nonblank representations need evidence.
+        public BrokerConfirmationKind ConfirmationKind { get {
+            return ConfirmationCode=="0"?BrokerConfirmationKind.Normal:HasRejection?BrokerConfirmationKind.Rejected:
+                string.IsNullOrWhiteSpace(ConfirmationCode)?BrokerConfirmationKind.Unavailable:BrokerConfirmationKind.Unknown;
+        } }
+        public string ConfirmationShape { get {
+            return ConfirmationKind==BrokerConfirmationKind.Unavailable?"Blank":ConfirmationKind==BrokerConfirmationKind.Normal?"Zero":
+                ConfirmationKind==BrokerConfirmationKind.Rejected?"Reject":ConfirmationCode.All(value=>value=='0')?"PaddedZero":"Other";
+        } }
+        static bool NoRejectionValue(string value){return string.IsNullOrWhiteSpace(value)||value.All(character=>character=='0');}
+        public bool HasRejectionConflict { get {
+            return HasRejection||!NoRejectionValue(RejectCode)||!NoRejectionValue(RejectName)
+                ||!string.IsNullOrEmpty(StatusName)&&(StatusName.IndexOf("거부",StringComparison.Ordinal)>=0
+                    ||StatusName.IndexOf("접속실패",StringComparison.Ordinal)>=0);
+        } }
+        // This is only one prerequisite for a separately verified, exact,
+        // known-accepted terminal fill. It cannot prove acceptance or a fill.
+        public bool TerminalConfirmationCompatible {get{return !HasRejectionConflict
+            &&(ConfirmationKind==BrokerConfirmationKind.Normal||ConfirmationKind==BrokerConfirmationKind.Unavailable);}}
         // SABA231Q1 aggregate rows are a snapshot, never individual executions.
         public bool HasExecutionId { get { return false; } }
     }

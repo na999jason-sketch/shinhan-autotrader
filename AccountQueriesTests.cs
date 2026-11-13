@@ -256,6 +256,26 @@ namespace ShinhanNativeTrader {
             Check(order.Quantity==10&&order.FilledQuantity==4&&order.OpenQuantity==6&&order.AverageFillPrice==70100&&!order.HasExecutionId,"aggregate partial fill is never an incremental execution event");
             io.SetRow(0,21,"3");io.SetRow(0,31,"거부");orders=AccountQueries.ReadOrders(io,"20261112",utc);
             Check(orders.Orders[0].HasRejection&&orders.Orders[0].StatusName=="거부","exchange rejection remains explicit rather than inferred as accepted");
+            foreach(var code in new[]{null,""," ","0","00","1","2","3","9"}) {
+                var confirmation=new BrokerOrderRow{ConfirmationCode=code};
+                bool blank=string.IsNullOrWhiteSpace(code),normal=code=="0",rejected=code=="1"||code=="2"||code=="3";
+                Check(confirmation.ConfirmationKind==(blank?BrokerConfirmationKind.Unavailable:normal?BrokerConfirmationKind.Normal:
+                    rejected?BrokerConfirmationKind.Rejected:BrokerConfirmationKind.Unknown),"confirmation enum preserves missing and unknown representations separately");
+                Check(confirmation.TerminalConfirmationCompatible==(blank||normal),"terminal prerequisite permits unavailable metadata but never treats it or padded zero as normal");
+                Check(confirmation.ConfirmationShape==(blank?"Blank":normal?"Zero":rejected?"Reject":code=="00"?"PaddedZero":"Other"),
+                    "confirmation diagnostics expose only finite shape classes");
+            }
+            foreach(var code in new[]{"0",""})foreach(var mutation in new Action<BrokerOrderRow>[] {
+                row=>row.RejectCode="R001",row=>row.RejectName="주문 거부",row=>row.StatusName="거래소거부",row=>row.StatusName="접속실패"
+            }) {
+                var confirmation=new BrokerOrderRow{ConfirmationCode=code};mutation(confirmation);
+                Check(confirmation.HasRejectionConflict&&!confirmation.TerminalConfirmationCompatible,
+                    "independent rejection metadata conflicts with both normal and unavailable confirmation echoes");
+            }
+            io.SetRow(0,21,"");io.SetRow(0,31,"확인");io.SetRow(0,19,"");io.SetRow(0,20,"");
+            orders=AccountQueries.ReadOrders(io,"20261112",utc);
+            Check(orders.Orders[0].ConfirmationCode==""&&orders.Orders[0].ConfirmationKind==BrokerConfirmationKind.Unavailable
+                &&!orders.Orders[0].HasRejection,"MO21 missing echo remains unavailable after parsing instead of being replaced by normal");
             io.SetRow(0,14,"Name\r\nInjected\u202E");orders=AccountQueries.ReadOrders(io,"20261112",utc);
             Check(orders.Orders[0].Name=="NameInjected","display text cannot insert multiline or bidi records");
             io.Order(1,"00123");Reject(()=>AccountQueries.ReadOrders(io,"20261112",utc),"duplicate aggregate IDs cannot be misread as two executions");

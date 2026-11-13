@@ -272,6 +272,27 @@ namespace ShinhanNativeTrader {
             snapshot.BindRequestScope(Now.AddMilliseconds(-30),Now.AddMilliseconds(-20),true,"12345678901");
             snapshot.Orders[0].AverageFillPrice=10001;f.Data.ObserveOrders(snapshot,snapshot.RequestStartedUtc);
             Check(!f.Evaluate().Ready,"a changed broker cumulative average invalidates the old terminal checkpoint");
+            snapshot.Orders[0].AverageFillPrice=10000;
+            Action observeFresh=()=> {
+                f.Data=new BrokerReadiness(key,Fingerprint);f.Data.SetAuthorization(true);f.Data.SetAccountStream(true,Now.AddSeconds(-10));f.Refresh(Now);
+                snapshot.BindRequestScope(Now.AddMilliseconds(-200),Now.AddMilliseconds(-100),true,"12345678901");
+                f.Data.ObserveOrders(snapshot,snapshot.RequestStartedUtc);
+            };
+            foreach(var basis in new[]{BrokerFillConfirmationBasis.NormalCode,BrokerFillConfirmationBasis.IndependentFullFillWithoutConfirmation}) {
+                order.FillCheckpoint.ConfirmationBasis=basis;order.FillCheckpoint.ConfirmationCode=basis==BrokerFillConfirmationBasis.NormalCode?"0":"";
+                foreach(var code in new[]{"0",""}) {
+                    snapshot.Orders[0].ConfirmationCode=code;observeFresh();
+                    Check(f.Evaluate().Ready,"fresh exact full-fill row validates its independent checkpoint while retaining separate confirmation provenance");
+                    foreach(var mutation in new Action<BrokerOrderRow>[] {
+                        row=>row.ConfirmationCode="1",row=>row.ConfirmationCode="2",row=>row.ConfirmationCode="3",row=>row.ConfirmationCode="00",
+                        row=>row.ConfirmationCode="9",row=>row.RejectCode="R001",row=>row.RejectName="거부",row=>row.StatusName="거부"
+                    }) {
+                        var row=snapshot.Orders[0];mutation(row);observeFresh();
+                        row.ConfirmationCode=code;row.RejectCode=null;row.RejectName=null;row.StatusName=null;
+                        Check(!f.Evaluate().Ready,"defensively copied conflicting confirmation or rejection metadata invalidates either checkpoint provenance");
+                    }
+                }
+            }
         }
         static void OrdinarySourceChecks() {
             var trade=ParsedBalance("",true,io=>{io.Fields[3]="";io.Fields[22]="";});

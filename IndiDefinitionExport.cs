@@ -60,7 +60,7 @@ namespace ShinhanNativeTrader {
                 destination=Path.GetFullPath(destinationDirectory);
             }catch{throw new ArgumentException("An absolute export directory is required.","destinationDirectory");}
             var items=new List<Definition>();
-            foreach(var name in new[]{"saba609q1.xtr","saba101u1.xtr","saba102u1.xtr"})items.Add(Read(root,"qry/"+name));
+            foreach(var name in new[]{"saba609q1.xtr","saba101u1.xtr","saba102u1.xtr","saba231q1.xtr"})items.Add(Read(root,"qry/"+name));
             if(!items.Any(item=>item.Status=="Included"))throw new InvalidOperationException("No readable static Indi query definition was found.");
             var helper=Read(root,"qry/config/helpertrinfo.dat");
             if(helper.Status!="Included")helper=Read(root,"config/helpertrinfo.dat");

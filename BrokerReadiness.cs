@@ -114,7 +114,8 @@ namespace ShinhanNativeTrader {
                     throw new ArgumentException("Malformed aggregate broker order evidence.");
                 copy.Orders.Add(new BrokerOrderRow{OrderNumber=row.OrderNumber,OriginalOrderNumber=row.OriginalOrderNumber,Code=row.Code,SideCode=row.SideCode,AmendCancelCode=row.AmendCancelCode,
                     ProductCode=row.ProductCode,CreditCode=row.CreditCode,Quantity=row.Quantity,FilledQuantity=row.FilledQuantity,OpenQuantity=row.OpenQuantity,LimitPrice=row.LimitPrice,
-                    AverageFillPrice=row.AverageFillPrice,ConfirmationCode=row.ConfirmationCode,ConfirmedQuantity=row.ConfirmedQuantity,AutoCancelledQuantity=row.AutoCancelledQuantity});
+                    AverageFillPrice=row.AverageFillPrice,ConfirmationCode=row.ConfirmationCode,RejectCode=row.RejectCode,RejectName=row.RejectName,StatusName=row.StatusName,
+                    ConfirmedQuantity=row.ConfirmedQuantity,AutoCancelledQuantity=row.AutoCancelledQuantity});
             }
             lock(sync){if(!Newer(orderTime,stamp))return false;orders=copy;orderTime=stamp;AdvanceEpoch();return true;}
         }
@@ -202,7 +203,7 @@ namespace ShinhanNativeTrader {
             if(!LiveOrderJournal.HasTerminalFillCheckpoint(order,journal.AccountFingerprint)||row==null||!snapshot.RequestScopeVerified
                 ||!snapshot.MatchesRequestAccountKey(currentAccountKey))return false;
             var point=order.FillCheckpoint;
-            if(row.HasRejection||row.ConfirmationCode!="0"||row.ConfirmedQuantity!=0||row.AutoCancelledQuantity!=0
+            if(!row.TerminalConfirmationCompatible||row.ConfirmedQuantity!=0||row.AutoCancelledQuantity!=0
                 ||row.AverageFillPrice!=point.AverageFillPrice||row.FilledQuantity!=point.FilledQuantity||row.OpenQuantity!=0)return false;
             var executions=journal.Executions.Where(value=>value.OrderId==order.Id).ToArray();
             if(executions.Any(value=>value.Price<=0||(order.TradeKind==LiveOrderKind.Buy?value.Price>order.LimitPrice:value.Price<order.LimitPrice)))return false;

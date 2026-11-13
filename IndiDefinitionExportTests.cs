@@ -34,17 +34,26 @@ namespace ShinhanNativeTrader {
                 string exported=IndiDefinitionExport.Save(starter,destination);
                 Check(Path.GetDirectoryName(exported)==destination&&Path.GetFileName(exported).StartsWith("indi-query-definitions-",StringComparison.Ordinal)&&Path.GetExtension(exported)==".xml","export filename is unique, fixed-prefix XML under the requested destination");
                 var xml=new XmlDocument{XmlResolver=null};xml.Load(exported);
-                Check(xml.DocumentElement.Name=="IndiQueryDefinitions"&&xml.DocumentElement.GetAttribute("version")=="1"&&xml.DocumentElement.ChildNodes.Count==4,"export contains exactly three known query entries and one helper");
+                Check(xml.DocumentElement.Name=="IndiQueryDefinitions"&&xml.DocumentElement.GetAttribute("version")=="1"&&xml.DocumentElement.ChildNodes.Count==5,"export contains exactly four known query entries and one helper");
                 var balance=Entry(xml,"qry/saba609q1.xtr");
                 Check(balance.GetAttribute("status")=="Included"&&balance.GetAttribute("bytes")=="3"&&Convert.FromBase64String(balance.InnerText).SequenceEqual(body),"binary query definitions round-trip exactly without being interpreted or executed");
                 Check(balance.GetAttribute("sha256")=="ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"&&balance.GetAttribute("encoding")=="base64","export records fixed byte length, lowercase SHA256 and encoding");
                 Check(Entry(xml,"qry/saba102u1.xtr").GetAttribute("status")=="Missing","a missing optional query is explicit rather than fabricated");
+                Check(Entry(xml,"qry/saba231q1.xtr").GetAttribute("status")=="Missing","a missing installed order-query layout remains explicit until it is captured");
                 Check(Encoding.ASCII.GetString(Convert.FromBase64String(Entry(xml,"qry/config/helpertrinfo.dat").InnerText))=="MODERN STATIC HELPER","current qry/config helper takes priority over the older root/config helper");
                 string text=File.ReadAllText(exported);
                 Check(!text.Contains(root)&&!text.Contains(destination)&&!text.Contains("12345678901")&&!text.Contains("PASSWORD")&&!text.Contains("diagnostics.log")&&!text.Contains("live-orders")&&!text.Contains("other.xtr"),"export omits absolute installation paths and every account/log/unrequested file");
                 Check(File.ReadAllBytes(Path.Combine(qry,"saba609q1.xtr")).SequenceEqual(body)&&new FileInfo(starter).Length==0,"export leaves vendor resources and starter unchanged");
                 string second=IndiDefinitionExport.Save(starter,destination);
                 Check(second!=exported&&File.Exists(exported)&&File.Exists(second),"repeated exports preserve existing output instead of overwriting it");
+                byte[] ordersDefinition={2,8,0,1,255};File.WriteAllBytes(Path.Combine(qry,"saba231q1.xtr"),ordersDefinition);
+                string withOrders=IndiDefinitionExport.Save(starter,destination);xml.Load(withOrders);
+                var orders=Entry(xml,"qry/saba231q1.xtr");
+                Check(orders.GetAttribute("status")=="Included"&&orders.GetAttribute("bytes")=="5"
+                    &&Convert.FromBase64String(orders.InnerText).SequenceEqual(ordersDefinition),
+                    "installed order-query definition is exported byte-for-byte without interpreting or invoking it");
+                Check(File.ReadAllBytes(Path.Combine(qry,"saba231q1.xtr")).SequenceEqual(ordersDefinition),
+                    "capturing installed order-query layout never changes the vendor definition");
                 Check(!Directory.EnumerateFiles(destination,"*.tmp").Any(),"successful export publishes no temporary leftovers");
                 File.Delete(Path.Combine(modern,"helpertrinfo.dat"));
                 string fallback=IndiDefinitionExport.Save(starter,destination);xml.Load(fallback);

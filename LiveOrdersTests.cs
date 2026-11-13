@@ -191,9 +191,9 @@ namespace ShinhanNativeTrader {
                     "wrong stock","wrong direction","wrong product","credit trade","broker rejection","wrong quantity","wrong limit",
                     "partial fill","open remainder","confirmation quantity","automatic cancellation","missing average","limit-violating average",
                     "original order link","pre-Unknown request","request after receive","future receive"};
-                for(int index=0;index<mutations.Length;index++) {
-                    var evidence=TerminalEvidence(journal,order);mutations[index](evidence);
-                    Reject(()=>journal.ReconcileKnownTerminalFill(id,evidence,Utc(5)),"terminal checkpoint rejects "+labels[index]);
+                foreach(var confirmation in new[]{"0",""})for(int index=0;index<mutations.Length;index++) {
+                    var evidence=TerminalEvidence(journal,order);evidence.Row.ConfirmationCode=confirmation;mutations[index](evidence);
+                    Reject(()=>journal.ReconcileKnownTerminalFill(id,evidence,Utc(5)),"terminal checkpoint rejects "+labels[index]+" even with "+(confirmation==""?"unavailable":"normal")+" confirmation");
                 }
                 Reject(()=>journal.ReconcileKnownTerminalFill(id,TerminalEvidence(journal,order),Utc(10)),"stale terminal broker snapshot cannot recover an unknown order");
                 Check(journal.RecoveryRequired&&journal.Snapshot.Executions.Count==0&&journal.Snapshot.Orders.Single().FillCheckpoint==null,
@@ -221,8 +221,45 @@ namespace ShinhanNativeTrader {
                 Check(restarted.ReconcileKnownTerminalFill(id,evidence,Utc(8)),"only a newer full account-scoped snapshot can re-establish a contradicted terminal checkpoint");
             }
             var document=new XmlDocument();document.Load(path);
+            var basisNode=document.SelectSingleNode("/LiveOrderJournalState/Orders/LiveOrderRecord/FillCheckpoint/ConfirmationBasis");
+            basisNode.ParentNode.RemoveChild(basisNode);document.Save(path);
+            using(var legacyCheckpoint=new LiveOrderJournal(path))
+                Check(LiveOrderJournal.HasTerminalFillCheckpoint(legacyCheckpoint.Snapshot.Orders.Single(),legacyCheckpoint.Snapshot.AccountFingerprint),
+                    "pre-provenance journals with explicit normal confirmation retain their original validated checkpoint");
             document.SelectSingleNode("/LiveOrderJournalState/Orders/LiveOrderRecord/FillCheckpoint/AccountFingerprint").InnerText="tampered-account";
             document.Save(path);Reject(()=>new LiveOrderJournal(path),"tampered persisted terminal-checkpoint identity fails closed on restart");
+
+            foreach(var kind in new[]{LiveOrderKind.Buy,LiveOrderKind.Sell}) {
+                string blankPath=Path.Combine(directory,"terminal-unavailable-confirmation-"+kind+".xml");
+                using(var journal=new LiveOrderJournal(blankPath)) {
+                    journal.BindAccount("12345678901");var intent=Buy("unavailable-confirmation-"+kind);intent.Kind=kind;
+                    var order=AcceptedWithEvidence(journal,intent,"000812399",Utc());journal.MarkUnknown(order.Id,Utc(2));
+                    foreach(var confirmation in new[]{"0",""})foreach(var mutation in new Action<BrokerOrderRow>[] {
+                        row=>row.ConfirmationCode="1",row=>row.ConfirmationCode="2",row=>row.ConfirmationCode="3",row=>row.ConfirmationCode="00",
+                        row=>row.ConfirmationCode="9",row=>row.RejectCode="R001",row=>row.RejectName="거부 사유",row=>row.StatusName="거부"
+                    }) {
+                        var conflict=TerminalEvidence(journal,order);conflict.Row.ConfirmationCode=confirmation;mutation(conflict.Row);
+                        Reject(()=>journal.ReconcileKnownTerminalFill(order.Id,conflict,Utc(5)),kind+" terminal recovery never ignores explicit or unknown rejection metadata");
+                    }
+                    var evidence=TerminalEvidence(journal,order);evidence.Row.ConfirmationCode="";
+                    Check(journal.ReconcileKnownTerminalFill(order.Id,evidence,Utc(5)),kind+" accepted exact-ID full fill can recover independently of a missing confirmation echo");
+                    var recovered=journal.Snapshot.Orders.Single();
+                    Check(recovered.Status==LiveOrderStatus.Filled&&recovered.FillCheckpoint.ConfirmationCode==""
+                        &&recovered.FillCheckpoint.ConfirmationBasis==BrokerFillConfirmationBasis.IndependentFullFillWithoutConfirmation
+                        &&journal.Snapshot.Executions.Count==0&&!journal.RecoveryRequired,
+                        kind+" recovery saves independent full-fill provenance without forging normal code or individual execution IDs");
+                    Reject(()=>journal.Prepare(intent,Utc(6)),kind+" checkpoint completion cannot replay the previously accepted strategy intent");
+                }
+                using(var journal=new LiveOrderJournal(blankPath)) {
+                    var recovered=journal.Snapshot.Orders.Single();
+                    Check(!journal.RecoveryRequired&&LiveOrderJournal.HasTerminalFillCheckpoint(recovered,journal.Snapshot.AccountFingerprint)
+                        &&recovered.FillCheckpoint.ConfirmationCode==""&&recovered.FillCheckpoint.ConfirmationBasis==BrokerFillConfirmationBasis.IndependentFullFillWithoutConfirmation,
+                        kind+" restart preserves distinct missing-echo recovery provenance");
+                }
+                var blankDocument=new XmlDocument();blankDocument.Load(blankPath);
+                blankDocument.SelectSingleNode("/LiveOrderJournalState/Orders/LiveOrderRecord/FillCheckpoint/ConfirmationBasis").InnerText="NormalCode";
+                blankDocument.Save(blankPath);Reject(()=>new LiveOrderJournal(blankPath),kind+" blank confirmation cannot be relabeled normal in the persisted checkpoint");
+            }
 
             foreach(var kind in new[]{LiveOrderKind.Buy,LiveOrderKind.Sell}) {
                 using(var journal=new LiveOrderJournal(Path.Combine(directory,"terminal-partial-"+kind+".xml"))) {

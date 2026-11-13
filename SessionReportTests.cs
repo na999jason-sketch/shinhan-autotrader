@@ -137,7 +137,30 @@ namespace ShinhanNativeTrader {
                 Check(text.Contains("\"'123\",\"미확인\",\"'005930\",\"매수\",3,65000,1,65000,2"),"broker cumulative fill snapshot is reported independently");
                 Check(text.Contains("\"'123\",\"미확인\",\"'005930\",\"Buy\",3,0,0,65000,\"Working\""),"acknowledged working journal order is not changed to broker aggregate fill");
                 Check(!text.Contains("SECRET")&&!text.Contains("PASSWORD")&&!text.Contains("12345678901")&&!text.Contains("4321"),"provider names, reject text and internal arbitrary identifiers are omitted");
+                Check(text.Contains("\"거부코드 형태\",\"거부코드명 형태\",\"상태명 분류\",\"확인구분 분류\",\"체결·확인 대조\"")
+                    &&text.Contains("\"Blank\",\"Present\",\"Other\",\"Zero\",\"거부명세 확인 필요\""),
+                    "appended broker metadata classifications preserve the old columns without exposing arbitrary provider text");
                 Check(positions[0].Price==65000&&orders.Orders[0].FilledQuantity==1&&journal[0].FilledQuantity==0,"reporting does not mutate holding or order evidence");
+
+                var conflictOrders=new BrokerOrdersSnapshot{TradingDate="20261113",ReceivedUtc=utc};
+                var conflictRow=new BrokerOrderRow{OrderNumber="9021",Code="005930",SideCode="1",Quantity=2,LimitPrice=8500,
+                    FilledQuantity=2,AverageFillPrice=8500,OpenQuantity=0,ConfirmedQuantity=0,ConfirmationCode="1",StatusName="확인"};
+                conflictOrders.Orders.Add(conflictRow);
+                var conflictPath=SessionReport.Write(directory,day.AddDays(3),utc,null,null,null,conflictOrders,null,"실주문 미시작");
+                var conflictText=File.ReadAllText(conflictPath);
+                Check(conflictText.Contains("\"'9021\",\"미확인\",\"'005930\",\"매도\",2,8500,2,8500,0,0,\"1\",\"Blank\",\"Blank\",\"확인\",\"Reject\",\"전량체결 수량·확인명세 충돌\""),
+                    "a synthetic full-fill row with literal confirmation 1 remains visible as conflicting evidence rather than normal or an inferred execution");
+                Check(conflictRow.ConfirmationCode=="1"&&conflictRow.HasRejection&&!conflictRow.TerminalConfirmationCompatible,
+                    "diagnostic reporting cannot turn conflicting confirmation 1 into acceptance or recovery authorization");
+                foreach(var status in new[]{"의뢰","접수","확인","거부","=CMD()","SECRET_ACCOUNT_12345678901"}) {
+                    conflictRow.StatusName=status;conflictRow.RejectCode="PASSWORD_4321";conflictRow.RejectName=" =SUM(SECRET_ACCOUNT_12345678901)";
+                    SessionReport.Write(directory,day.AddDays(3),utc,null,null,null,conflictOrders,null,"실주문 미시작");
+                    conflictText=File.ReadAllText(conflictPath);
+                    Check(!conflictText.Contains("SECRET")&&!conflictText.Contains("PASSWORD")&&!conflictText.Contains("=CMD")&&!conflictText.Contains("=SUM"),
+                        "provider metadata remains finite before CSV formula escaping or sensitive free text could enter the report");
+                    Check(conflictText.Contains("\"Present\",\"Present\",\""+(status=="의뢰"||status=="접수"||status=="확인"||status=="거부"?status:"Other")+"\",\"Reject\""),
+                        "only documented broker statuses are retained while rejection-field presence remains diagnosable");
+                }
 
                 positions[0].Price=60000;
                 var second=SessionReport.Write(directory,day,utc.AddMinutes(1),positions,utc,cash,orders,journal,LiveOrderSafety.BlockReason);

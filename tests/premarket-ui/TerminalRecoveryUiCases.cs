@@ -151,8 +151,35 @@ static class TerminalRecoveryUiCases {
             CheckNoBrokerSideEffect(fixture,check,scenario);
         }
     }
+    static void ConfirmationEvidence(string data,Action<bool,string> check) {
+        using(var fixture=new Fixture(data,"blank-confirmation")) {
+            var value=fixture.Snapshot();value.Orders.Single().ConfirmationCode="";fixture.Apply(value);
+            check(fixture.Current.Status==LiveOrderStatus.Filled&&fixture.Current.FillCheckpoint!=null
+                &&fixture.Current.FillCheckpoint.ConfirmationCode==""
+                &&fixture.Current.FillCheckpoint.ConfirmationBasis==BrokerFillConfirmationBasis.IndependentFullFillWithoutConfirmation,
+                "missing confirmation metadata is preserved separately from independently verified known-order full fill evidence");
+            CheckNoBrokerSideEffect(fixture,check,"blank terminal confirmation");
+        }
+        using(var fixture=new Fixture(data,"full-fill-confirmation-conflict")) {
+            var value=fixture.Snapshot();value.Orders.Single().ConfirmationCode="1";fixture.Apply(value);
+            var grid=Get<DataGridView>(fixture.Form,"ordersGrid");
+            check(fixture.Current.Status==LiveOrderStatus.Unknown&&fixture.Journal.RecoveryRequired
+                &&fixture.Journal.Snapshot.Executions.Count==0&&fixture.Current.FillCheckpoint==null,
+                "a full-fill row with confirmation code 1 cannot silently become normal or clear the unresolved order");
+            check(grid.Rows.Count==1&&Convert.ToDecimal(grid.Rows[0].Cells[4].Value)==3
+                &&Convert.ToDecimal(grid.Rows[0].Cells[5].Value)==0
+                &&Convert.ToString(grid.Rows[0].Cells[8].Value).Contains("전량체결 조회 · 확인구분 충돌")
+                &&Convert.ToString(grid.Rows[0].Cells[9].Value).Contains("확인구분 1"),
+                "the UI retains reported filled and open quantities and explains the exact finite confirmation conflict");
+            Call(fixture.Form,"Arm");
+            check(!Get<LiveTradingSession>(fixture.Form,"authorization").Active&&fixture.Journal.RecoveryRequired,
+                "a confirmation conflict cannot rearm trading through the start button");
+            CheckNoBrokerSideEffect(fixture,check,"full-fill confirmation conflict");
+        }
+    }
     public static void Run(string data,Action<bool,string> check) {
         TerminalMatch(data,check);
+        ConfirmationEvidence(data,check);
         Refused(data,"empty",(value,row)=>value.Orders.Clear(),check);
         Refused(data,"unverified",(value,row)=>Bind(value,value.RequestStartedUtc,value.ReceivedUtc,false,Account),check);
         Refused(data,"wrong-account",(value,row)=>Bind(value,value.RequestStartedUtc,value.ReceivedUtc,true,OtherAccount),check);
