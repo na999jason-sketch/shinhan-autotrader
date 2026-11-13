@@ -214,11 +214,95 @@ namespace ShinhanNativeTrader {
             fake=Gi004();requests=new IndiRequestCoordinator(fake);fake.DuringRequest=()=>fake.Data(0);
             Check(!requests.Begin("TRADEHOLDINGS","SABA609Q1",AccountQueries.HoldingsInputs(account,secret),"")&&requests.Failed,"a zero return with an early callback is not silently reinterpreted as safe delayed evidence");requests.Dispose();
         }
+        static void OrdersRequestScopeProof() {
+            const string number="12345678901",secret="5678",day="20261112";
+            var fake=new FakeIndi();var requests=new IndiRequestCoordinator(fake);IndiReply reply=null;
+            requests.Done+=value=>reply=value;
+            Check(requests.Begin("ORDERS","SABA231Q1",AccountQueries.OrdersInputs(number,secret,day),day),
+                "exact nine-field account/date order profile can start a read-only request");
+            fake.Data(99);
+            Check(reply==null&&requests.Busy,"another callback ID cannot certify the order request scope");
+            fake.Data(7);
+            Check(reply!=null&&reply.BrokerOrders.RequestScopeVerified&&reply.BrokerOrders.RequestStartedUtc==reply.RequestStartedUtc
+                &&reply.BrokerOrders.RequestStartedUtc.Kind==DateTimeKind.Utc&&reply.BrokerOrders.RequestStartedUtc<=reply.BrokerOrders.ReceivedUtc,
+                "accepted integer ID and matching normal callback bind the exact order profile and actual UTC times");
+            Check(reply.BrokerOrders.MatchesRequestAccount(number)&&!reply.BrokerOrders.MatchesRequestAccount("12345678902"),
+                "the correlated native order response remains bound to the exact account sent in input1");
+            Check(reply.BrokerOrders.Orders.Count==0&&!reply.BrokerOrders.IsComplete&&!reply.BrokerOrders.HasExecutionIds,
+                "verified request scope does not make an empty order response complete or invent execution identifiers");requests.Dispose();
+
+            for(int field=0;field<9;field++) {
+                fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+                var inputs=AccountQueries.OrdersInputs(number,secret,day);inputs.Remove(field);
+                requests.Begin("ORDERS","SABA231Q1",inputs,day);fake.Data(7);
+                Check(reply!=null&&!reply.BrokerOrders.RequestScopeVerified,"missing order input cannot establish account/date scope: "+field);requests.Dispose();
+            }
+            foreach(var entry in new[]{new[]{"0","20260230"},new[]{"1","bad"},new[]{"2",""},new[]{"3","11"},new[]{"4","1"},
+                new[]{"5","1"},new[]{"6","A005930"},new[]{"7","02"},new[]{"8","N"},new[]{"9","unsupported"}}) {
+                fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+                var inputs=AccountQueries.OrdersInputs(number,secret,day);inputs[int.Parse(entry[0],CultureInfo.InvariantCulture)]=entry[1];
+                requests.Begin("ORDERS","SABA231Q1",inputs,day);fake.Data(7);
+                Check(reply!=null&&!reply.BrokerOrders.RequestScopeVerified,"malformed or restricted order input cannot establish full profile: "+entry[0]);requests.Dispose();
+            }
+            foreach(var scope in new[]{"DateMismatch","WrongQuery"}) {
+                fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+                requests.Begin("ORDERS",scope=="WrongQuery"?"SABA200QB":"SABA231Q1",AccountQueries.OrdersInputs(number,secret,day),scope=="DateMismatch"?"20261111":day);fake.Data(7);
+                Check(reply!=null&&!reply.BrokerOrders.RequestScopeVerified,"order profile must agree with parser query and requested date: "+scope);requests.Dispose();
+            }
+            for(int ambiguous=0;ambiguous<2;ambiguous++) {
+                fake=new FakeIndi{OverrideSetterReturns=true,QuerySetterReturn=ambiguous==0?null:(object)true,FieldSetterReturn=ambiguous==0?(object)true:1};
+                requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+                requests.Begin("ORDERS","SABA231Q1",AccountQueries.OrdersInputs(number,secret,day),day);fake.Data(7);
+                Check(reply!=null&&!reply.BrokerOrders.RequestScopeVerified,"ambiguous native setter return cannot establish order query scope: "+ambiguous);requests.Dispose();
+            }
+            foreach(var refused in new[]{"Query","Field"}) {
+                fake=new FakeIndi{SetQueryAccepted=refused!="Query",SetFieldAccepted=refused!="Field"};
+                requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+                Check(!requests.Begin("ORDERS","SABA231Q1",AccountQueries.OrdersInputs(number,secret,day),day)&&fake.RequestCount==0,
+                    "refused native setter prevents an order-read request entirely: "+refused);
+                fake.Data(7);Check(reply==null,"late callback after refused order-read setter is not proof: "+refused);requests.Dispose();
+            }
+            for(int unknown=0;unknown<2;unknown++) {
+                fake=new FakeIndi{DiagnosticThrows=unknown==0};if(unknown==1)fake.Diagnostic.ErrorState=null;
+                requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+                requests.Begin("ORDERS","SABA231Q1",AccountQueries.OrdersInputs(number,secret,day),day);fake.DeliverWithoutSettingStatus(7);
+                Check(reply!=null&&!reply.BrokerOrders.RequestScopeVerified,"unknown callback diagnostics can display order rows but cannot prove scope: "+unknown);requests.Dispose();
+            }
+            fake=new FakeIndi{ResponseErrorState=2};requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+            requests.Begin("ORDERS","SABA231Q1",AccountQueries.OrdersInputs(number,secret,day),day);fake.Data(7);
+            Check(reply==null&&requests.Failed,"a provider-error order callback never establishes a successful request scope");requests.Dispose();
+
+            fake=new FakeIndi{ErrorAfterRequest=true};requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+            fake.DuringRequest=()=>fake.Data(7);
+            Check(requests.Begin("ORDERS","SABA231Q1",AccountQueries.OrdersInputs(number,secret,day),day)
+                &&reply!=null&&reply.BrokerOrders.RequestScopeVerified,
+                "reentrant matching order callback retains its normal status before stale post-request diagnostics replace it");requests.Dispose();
+            fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+            fake.DuringSetField=()=>fake.Data(7);
+            requests.Begin("ORDERS","SABA231Q1",AccountQueries.OrdersInputs(number,secret,day),day);
+            Check(reply!=null&&!reply.BrokerOrders.RequestScopeVerified,
+                "a callback copied before RequestData begins cannot certify a later accepted order request");requests.Dispose();
+
+            fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+            var mutable=AccountQueries.OrdersInputs(number,secret,day);fake.DuringSetField=()=>{mutable[0]="20261111";mutable[1]="bad";mutable[2]="changed";mutable[5]="1";};
+            requests.Begin("ORDERS","SABA231Q1",mutable,day);fake.Data(7);
+            Check(reply!=null&&reply.BrokerOrders.RequestScopeVerified&&fake.Inputs[0]==day&&fake.Inputs[1]==number&&fake.Inputs[5]=="0",
+                "order scope is bound to the private accepted input snapshot despite caller mutations during COM setters");requests.Dispose();
+
+            fake=Gi004();requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+            mutable=AccountQueries.OrdersInputs(number,secret,day);requests.Begin("ORDERS","SABA231Q1",mutable,day);
+            mutable[0]="20261111";mutable[1]="bad";fake.Id=8;
+            Check(reply==null&&requests.Busy&&requests.PollReadOnlyRetry(DateTime.UtcNow.AddSeconds(2)),
+                "unaccepted read-only order query may retry without minting scope before a new accepted ID");fake.Data(8);
+            Check(reply!=null&&reply.BrokerOrders.RequestScopeVerified&&fake.RequestCount==2&&fake.FieldSetCount==18&&fake.Inputs[0]==day,
+                "bounded order-read retry rebinds all nine private inputs and verifies its own successful matching callback");requests.Dispose();
+        }
         public static int Run() {
             checks=0;
             KrxHoldingsProvenance();
             OrdinaryHoldingsProvenance();
             ReadOnlyGi004Recovery();
+            OrdersRequestScopeProof();
             var fake=new FakeIndi();fake.Quote();var requests=new IndiRequestCoordinator(fake);
             int received=0,fatal=0;IndiReply reply=null;
             requests.Done+=value=>{received++;reply=value;};requests.Fatal+=reason=>fatal++;

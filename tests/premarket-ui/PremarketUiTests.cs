@@ -534,7 +534,7 @@ static class PremarketUiTests {
 
     static void Run(string data,string screenshot) {
         using(var form=NewForm()) {
-            Check(form.Text.Contains("2.2.7"),"premarket regression runs against version 2.2.7");
+            Check(form.Text.Contains("2.2.8"),"premarket regression runs against version 2.2.8");
             Check(All(form).OfType<Button>().Any(button=>button.Text=="조회 정의 내보내기"),"static query-definition export is available without invoking registry COM or provider queries");
             Check(!Get<LiveTradingSession>(form,"authorization").Active,"application startup never authorizes live orders");
             var fixture=new Fixture(form);Bind(form);
@@ -651,6 +651,7 @@ static class PremarketUiTests {
         AcceptedUnknownStatus(data);
         RejectedSellQueue(data);
         AcceptedRealtimeFaultCases.Run(data,Check);
+        TerminalRecoveryUiCases.Run(data,Check);
         DeferredReadStatus(data);
     }
 
@@ -769,8 +770,9 @@ static class AcceptedRealtimeFaultCases {
                             &&uncertain.ResponseEvidence.Disposition==OrderResponseDisposition.Accepted&&uncertain.FilledQuantity==0&&persisted.Executions.Count==0,
                             scenario+": actual RT-failure handler stops operations while retaining accepted broker identity and ACK evidence durably");
                     }
-                    check(Get<object>(form,"credentials")==null&&!authorization.Active&&wire.Sends==1,
-                        scenario+": RT failure revokes the account session and never resends the accepted order");
+                    check(Get<object>(form,"credentials")!=null&&Get<bool>(form,"monitoring")&&!authorization.Active&&wire.Sends==1
+                        &&Get<LiveOrderJournal>(form,"journal")==journal,
+                        scenario+": RT failure revokes trading while retaining read-only account reconciliation and never resends the accepted order");
                     var grid=Get<DataGridView>(form,"ordersGrid");
                     check(grid.Rows.Count==1&&Convert.ToString(grid.Rows[0].Cells["주문번호"].Value,CultureInfo.InvariantCulture)=="000812345",
                         scenario+": the actual order grid retains the positive broker order number after reconciliation becomes necessary");

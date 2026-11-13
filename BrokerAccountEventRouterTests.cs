@@ -24,6 +24,22 @@ namespace ShinhanNativeTrader {
             public LiveOrderRecord Acknowledge(LiveOrderRecord order,string number="00123") {
                 Journal.RecordAcknowledgement(order.Id,7,number,false,Utc(1));return Find(order.Id);
             }
+            public LiveOrderRecord TerminalCheckpoint(bool knownIndividual=false,LiveOrderKind kind=LiveOrderKind.Buy) {
+                var pending=Pending(kind:kind);
+                var fields=new[]{"0","00123","0","","0","accepted","0","0"};
+                var accepted=LiveOrderResponseParser.Read(7,index=>fields[index],new IndiDiagnosticSnapshot{ErrorState=0},OrderResponseLayout.Modern,new string[0]);
+                Journal.RecordAcknowledgement(pending.Id,7,accepted.BrokerOrderNumber,false,Utc(1),accepted);
+                decimal average=kind==LiveOrderKind.Buy?9900:10100;
+                if(knownIndividual)Journal.RecordExecution("00123","known-fill",2,average,Utc(2));
+                Journal.MarkUnknown(pending.Id,Utc(3));
+                var evidence=new BrokerTerminalFillEvidence{AccountFingerprint=Journal.Snapshot.AccountFingerprint,TradingDate="20261112",QueryName="SABA231Q1",
+                    RequestStartedUtc=Utc(4),ReceivedUtc=Utc(5),RequestScopeVerified=true,MatchingOrderCount=1,
+                    Row=new BrokerOrderRow{OrderNumber="000123",OriginalOrderNumber="",Code="005930",SideCode=kind==LiveOrderKind.Buy?"2":"1",
+                        ProductCode="01",CreditCode="00",AmendCancelCode="0",ConfirmationCode="0",Quantity=10,LimitPrice=10000,
+                        FilledQuantity=10,AverageFillPrice=average,OpenQuantity=0,ConfirmedQuantity=0,AutoCancelledQuantity=0}};
+                if(!Journal.ReconcileKnownTerminalFill(pending.Id,evidence,Utc(5)))throw new InvalidOperationException("Synthetic terminal recovery did not apply.");
+                return Find(pending.Id);
+            }
             public LiveOrderRecord Find(string id){return Journal.Snapshot.Orders.Single(o=>o.Id==id);}
             public void Dispose(){Journal.Dispose();Directory.Delete(directory,true);}
         }
@@ -166,6 +182,62 @@ namespace ShinhanNativeTrader {
                 var order=fixture.Acknowledge(fixture.Pending());fixture.Router.SetBrokerDate("20261113",Utc().AddDays(1));
                 var value=Event();value.ReceivedUtc=Utc(2).AddDays(1);fixture.Router.ObserveAA(value);
                 Check(fixture.Find(order.Id).FilledQuantity==0&&fixture.Unmatched==1,"a broker number from another confirmed trading day cannot attach to yesterday's order");
+            }
+            using(var fixture=new Fixture()) {
+                var order=fixture.TerminalCheckpoint();
+                fixture.Router.ObserveAA(Event(fill:2,cumulative:2,seconds:6));
+                var late=Event(execution:"later-fill",fill:3,cumulative:7,seconds:7);late.IndividualFillPrice=9980;
+                fixture.Router.ObserveAA(late);
+                Check(fixture.Find(order.Id).Status==LiveOrderStatus.Filled&&fixture.Find(order.Id).FilledQuantity==10
+                    &&fixture.Journal.Snapshot.Executions.Count==0,
+                    "delayed individual ranges already covered by a terminal broker total cannot create fabricated executions or double quantity");
+                Check(fixture.Unknown==0&&fixture.Invalidations==0&&fixture.Changes==0,
+                    "covered historical fills with distinct valid prices do not reopen recovery or starve fresh account snapshots");
+            }
+            using(var fixture=new Fixture()) {
+                var order=fixture.TerminalCheckpoint(true);
+                fixture.Router.ObserveAA(Event(execution:"known-fill",fill:2,cumulative:2,seconds:6));
+                Check(fixture.Find(order.Id).Status==LiveOrderStatus.Filled&&fixture.Journal.Snapshot.Executions.Count==1,
+                    "a real individual execution retained beneath a broker checkpoint remains an idempotent historical event");
+                var conflict=Event(execution:"known-fill",fill:2,cumulative:2,seconds:7);conflict.IndividualFillPrice=9950;
+                fixture.Router.ObserveAA(conflict);
+                Check(fixture.Find(order.Id).Status==LiveOrderStatus.Unknown&&fixture.Unknown==1&&fixture.Find(order.Id).FilledQuantity==10
+                    &&fixture.Journal.Snapshot.Executions.Single().Price==9900,
+                    "a conflicting known execution ID reopens checkpoint reconciliation without changing the authoritative total or earlier execution");
+            }
+            using(var fixture=new Fixture()) {
+                var order=fixture.TerminalCheckpoint();var conflict=Event(fill:2,cumulative:2,seconds:6);conflict.IndividualFillPrice=10001;
+                fixture.Router.ObserveAA(conflict);
+                Check(fixture.Find(order.Id).Status==LiveOrderStatus.Unknown&&fixture.Journal.Snapshot.Executions.Count==0&&fixture.Unknown==1,
+                    "a late buy execution above the submitted limit cannot be excused by an aggregate checkpoint");
+            }
+            using(var fixture=new Fixture()) {
+                var order=fixture.TerminalCheckpoint();var conflict=Event(fill:10,cumulative:10,seconds:6);conflict.IndividualFillPrice=9950;
+                fixture.Router.ObserveAA(conflict);
+                Check(fixture.Find(order.Id).Status==LiveOrderStatus.Unknown&&fixture.Unknown==1&&fixture.Journal.Snapshot.Executions.Count==0,
+                    "a full-quantity individual execution with a different total value contradicts the checkpoint even within the buy limit");
+            }
+            using(var fixture=new Fixture()) {
+                var order=fixture.TerminalCheckpoint();var conflict=Event(fill:2,cumulative:2,seconds:6);conflict.IndividualFillPrice=9000;
+                fixture.Router.ObserveAA(conflict);
+                Check(fixture.Find(order.Id).Status==LiveOrderStatus.Unknown&&fixture.Unknown==1,
+                    "an individually valid historical buy price cannot imply an impossible above-limit remainder under the broker total");
+            }
+            using(var fixture=new Fixture()) {
+                var order=fixture.TerminalCheckpoint(kind:LiveOrderKind.Sell);var late=Event(fill:2,cumulative:2,seconds:6);
+                late.SideCode="01";late.TradeTypeCode="01";late.IndividualFillPrice=10150;fixture.Router.ObserveAA(late);
+                Check(fixture.Find(order.Id).Status==LiveOrderStatus.Filled&&fixture.Journal.Snapshot.Executions.Count==0,
+                    "a delayed sell fill covered by the terminal total may have its own valid price distinct from the aggregate average");
+                late=Event(execution:"below-limit",fill:2,cumulative:2,seconds:7);late.SideCode="01";late.TradeTypeCode="01";late.IndividualFillPrice=9990;
+                fixture.Router.ObserveAA(late);
+                Check(fixture.Find(order.Id).Status==LiveOrderStatus.Unknown&&fixture.Unknown==1,
+                    "a late sell execution below the submitted limit restores reconciliation instead of silently accepting inconsistent evidence");
+            }
+            using(var fixture=new Fixture()) {
+                var order=fixture.TerminalCheckpoint();var conflict=Event(fill:2,cumulative:2,seconds:6);conflict.Code="000660";
+                fixture.Router.ObserveAA(conflict);
+                Check(fixture.Find(order.Id).Status==LiveOrderStatus.Unknown&&fixture.Journal.RecoveryRequired&&fixture.Unknown==1,
+                    "a matching accepted broker ID with a contradictory symbol cannot retain a terminal checkpoint as reconciled");
             }
             return checks;
         }

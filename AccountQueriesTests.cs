@@ -219,6 +219,37 @@ namespace ShinhanNativeTrader {
 
             io=new Response();var orders=AccountQueries.ReadOrders(io,"20261112",utc);
             Check(orders.Orders.Count==0&&!orders.IsComplete&&!orders.HasExecutionIds,"empty account orders are displayed but cannot certify reconciliation");
+            Check(!orders.RequestScopeVerified&&orders.RequestStartedUtc==default(DateTime),
+                "direct order parsing cannot create accepted request scope or invent its start time");
+            orders.BindRequestScope(utc.AddMilliseconds(-100),utc,true,account);
+            string accountKey,otherAccountKey;
+            using(var session=new AccountCredentialSession(account,password))accountKey=session.Key;
+            using(var session=new AccountCredentialSession("12345678902",password))otherAccountKey=session.Key;
+            Check(orders.RequestScopeVerified&&orders.MatchesRequestAccount(account)&&!orders.MatchesRequestAccount("12345678902")
+                &&!orders.MatchesRequestAccount(null)&&!orders.IsComplete&&!orders.HasExecutionIds,
+                "transient order scope binds one account without claiming complete rows or individual executions");
+            Check(orders.MatchesRequestAccountKey(accountKey)&&!orders.MatchesRequestAccountKey(otherAccountKey)
+                &&!orders.MatchesRequestAccountKey(null)&&!orders.MatchesRequestAccountKey("unverified-account-key"),
+                "order request scope matches the exact active credential profile key and refuses another account key");
+            var copiedOrders=new BrokerOrdersSnapshot{TradingDate=orders.TradingDate,RequestStartedUtc=orders.RequestStartedUtc,ReceivedUtc=orders.ReceivedUtc};
+            copiedOrders.CopyRequestScopeFrom(orders);
+            Check(copiedOrders.RequestScopeVerified&&copiedOrders.MatchesRequestAccount(account)&&!copiedOrders.MatchesRequestAccount("12345678902"),
+                "defensive order-snapshot copy preserves the exact transient request account binding");
+            Check(copiedOrders.MatchesRequestAccountKey(accountKey)&&!copiedOrders.MatchesRequestAccountKey(otherAccountKey),
+                "defensive order snapshot also preserves its account-key binding for readiness evaluation");
+            copiedOrders.TradingDate="20261111";
+            Check(!copiedOrders.RequestScopeVerified&&!copiedOrders.MatchesRequestAccount(account),
+                "mutating a scoped order date invalidates both provenance and account matching");
+            copiedOrders=new BrokerOrdersSnapshot{TradingDate=orders.TradingDate,RequestStartedUtc=orders.RequestStartedUtc.AddTicks(-1),ReceivedUtc=orders.ReceivedUtc};
+            copiedOrders.CopyRequestScopeFrom(orders);
+            Check(!copiedOrders.RequestScopeVerified,"order-scope provenance cannot be copied to a different request start");
+            var serializer=new System.Xml.Serialization.XmlSerializer(typeof(BrokerOrdersSnapshot));string serialized;
+            using(var writer=new System.IO.StringWriter(CultureInfo.InvariantCulture)){serializer.Serialize(writer,orders);serialized=writer.ToString();}
+            BrokerOrdersSnapshot restored;
+            using(var reader=new System.IO.StringReader(serialized))restored=(BrokerOrdersSnapshot)serializer.Deserialize(reader);
+            Check(!serialized.Contains(account)&&!serialized.Contains(accountKey)&&!serialized.Contains("RequestScopeVerified")&&!serialized.Contains("requestAccount")
+                &&!restored.RequestScopeVerified&&!restored.MatchesRequestAccount(account),
+                "XML serialization retains no request credentials salt digest or recoverable live account authorization");
             io.Order(0);io.SetRow(0,24,"4");io.SetRow(0,25,"70100");io.SetRow(0,26,"6");
             orders=AccountQueries.ReadOrders(io,"20261112",utc);var order=orders.Orders[0];
             Check(order.OrderNumber=="00123"&&order.OriginalOrderNumber==""&&order.Code=="005930"&&order.SideCode=="2","aggregate order identifiers preserve leading zero and normalize symbol");

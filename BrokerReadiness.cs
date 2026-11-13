@@ -104,7 +104,9 @@ namespace ShinhanNativeTrader {
         public bool ObserveOrders(BrokerOrdersSnapshot value,DateTime requestStartedUtc) {
             if(value==null)throw new ArgumentNullException("value");DateTime day;
             if(!DateTime.TryParseExact(value.TradingDate,"yyyyMMdd",CultureInfo.InvariantCulture,DateTimeStyles.None,out day))throw new ArgumentException("A broker query trading date is required.");
-            var stamp=new Stamp(requestStartedUtc,value.ReceivedUtc);var copy=new BrokerOrdersSnapshot{TradingDate=value.TradingDate,ReceivedUtc=value.ReceivedUtc};
+            var stamp=new Stamp(requestStartedUtc,value.ReceivedUtc);var copy=new BrokerOrdersSnapshot{TradingDate=value.TradingDate,
+                RequestStartedUtc=value.RequestStartedUtc,ReceivedUtc=value.ReceivedUtc};
+            if(requestStartedUtc==value.RequestStartedUtc)copy.CopyRequestScopeFrom(value);
             var seen=new HashSet<string>(StringComparer.Ordinal);
             foreach(var row in value.Orders) {
                 if(row==null||!LiveOrderProtocol.ValidBrokerNumber(row.OrderNumber)||!seen.Add(NumberKey(row.OrderNumber))||string.IsNullOrEmpty(row.Code)||Rules.Code(row.Code)!=row.Code
@@ -196,6 +198,20 @@ namespace ShinhanNativeTrader {
         static bool Fresh(Stamp stamp,DateTime now,DateTime barrier){return stamp!=null&&stamp.Started>barrier&&stamp.Received<=now&&now-stamp.Received<=TimeSpan.FromSeconds(5);}
         static bool IsTransit(LiveOrderRecord order){return order.Status==LiveOrderStatus.Prepared||order.Status==LiveOrderStatus.Dispatching||order.Status==LiveOrderStatus.AwaitingAcknowledgement||order.Status==LiveOrderStatus.AwaitingConfirmation||order.Status==LiveOrderStatus.Unknown;}
         static bool IsWorking(LiveOrderRecord order){return order.Status==LiveOrderStatus.Working||order.Status==LiveOrderStatus.PartiallyFilled;}
+        static bool TerminalCheckpointMatches(LiveOrderRecord order,LiveOrderJournalState journal,BrokerOrderRow row,BrokerOrdersSnapshot snapshot,string currentAccountKey) {
+            if(!LiveOrderJournal.HasTerminalFillCheckpoint(order,journal.AccountFingerprint)||row==null||!snapshot.RequestScopeVerified
+                ||!snapshot.MatchesRequestAccountKey(currentAccountKey))return false;
+            var point=order.FillCheckpoint;
+            if(row.HasRejection||row.ConfirmationCode!="0"||row.ConfirmedQuantity!=0||row.AutoCancelledQuantity!=0
+                ||row.AverageFillPrice!=point.AverageFillPrice||row.FilledQuantity!=point.FilledQuantity||row.OpenQuantity!=0)return false;
+            var executions=journal.Executions.Where(value=>value.OrderId==order.Id).ToArray();
+            if(executions.Any(value=>value.Price<=0||(order.TradeKind==LiveOrderKind.Buy?value.Price>order.LimitPrice:value.Price<order.LimitPrice)))return false;
+            long quantity=executions.Sum(value=>(long)value.Quantity);
+            decimal total=point.FilledQuantity*point.AverageFillPrice,amount=executions.Sum(value=>value.Quantity*value.Price);
+            if(quantity>point.FilledQuantity||amount>total)return false;
+            long remaining=point.FilledQuantity-quantity;decimal remainder=total-amount;
+            return remaining==0?remainder==0:remainder>0&&(order.TradeKind==LiveOrderKind.Buy?remainder<=remaining*order.LimitPrice:remainder>=remaining*order.LimitPrice);
+        }
         public BrokerReadinessResult Evaluate(LiveOrderIntent intent,IndiReply quote,DateTime quoteReceivedUtc,bool quoteIsLiveAndAdvanced,bool priceRuleVerified,
             LiveOrderJournalState journal,decimal operatingRemainingLimit,DateTime nowUtc) {
             Utc(nowUtc);Utc(quoteReceivedUtc);lock(sync){
@@ -244,7 +260,9 @@ namespace ShinhanNativeTrader {
                             ||NumberKey(match.OriginalOrderNumber)!=NumberKey(order.OriginalBrokerOrderNumber)||match.Quantity!=order.Quantity||match.FilledQuantity!=order.FilledQuantity||match.OpenQuantity!=expectedOpen||match.LimitPrice!=order.LimitPrice)rows=false;
                         var executions=journal.Executions.Where(x=>x!=null&&x.OrderId==order.Id).ToList();
                         if(executions.Any(x=>string.IsNullOrWhiteSpace(x.ExecutionId)||NumberKey(x.BrokerOrderNumber)!=NumberKey(order.BrokerOrderNumber)||x.TradingDate!=order.TradingDate||x.Quantity<=0||x.Price<=0||x.ExecutedUtc.Kind!=DateTimeKind.Utc||x.ExecutedUtc>nowUtc)
-                            ||executions.Select(x=>x.ExecutionId).Distinct(StringComparer.Ordinal).Count()!=executions.Count||executions.Sum(x=>(long)x.Quantity)!=order.FilledQuantity)fillEvidence=false;
+                            ||executions.Select(x=>x.ExecutionId).Distinct(StringComparer.Ordinal).Count()!=executions.Count
+                            ||(order.FillCheckpoint==null?executions.Sum(x=>(long)x.Quantity)!=order.FilledQuantity:
+                                !TerminalCheckpointMatches(order,journal,match,orders,accountKey)))fillEvidence=false;
                     }
                     var pending=orders.Orders.Where(x=>x.OpenQuantity>0).GroupBy(x=>x.Code).ToDictionary(x=>x.Key,x=>x.Sum(o=>o.OpenQuantity),StringComparer.Ordinal);
                     foreach(var position in holdings) {
@@ -256,7 +274,7 @@ namespace ShinhanNativeTrader {
                 }
                 fillEvidence=fillEvidence&&rows;
                 result.Require(rows,"확인된 주문·잔고 수량 대사 필요");
-                result.Require(fillEvidence,"주문별 실제 체결번호·누적수량 대사 필요");
+                result.Require(fillEvidence,"주문별 개별 체결 또는 증권사 전량체결 대사 필요");
                 checks.OrdersReconciled=rows;checks.FillsReconciled=fillEvidence;checks.RecoveryVerified=journalValid&&!journal.Orders.Any(x=>x==null||IsTransit(x))&&rows&&fillEvidence;
                 result.ReconciliationScope=rows&&fillEvidence?(local.Any(IsWorking)?"KnownLocalOrdersAndExecutions":"NoLocalUnresolvedBaseline"):"Unverified";
                 var effective=intent.Kind;

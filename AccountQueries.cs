@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace ShinhanNativeTrader {
     // These DTOs contain broker data only. Account numbers and passwords exist
@@ -33,7 +35,60 @@ namespace ShinhanNativeTrader {
 
     public sealed class BrokerOrdersSnapshot {
         public string TradingDate;
-        public DateTime ReceivedUtc;
+        public DateTime ReceivedUtc,RequestStartedUtc;
+        // Set only after the coordinator correlates a successful callback with
+        // the positive request ID and the exact accepted account/date profile.
+        // This scopes returned rows; it does not prove that absent rows do not
+        // exist or manufacture individual execution identifiers.
+        bool requestScopeBound;
+        string scopeTradingDate;
+        DateTime scopeStartedUtc,scopeReceivedUtc;
+        byte[] requestAccountSalt,requestAccountDigest;
+        [System.Xml.Serialization.XmlIgnore]
+        public bool RequestScopeVerified {get{return requestScopeBound&&TradingDate==scopeTradingDate
+            &&RequestStartedUtc.Kind==DateTimeKind.Utc&&ReceivedUtc.Kind==DateTimeKind.Utc
+            &&RequestStartedUtc==scopeStartedUtc&&ReceivedUtc==scopeReceivedUtc
+            &&requestAccountSalt!=null&&requestAccountSalt.Length==32&&requestAccountDigest!=null&&requestAccountDigest.Length==32;}}
+        static bool AccountShape(string number){return number!=null&&number.Length==11&&number.All(value=>value>='0'&&value<='9');}
+        static string AccountProfileKey(string number) {
+            var input=Encoding.UTF8.GetBytes("ShinhanNativeTrader/real-account/v1/"+number);
+            try{using(var sha=SHA256.Create())return string.Concat(sha.ComputeHash(input).Select(value=>value.ToString("x2",CultureInfo.InvariantCulture)));}
+            finally{Array.Clear(input,0,input.Length);}
+        }
+        static byte[] AccountDigest(byte[] salt,string key) {
+            var account=Encoding.ASCII.GetBytes(key);var input=new byte[salt.Length+account.Length];
+            Buffer.BlockCopy(salt,0,input,0,salt.Length);Buffer.BlockCopy(account,0,input,salt.Length,account.Length);
+            try{using(var sha=SHA256.Create())return sha.ComputeHash(input);}
+            finally{Array.Clear(account,0,account.Length);Array.Clear(input,0,input.Length);}
+        }
+        public bool MatchesRequestAccount(string number) {
+            if(!RequestScopeVerified||!AccountShape(number))return false;
+            return MatchesRequestAccountKey(AccountProfileKey(number));
+        }
+        public bool MatchesRequestAccountKey(string key) {
+            if(!RequestScopeVerified||key==null||key.Length!=64||key.Any(value=>!(value>='0'&&value<='9'||value>='a'&&value<='f')))return false;
+            var digest=AccountDigest(requestAccountSalt,key);
+            try{int different=0;for(int index=0;index<digest.Length;index++)different|=digest[index]^requestAccountDigest[index];return different==0;}
+            finally{Array.Clear(digest,0,digest.Length);}
+        }
+        // Transient account binding is deliberately private and XmlIgnore.
+        // It is never an account identifier persisted in a report or journal.
+        internal void BindRequestScope(DateTime startedUtc,DateTime receivedUtc,bool verified,string number) {
+            requestScopeBound=false;requestAccountSalt=null;requestAccountDigest=null;
+            RequestStartedUtc=startedUtc;ReceivedUtc=receivedUtc;DateTime parsed;
+            if(!verified||!AccountShape(number)||startedUtc.Kind!=DateTimeKind.Utc||receivedUtc.Kind!=DateTimeKind.Utc||startedUtc>receivedUtc
+                ||TradingDate==null||TradingDate.Length!=8||!DateTime.TryParseExact(TradingDate,"yyyyMMdd",CultureInfo.InvariantCulture,DateTimeStyles.None,out parsed))return;
+            var salt=new byte[32];using(var random=RandomNumberGenerator.Create())random.GetBytes(salt);
+            requestAccountSalt=salt;requestAccountDigest=AccountDigest(salt,AccountProfileKey(number));
+            scopeTradingDate=TradingDate;scopeStartedUtc=startedUtc;scopeReceivedUtc=receivedUtc;requestScopeBound=true;
+        }
+        internal void CopyRequestScopeFrom(BrokerOrdersSnapshot source) {
+            requestScopeBound=false;requestAccountSalt=null;requestAccountDigest=null;
+            if(source==null||!source.RequestScopeVerified||TradingDate!=source.TradingDate
+                ||RequestStartedUtc!=source.RequestStartedUtc||ReceivedUtc!=source.ReceivedUtc)return;
+            scopeTradingDate=source.scopeTradingDate;scopeStartedUtc=source.scopeStartedUtc;scopeReceivedUtc=source.scopeReceivedUtc;
+            requestAccountSalt=(byte[])source.requestAccountSalt.Clone();requestAccountDigest=(byte[])source.requestAccountDigest.Clone();requestScopeBound=true;
+        }
         public readonly List<BrokerOrderRow> Orders=new List<BrokerOrderRow>();
         // The recovered resources do not establish continuation/end-of-stream
         // guarantees. An empty response must not unlock an unknown live order.

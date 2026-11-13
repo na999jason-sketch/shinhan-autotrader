@@ -70,8 +70,40 @@ namespace ShinhanNativeTrader {
             if(date==null||!value.IsExecution)return false;
             var matches=state.Orders.Where(o=>o.TradingDate==date&&SameBrokerNumber(o.BrokerOrderNumber,value.BrokerOrderNumber)).ToList();
             if(matches.Count!=1||!Valid(value,matches[0])||value.CumulativeFilledQuantity>matches[0].FilledQuantity)return false;
+            // A terminal broker checkpoint already accounts for the whole order.
+            // A delayed individual event inside that total is historical evidence,
+            // not another quantity delta. Conflicts must still reach Route.
+            if(matches[0].FillCheckpoint!=null)return CoveredByCheckpoint(value,matches[0],state);
             var execution=state.Executions.SingleOrDefault(e=>e.OrderId==matches[0].Id&&e.ExecutionId==value.ExecutionId);
             return execution!=null&&execution.Quantity==value.IndividualFillQuantity&&execution.Price==value.IndividualFillPrice;
+        }
+        static bool CoveredByCheckpoint(CashOrderEvent value,LiveOrderRecord order,LiveOrderJournalState state) {
+            var checkpoint=order.FillCheckpoint;
+            if(checkpoint==null||!LiveOrderJournal.HasTerminalFillCheckpoint(order,state.AccountFingerprint)||!value.IsExecution||!Valid(value,order)
+                ||checkpoint.QueryName!="SABA231Q1"||checkpoint.AccountFingerprint!=state.AccountFingerprint
+                ||checkpoint.TradingDate!=order.TradingDate||checkpoint.Code!=order.Code
+                ||!SameBrokerNumber(checkpoint.BrokerOrderNumber,order.BrokerOrderNumber)
+                ||checkpoint.TradeKind!=order.TradeKind||checkpoint.OrderQuantity!=order.Quantity
+                ||checkpoint.FilledQuantity!=order.Quantity||checkpoint.LimitPrice!=order.LimitPrice
+                ||order.FilledQuantity!=order.Quantity||order.CancelledQuantity!=0
+                ||value.CumulativeFilledQuantity>checkpoint.FilledQuantity
+                ||value.IndividualFillQuantity>value.CumulativeFilledQuantity
+                ||value.CumulativeFilledQuantity+value.OpenQuantity>order.Quantity
+                ||order.TradeKind==LiveOrderKind.Buy&&value.IndividualFillPrice>order.LimitPrice
+                ||order.TradeKind==LiveOrderKind.Sell&&value.IndividualFillPrice<order.LimitPrice)return false;
+            // Check each delayed individual as a subset of the authoritative
+            // total. It need not have the aggregate average price, but its value
+            // must leave a possible remainder within the submitted limit. Do
+            // not sum unrelated late IDs without proven disjoint ranges, and
+            // do not manufacture an average-price rounding tolerance.
+            decimal total=checkpoint.FilledQuantity*checkpoint.AverageFillPrice;
+            decimal remainderValue=total-value.IndividualFillQuantity*value.IndividualFillPrice;
+            int remainderQuantity=checkpoint.FilledQuantity-value.IndividualFillQuantity;
+            if(remainderQuantity==0?remainderValue!=0:remainderValue<=0
+                ||order.TradeKind==LiveOrderKind.Buy&&remainderValue>remainderQuantity*order.LimitPrice
+                ||order.TradeKind==LiveOrderKind.Sell&&remainderValue<remainderQuantity*order.LimitPrice)return false;
+            var execution=state.Executions.SingleOrDefault(e=>e.OrderId==order.Id&&e.ExecutionId==value.ExecutionId);
+            return execution==null||execution.Quantity==value.IndividualFillQuantity&&execution.Price==value.IndividualFillPrice;
         }
         public void DrainOnGatewayOrderChanged() {
             if(draining)return;draining=true;
@@ -146,11 +178,18 @@ namespace ShinhanNativeTrader {
             // are not a second execution or confirmation for the child request.
             if(value.OriginalResultCode=="1"&&ValidProfile(value,order))return true;
             if(!Valid(value,order)) {
-                MarkUnknown(order,value.ReceivedUtc,true,ValidProfile(value,order));SignalUnknown("AA의 종목·매매구분·수량·필수 필드가 주문 기록과 다릅니다.");return true;
+                MarkUnknown(order,value.ReceivedUtc,true,order.FillCheckpoint!=null||ValidProfile(value,order));SignalUnknown("AA의 종목·매매구분·수량·필수 필드가 주문 기록과 다릅니다.");return true;
             }
             try {
                 var utc=ObservationUtc(value.ReceivedUtc,order);
                 if(value.IsExecution) {
+                    if(order.FillCheckpoint!=null) {
+                        if(!CoveredByCheckpoint(value,order,state))
+                            throw new InvalidOperationException("Individual execution contradicts the terminal broker checkpoint.");
+                        // Do not turn an aggregate checkpoint into manufactured
+                        // per-execution records or count delayed fills twice.
+                        return true;
+                    }
                     var previous=state.Executions.SingleOrDefault(e=>e.OrderId==order.Id&&e.ExecutionId==value.ExecutionId);
                     List<FillRange> ranges;
                     if(!observedFillRanges.TryGetValue(order.Id,out ranges)){ranges=new List<FillRange>();observedFillRanges[order.Id]=ranges;}

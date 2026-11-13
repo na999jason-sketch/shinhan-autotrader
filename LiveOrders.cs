@@ -175,6 +175,7 @@ namespace ShinhanNativeTrader {
         public int? RequestId;
         public DateTime CreatedUtc,UpdatedUtc;
         public OrderResponseEvidence ResponseEvidence;
+        public BrokerFillCheckpoint FillCheckpoint;
     }
     public sealed class LiveExecutionRecord {
         public string ExecutionId,OrderId,BrokerOrderNumber,TradingDate;
@@ -189,6 +190,23 @@ namespace ShinhanNativeTrader {
         public decimal LimitPrice;
         public DateTime ReceivedUtc;
         public bool AccountMatched,IdentityProven,SnapshotComplete;
+    }
+    // A terminal broker aggregate is a separate evidence source. It does not
+    // create an individual execution ID or add its total to existing AA fills.
+    public sealed class BrokerFillCheckpoint {
+        public string AccountFingerprint,TradingDate,BrokerOrderNumber,Code,QueryName;
+        public string ProductCode,CreditCode,SideCode,ConfirmationCode;
+        public LiveOrderKind TradeKind;
+        public int OrderQuantity,FilledQuantity;
+        public decimal LimitPrice,AverageFillPrice;
+        public DateTime RequestStartedUtc,ReceivedUtc,ObservedUtc,PreviousOrderUpdatedUtc,PreviousBrokerChangeUtc;
+    }
+    public sealed class BrokerTerminalFillEvidence {
+        public string AccountFingerprint,TradingDate,QueryName;
+        public DateTime RequestStartedUtc,ReceivedUtc;
+        public bool RequestScopeVerified;
+        public int MatchingOrderCount;
+        public BrokerOrderRow Row;
     }
     public sealed class LiveOrderJournalState {
         public int Version=1;
@@ -442,6 +460,87 @@ namespace ShinhanNativeTrader {
                 BrokerChanged(copy,utc);
             });
         }
+        public bool ReconcileKnownTerminalFill(string id,BrokerTerminalFillEvidence evidence,DateTime utc) {
+            LiveOrderSafety.RequireUtc(utc);
+            if(evidence==null||!evidence.RequestScopeVerified||evidence.MatchingOrderCount!=1||evidence.Row==null
+                ||evidence.QueryName!="SABA231Q1")throw new InvalidOperationException("검증된 계좌·거래일 요청의 유일한 증권사 주문 행이 필요합니다.");
+            LiveOrderSafety.RequireUtc(evidence.RequestStartedUtc);LiveOrderSafety.RequireUtc(evidence.ReceivedUtc);
+            if(evidence.RequestStartedUtc>evidence.ReceivedUtc||evidence.ReceivedUtc>utc||utc-evidence.ReceivedUtc>TimeSpan.FromSeconds(5))
+                throw new InvalidOperationException("복구 주문 조회의 요청·수신 시각이 유효하지 않습니다.");
+            bool applied=false;
+            Change(copy=>{
+                var order=Find(copy,id);var row=evidence.Row;
+                if(order.Status!=LiveOrderStatus.Unknown||!KnownAcceptedNewOrder(order)
+                    ||string.IsNullOrEmpty(copy.AccountFingerprint)||evidence.AccountFingerprint!=copy.AccountFingerprint
+                    ||evidence.TradingDate!=order.TradingDate||evidence.TradingDate!=TradeDate(utc)
+                    ||evidence.RequestStartedUtc<=order.UpdatedUtc||evidence.RequestStartedUtc<copy.LastBrokerChangeUtc
+                    ||!LiveOrderProtocol.BrokerNumbersEqual(order.BrokerOrderNumber,row.OrderNumber)||row.Code!=order.Code
+                    ||row.SideCode!=(order.TradeKind==LiveOrderKind.Buy?"2":"1")||row.ProductCode!="01"||row.CreditCode!="00"
+                    ||row.ConfirmationCode!="0"||row.Quantity!=order.Quantity||row.LimitPrice!=order.LimitPrice
+                    ||row.FilledQuantity!=order.Quantity||row.OpenQuantity!=0||row.ConfirmedQuantity!=0||row.AutoCancelledQuantity!=0
+                    ||!AbsentBrokerNumber(row.OriginalOrderNumber)||row.HasRejection||order.CancelledQuantity!=0
+                    ||row.AverageFillPrice<=0||(order.TradeKind==LiveOrderKind.Buy?row.AverageFillPrice>order.LimitPrice:row.AverageFillPrice<order.LimitPrice)
+                    ||copy.Orders.Any(value=>value.Id!=id&&value.TradingDate==order.TradingDate
+                        &&(LiveOrderProtocol.BrokerNumbersEqual(value.BrokerOrderNumber,order.BrokerOrderNumber)
+                            ||!AbsentBrokerNumber(value.OriginalBrokerOrderNumber)&&LiveOrderProtocol.BrokerNumbersEqual(value.OriginalBrokerOrderNumber,order.BrokerOrderNumber)
+                                &&value.Status!=LiveOrderStatus.Rejected&&value.Status!=LiveOrderStatus.NotSent)))
+                    throw new InvalidOperationException("접수된 원주문과 정상 전량체결 조회의 계좌·거래일·식별자·수량·가격이 일치하지 않습니다.");
+                var checkpoint=new BrokerFillCheckpoint{AccountFingerprint=copy.AccountFingerprint,TradingDate=order.TradingDate,
+                    BrokerOrderNumber=order.BrokerOrderNumber,Code=order.Code,QueryName=evidence.QueryName,
+                    ProductCode=row.ProductCode,CreditCode=row.CreditCode,SideCode=row.SideCode,ConfirmationCode=row.ConfirmationCode,
+                    TradeKind=order.TradeKind,OrderQuantity=order.Quantity,FilledQuantity=order.Quantity,
+                    LimitPrice=order.LimitPrice,AverageFillPrice=row.AverageFillPrice,RequestStartedUtc=evidence.RequestStartedUtc,
+                    ReceivedUtc=evidence.ReceivedUtc,ObservedUtc=utc,PreviousOrderUpdatedUtc=order.UpdatedUtc,PreviousBrokerChangeUtc=copy.LastBrokerChangeUtc};
+                if(!CheckpointCoversExecutions(checkpoint,copy.Executions.Where(value=>value.OrderId==order.Id)))
+                    throw new InvalidOperationException("증권사 누적체결과 기존 개별 체결의 수량·금액·잔여 지정가가 일치하지 않습니다.");
+                order.FillCheckpoint=checkpoint;order.FilledQuantity=order.Quantity;order.UpdatedUtc=utc;order.Status=LiveOrderStatus.Filled;
+                BrokerChanged(copy,utc);applied=true;
+            });return applied;
+        }
+        static bool AbsentBrokerNumber(string value){return string.IsNullOrEmpty(value)||value.All(character=>character=='0');}
+        static bool KnownAcceptedNewOrder(LiveOrderRecord order) {
+            return order!=null&&(order.Kind==LiveOrderKind.Buy||order.Kind==LiveOrderKind.Sell)&&order.Kind==order.TradeKind
+                &&AbsentBrokerNumber(order.OriginalBrokerOrderNumber)&&LiveOrderProtocol.ValidBrokerNumber(order.BrokerOrderNumber)
+                &&order.RequestId.HasValue&&order.RequestId.Value>0&&order.ResponseEvidence!=null
+                &&order.ResponseEvidence.Disposition==OrderResponseDisposition.Accepted
+                &&!order.ResponseEvidence.ProviderError&&!order.ResponseEvidence.ParseFailed
+                &&LiveOrderProtocol.BrokerNumbersEqual(order.BrokerOrderNumber,order.ResponseEvidence.BrokerOrderNumber)
+                &&(order.ResponseEvidence.Layout==OrderResponseLayout.Legacy
+                    ||order.ResponseEvidence.Layout==OrderResponseLayout.Modern
+                        &&LiveOrderProtocol.BrokerNumbersEqual(order.BrokerOrderNumber,order.ResponseEvidence.Slot1OrderNumber)
+                        &&!LiveOrderProtocol.ValidBrokerNumber(order.ResponseEvidence.Slot0OrderNumber)
+                        &&!LiveOrderProtocol.ValidBrokerNumber(order.ResponseEvidence.Slot2OrderNumber));
+        }
+        static bool ValidFillCheckpoint(LiveOrderRecord order,string fingerprint) {
+            var point=order==null?null:order.FillCheckpoint;
+            return point!=null&&KnownAcceptedNewOrder(order)&&!string.IsNullOrEmpty(fingerprint)&&point.AccountFingerprint==fingerprint
+                &&point.QueryName=="SABA231Q1"&&point.TradingDate==order.TradingDate&&point.Code==order.Code
+                &&LiveOrderProtocol.BrokerNumbersEqual(point.BrokerOrderNumber,order.BrokerOrderNumber)&&point.TradeKind==order.TradeKind
+                &&point.OrderQuantity==order.Quantity&&point.FilledQuantity==order.Quantity&&order.FilledQuantity==order.Quantity&&order.CancelledQuantity==0
+                &&point.LimitPrice==order.LimitPrice&&point.AverageFillPrice>0
+                &&(order.TradeKind==LiveOrderKind.Buy?point.AverageFillPrice<=order.LimitPrice:point.AverageFillPrice>=order.LimitPrice)
+                &&point.ProductCode=="01"&&point.CreditCode=="00"&&point.SideCode==(order.TradeKind==LiveOrderKind.Buy?"2":"1")&&point.ConfirmationCode=="0"
+                &&point.RequestStartedUtc.Kind==DateTimeKind.Utc&&point.ReceivedUtc.Kind==DateTimeKind.Utc&&point.ObservedUtc.Kind==DateTimeKind.Utc
+                &&point.PreviousOrderUpdatedUtc.Kind==DateTimeKind.Utc&&point.PreviousBrokerChangeUtc.Kind==DateTimeKind.Utc
+                &&point.PreviousOrderUpdatedUtc>=order.CreatedUtc&&point.RequestStartedUtc>point.PreviousOrderUpdatedUtc
+                &&point.RequestStartedUtc>=point.PreviousBrokerChangeUtc&&point.RequestStartedUtc<=point.ReceivedUtc
+                &&point.ReceivedUtc<=point.ObservedUtc&&point.ObservedUtc-point.ReceivedUtc<=TimeSpan.FromSeconds(5)
+                &&point.ObservedUtc<=order.UpdatedUtc&&TradeDate(point.ObservedUtc)==point.TradingDate;
+        }
+        public static bool HasTerminalFillCheckpoint(LiveOrderRecord order,string accountFingerprint) {
+            return order!=null&&order.Status==LiveOrderStatus.Filled&&ValidFillCheckpoint(order,accountFingerprint);
+        }
+        static bool CheckpointCoversExecutions(BrokerFillCheckpoint point,IEnumerable<LiveExecutionRecord> executions) {
+            var known=executions.ToArray();
+            if(known.Any(value=>value==null||value.Quantity<=0||value.Price<=0
+                ||(point.TradeKind==LiveOrderKind.Buy?value.Price>point.LimitPrice:value.Price<point.LimitPrice)))return false;
+            int quantity=known.Sum(value=>value.Quantity);decimal amount=known.Sum(value=>value.Quantity*value.Price);
+            decimal total=point.FilledQuantity*point.AverageFillPrice;int missing=point.FilledQuantity-quantity;
+            if(missing<0||amount>total)return false;
+            decimal remainder=total-amount;
+            if(missing==0)return remainder==0;
+            return remainder>0&&(point.TradeKind==LiveOrderKind.Buy?remainder<=missing*point.LimitPrice:remainder>=missing*point.LimitPrice);
+        }
         static int Remaining(LiveOrderRecord order){return order.Quantity-order.FilledQuantity-order.CancelledQuantity;}
         static bool IsWorking(LiveOrderRecord order){return order.Status==LiveOrderStatus.Working||order.Status==LiveOrderStatus.PartiallyFilled;}
         static LiveOrderRecord Find(LiveOrderJournalState copy,string id){var order=copy.Orders.SingleOrDefault(o=>o.Id==id);if(order==null)throw new InvalidOperationException("실계좌 주문 기록을 찾을 수 없습니다.");return order;}
@@ -480,7 +579,11 @@ namespace ShinhanNativeTrader {
                     if(!order.RequestId.HasValue)throw new InvalidDataException("주문 응답에 요청번호가 없습니다.");
                     ValidateResponse(order.ResponseEvidence,order.RequestId.Value);
                 }
-                if(value.Executions.Where(f=>f.OrderId==order.Id).Sum(f=>f.Quantity)!=order.FilledQuantity
+                bool checkpoint=order.FillCheckpoint!=null;
+                if(checkpoint&&(!ValidFillCheckpoint(order,value.AccountFingerprint)
+                    ||!CheckpointCoversExecutions(order.FillCheckpoint,value.Executions.Where(f=>f.OrderId==order.Id))))
+                    throw new InvalidDataException("증권사 전량체결 체크포인트와 요청·주문·개별체결이 일치하지 않습니다.");
+                if((!checkpoint&&value.Executions.Where(f=>f.OrderId==order.Id).Sum(f=>f.Quantity)!=order.FilledQuantity)
                     ||(order.Status==LiveOrderStatus.Filled&&Remaining(order)!=0)
                     ||(order.Status==LiveOrderStatus.PartiallyFilled&&(order.FilledQuantity==0||Remaining(order)==0))
                     ||(order.Status==LiveOrderStatus.AwaitingAcknowledgement&&(!order.RequestId.HasValue||order.RequestId.Value<=0))

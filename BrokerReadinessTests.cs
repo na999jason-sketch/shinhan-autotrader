@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace ShinhanNativeTrader {
     public static class BrokerReadinessTests {
@@ -228,8 +230,48 @@ namespace ShinhanNativeTrader {
             Reject(()=>new BrokerReadiness("12345678901",Fingerprint),"readiness never uses plaintext account numbers as stored account keys");
             Reject(()=>f.Data.ObserveCash(new AccountCashSnapshot{ReceivedUtc=Now.AddSeconds(-1)},Now),"a response cannot precede its request");
             Reject(()=>f.Data.Invalidate(DateTime.SpecifyKind(Now,DateTimeKind.Local)),"local clock timestamps cannot masquerade as UTC evidence");
+            TerminalCheckpointChecks();
             OrdinarySourceChecks();
             return checks;
+        }
+        static void TerminalCheckpointChecks() {
+            var f=new Fixture();string key;
+            using(var hash=SHA256.Create())key=string.Concat(hash.ComputeHash(Encoding.UTF8.GetBytes("ShinhanNativeTrader/real-account/v1/12345678901"))
+                .Select(value=>value.ToString("x2")));
+            f.Data=new BrokerReadiness(key,Fingerprint);f.Data.SetAuthorization(true);f.Data.SetAccountStream(true,Now.AddSeconds(-10));f.Refresh(Now);
+            var order=Working(10);order.Kind=LiveOrderKind.Sell;order.TradeKind=LiveOrderKind.Sell;order.Status=LiveOrderStatus.Filled;order.RequestId=71;
+            var fields=new[]{"0","11","0","0","0","synthetic","0","0"};
+            order.ResponseEvidence=LiveOrderResponseParser.Read(71,index=>fields[index],new IndiDiagnosticSnapshot{ErrorState=0},OrderResponseLayout.Modern,new string[0]);
+            order.FillCheckpoint=new BrokerFillCheckpoint{AccountFingerprint=Fingerprint,TradingDate="20261112",BrokerOrderNumber="11",Code=order.Code,
+                QueryName="SABA231Q1",ProductCode="01",CreditCode="00",SideCode="1",ConfirmationCode="0",TradeKind=LiveOrderKind.Sell,
+                OrderQuantity=10,FilledQuantity=10,LimitPrice=10000,AverageFillPrice=10000,PreviousOrderUpdatedUtc=Now.AddSeconds(-10),
+                PreviousBrokerChangeUtc=Now.AddSeconds(-11),RequestStartedUtc=Now.AddSeconds(-8),ReceivedUtc=Now.AddSeconds(-7),ObservedUtc=Now.AddSeconds(-6)};
+            f.Journal.Orders.Add(order);f.Journal.LastBrokerChangeUtc=Now.AddSeconds(-6);
+            var snapshot=new BrokerOrdersSnapshot{TradingDate="20261112"};
+            snapshot.Orders.Add(new BrokerOrderRow{OrderNumber="00011",Code=order.Code,SideCode="1",ProductCode="01",CreditCode="00",ConfirmationCode="0",
+                Quantity=10,LimitPrice=10000,FilledQuantity=10,OpenQuantity=0,AverageFillPrice=10000});
+            snapshot.BindRequestScope(Now.AddMilliseconds(-200),Now.AddMilliseconds(-100),true,"12345678901");
+            f.Data.ObserveOrders(snapshot,snapshot.RequestStartedUtc);
+            var result=f.Evaluate();
+            Check(result.Ready&&result.Checks.FillsReconciled&&result.Checks.RecoveryVerified&&f.Journal.Executions.Count==0,
+                "a validated terminal broker checkpoint can explain its aggregate total without inventing execution IDs");
+            var subset=new LiveExecutionRecord{OrderId=order.Id,BrokerOrderNumber="11",TradingDate="20261112",ExecutionId="ACTUAL-AA1",Quantity=3,Price=10000,ExecutedUtc=Now.AddSeconds(-6)};
+            f.Journal.Executions.Add(subset);
+            Check(f.Evaluate().Ready,"real execution subset is not added a second time to the terminal aggregate total");
+            f.Journal.Executions.Add(subset);Check(!f.Evaluate().Ready,"duplicate real execution IDs still block a checkpoint-backed account");f.Journal.Executions.RemoveAt(1);
+            subset.Price=9999;Check(!f.Evaluate().Ready,"a stored execution outside the sell limit cannot hide behind an aggregate checkpoint");
+            subset.Price=10001;Check(!f.Evaluate().Ready,"known execution value cannot imply below-limit remaining checkpoint value");subset.Price=10000;
+            f.Data.Invalidate(Now.AddMilliseconds(-90));
+            Check(!f.Evaluate().Ready,"terminal checkpoint does not exempt current cash holdings or orders from new invalidation barriers");
+            f.Data=new BrokerReadiness(key,Fingerprint);f.Data.SetAuthorization(true);f.Data.SetAccountStream(true,Now.AddSeconds(-10));f.Refresh(Now);
+            snapshot.BindRequestScope(Now.AddMilliseconds(-200),Now.AddMilliseconds(-100),true,"12345678902");f.Data.ObserveOrders(snapshot,snapshot.RequestStartedUtc);
+            Check(!f.Evaluate().Ready,"a fresh scoped different-account snapshot cannot validate an existing checkpoint");
+            snapshot.BindRequestScope(Now.AddMilliseconds(-80),Now.AddMilliseconds(-40),true,"12345678901");
+            f.Data.ObserveOrders(snapshot,Now.AddMilliseconds(-60));
+            Check(!f.Evaluate().Ready,"a newer method argument cannot re-stamp a differently sealed request proof");
+            snapshot.BindRequestScope(Now.AddMilliseconds(-30),Now.AddMilliseconds(-20),true,"12345678901");
+            snapshot.Orders[0].AverageFillPrice=10001;f.Data.ObserveOrders(snapshot,snapshot.RequestStartedUtc);
+            Check(!f.Evaluate().Ready,"a changed broker cumulative average invalidates the old terminal checkpoint");
         }
         static void OrdinarySourceChecks() {
             var trade=ParsedBalance("",true,io=>{io.Fields[3]="";io.Fields[22]="";});

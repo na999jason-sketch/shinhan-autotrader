@@ -367,14 +367,14 @@ namespace ShinhanNativeTrader {
 
     // Serial request state is independent of COM and WinForms and can be replayed in unit tests.
     public sealed class IndiRequestCoordinator : IDisposable {
-        sealed class Snapshot { public int Id;public int? ProviderErrorState;public IndiReply Reply;public Exception Error;public DateTime ReceivedUtc; }
+        sealed class Snapshot { public int Id;public int? ProviderErrorState;public bool NormalResponse;public IndiReply Reply;public Exception Error;public DateTime ReceivedUtc; }
         sealed class Pending {
             public string Kind,Code;public int? Id;
             public string Query;
             public IDictionary<int,string> Input;
             public bool Retried;
             public DateTime? RetryDueUtc;
-            public bool TradeBasisRequested,OrdinaryOnlyRequested;
+            public bool TradeBasisRequested,OrdinaryOnlyRequested,OrdersScopeRequested;
             public decimal? RequestedPrice;
             public DateTime RequestStartedUtc;
             public readonly List<Snapshot> Early=new List<Snapshot>();
@@ -424,6 +424,18 @@ namespace ShinhanNativeTrader {
                 &&input.TryGetValue(5,out selection)&&selection=="1"&&input.TryGetValue(6,out output)&&output=="0"
                 &&input.TryGetValue(7,out quoteKind)&&quoteKind=="1";
         }
+        static bool VerifiedOrdersRequest(string kind,string query,IDictionary<int,string> input,bool settersConfirmed,string code) {
+            string day,number,secret,market,filled,aggregation,symbol,product,work;DateTime parsed;
+            return kind=="ORDERS"&&string.Equals(query,"SABA231Q1",StringComparison.OrdinalIgnoreCase)
+                &&settersConfirmed&&input!=null&&input.Count==9
+                &&input.TryGetValue(0,out day)&&day!=null&&day.Length==8&&day==code
+                &&DateTime.TryParseExact(day,"yyyyMMdd",CultureInfo.InvariantCulture,DateTimeStyles.None,out parsed)
+                &&input.TryGetValue(1,out number)&&number!=null&&number.Length==11&&number.All(c=>c>='0'&&c<='9')
+                &&input.TryGetValue(2,out secret)&&!string.IsNullOrWhiteSpace(secret)&&secret.Length<=9&&!secret.Any(char.IsControl)
+                &&input.TryGetValue(3,out market)&&market=="00"&&input.TryGetValue(4,out filled)&&filled=="0"
+                &&input.TryGetValue(5,out aggregation)&&aggregation=="0"&&input.TryGetValue(6,out symbol)&&symbol=="*"
+                &&input.TryGetValue(7,out product)&&product=="01"&&input.TryGetValue(8,out work)&&work=="Y";
+        }
         public bool Begin(string kind,string query,IDictionary<int,string> input,string code,decimal? requestedPrice=null) {
             return BeginCore(kind,query,input,code,requestedPrice,false);
         }
@@ -465,6 +477,7 @@ namespace ShinhanNativeTrader {
                 // explicitly contradictory returned basis still blocks orders.
                 current.TradeBasisRequested=VerifiedHoldingsRequest(kind,"TRADEHOLDINGS",query,input,settersConfirmed,"1");
                 current.OrdinaryOnlyRequested=VerifiedHoldingsRequest(kind,"ORDINARYHOLDINGS",query,input,settersConfirmed,"5");
+                current.OrdersScopeRequested=VerifiedOrdersRequest(kind,query,input,settersConfirmed,code);
                 // Input COM calls may pump a stop/dispose/account-change event.
                 // An obsolete pending instance must not start its deferred read.
                 if(disposed||failed||pending!=current)return false;
@@ -517,6 +530,7 @@ namespace ShinhanNativeTrader {
             // The OCX has now set this response's status. Capture it while the
             // response buffer is valid; a later request can clear it again.
             var diagnostic=Diagnose(current,"ReceiveData rid="+id);
+            snapshot.NormalResponse=diagnostic!=null&&diagnostic.ErrorState==0;
             if(diagnostic!=null&&diagnostic.ErrorState.HasValue&&diagnostic.ErrorState.Value>0)
                 snapshot.ProviderErrorState=diagnostic.ErrorState.Value;
             else {
@@ -542,7 +556,13 @@ namespace ShinhanNativeTrader {
             if(snapshot.Reply.TradeHoldings!=null){snapshot.Reply.TradeHoldings.RequestStartedUtc=current.RequestStartedUtc;snapshot.Reply.TradeHoldings.ReceivedUtc=snapshot.ReceivedUtc;}
             if(snapshot.Reply.Cash!=null)snapshot.Reply.Cash.ReceivedUtc=snapshot.ReceivedUtc;
             if(snapshot.Reply.Capacity!=null)snapshot.Reply.Capacity.ReceivedUtc=snapshot.ReceivedUtc;
-            if(snapshot.Reply.BrokerOrders!=null)snapshot.Reply.BrokerOrders.ReceivedUtc=snapshot.ReceivedUtc;
+            if(snapshot.Reply.BrokerOrders!=null) {
+                string number=null;if(current.Input!=null)current.Input.TryGetValue(1,out number);
+                bool verified=current.OrdersScopeRequested&&snapshot.NormalResponse
+                    &&current.Id.HasValue&&current.Id.Value>0&&current.Id.Value==snapshot.Id
+                    &&current.RequestStartedUtc.Kind==DateTimeKind.Utc&&current.RequestStartedUtc<=snapshot.ReceivedUtc;
+                snapshot.Reply.BrokerOrders.BindRequestScope(current.RequestStartedUtc,snapshot.ReceivedUtc,verified,number);
+            }
             pending=null;Log("RECEIVED "+current.Kind+" rid="+snapshot.Id+" rows="+snapshot.Reply.Count);
             if(Done!=null)Done(snapshot.Reply);
         }

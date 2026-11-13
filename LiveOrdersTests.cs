@@ -39,6 +39,144 @@ namespace ShinhanNativeTrader {
         static LiveOrderRecord Accepted(LiveOrderJournal journal,LiveOrderIntent intent,string number,DateTime utc,int rid=7) {
             var order=journal.Prepare(intent,utc);journal.MarkDispatching(order.Id,utc);journal.MarkRequestAccepted(order.Id,rid,utc);journal.RecordAcknowledgement(order.Id,rid,number,false,utc);return journal.Snapshot.Orders.Single(o=>o.Id==order.Id);
         }
+        static LiveOrderRecord AcceptedWithEvidence(LiveOrderJournal journal,LiveOrderIntent intent,string number,DateTime utc,int rid=7) {
+            var order=journal.Prepare(intent,utc);journal.MarkDispatching(order.Id,utc);journal.MarkRequestAccepted(order.Id,rid,utc);
+            var slots=new[]{"0",number,"0","","0","synthetic accepted","0","0"};
+            var response=LiveOrderResponseParser.Read(rid,index=>slots[index],new IndiDiagnosticSnapshot{ErrorState=0},OrderResponseLayout.Modern,new string[0]);
+            journal.RecordAcknowledgement(order.Id,rid,response.BrokerOrderNumber,false,utc,response);
+            return journal.Snapshot.Orders.Single(value=>value.Id==order.Id);
+        }
+        static BrokerTerminalFillEvidence TerminalEvidence(LiveOrderJournal journal,LiveOrderRecord order) {
+            return new BrokerTerminalFillEvidence{AccountFingerprint=journal.Snapshot.AccountFingerprint,TradingDate=order.TradingDate,
+                QueryName="SABA231Q1",RequestScopeVerified=true,MatchingOrderCount=1,RequestStartedUtc=Utc(3),ReceivedUtc=Utc(4),
+                Row=new BrokerOrderRow{OrderNumber=order.BrokerOrderNumber.TrimStart('0'),OriginalOrderNumber="0",Code=order.Code,
+                    SideCode=order.TradeKind==LiveOrderKind.Buy?"2":"1",AmendCancelCode="0",ProductCode="01",CreditCode="00",ConfirmationCode="0",
+                    Quantity=order.Quantity,LimitPrice=order.LimitPrice,FilledQuantity=order.Quantity,OpenQuantity=0,ConfirmedQuantity=0,
+                    AutoCancelledQuantity=0,AverageFillPrice=order.TradeKind==LiveOrderKind.Buy?9900:10100}};
+        }
+        static void TerminalRecoveryTests(string directory) {
+            string path=Path.Combine(directory,"terminal-checkpoint.xml");string id;
+            using(var journal=new LiveOrderJournal(path)) {
+                journal.BindAccount("12345678901");var order=AcceptedWithEvidence(journal,Buy("terminal-known"),"00000812345",Utc());id=order.Id;
+                journal.MarkUnknown(order.Id,Utc(2));
+                var mutations=new Action<BrokerTerminalFillEvidence>[] {
+                    value=>value.RequestScopeVerified=false,value=>value.MatchingOrderCount=0,value=>value.MatchingOrderCount=2,
+                    value=>value.QueryName="TR_5200",value=>value.AccountFingerprint="wrong-account",value=>value.TradingDate="20261111",
+                    value=>value.Row.OrderNumber="888888",value=>value.Row.Code="000660",value=>value.Row.SideCode="1",
+                    value=>value.Row.ProductCode="02",value=>value.Row.CreditCode="01",value=>value.Row.ConfirmationCode="1",
+                    value=>value.Row.Quantity=11,value=>value.Row.LimitPrice=10001,value=>value.Row.FilledQuantity=9,
+                    value=>value.Row.OpenQuantity=1,value=>value.Row.ConfirmedQuantity=1,value=>value.Row.AutoCancelledQuantity=1,
+                    value=>value.Row.AverageFillPrice=0,value=>value.Row.AverageFillPrice=10001,value=>value.Row.OriginalOrderNumber="123",
+                    value=>value.RequestStartedUtc=Utc(2),value=>value.RequestStartedUtc=Utc(5),value=>value.ReceivedUtc=Utc(6)
+                };
+                string[] labels={"unverified request","missing row","ambiguous row","wrong query","wrong account","wrong day","wrong broker ID",
+                    "wrong stock","wrong direction","wrong product","credit trade","broker rejection","wrong quantity","wrong limit",
+                    "partial fill","open remainder","confirmation quantity","automatic cancellation","missing average","limit-violating average",
+                    "original order link","pre-Unknown request","request after receive","future receive"};
+                for(int index=0;index<mutations.Length;index++) {
+                    var evidence=TerminalEvidence(journal,order);mutations[index](evidence);
+                    Reject(()=>journal.ReconcileKnownTerminalFill(id,evidence,Utc(5)),"terminal checkpoint rejects "+labels[index]);
+                }
+                Reject(()=>journal.ReconcileKnownTerminalFill(id,TerminalEvidence(journal,order),Utc(10)),"stale terminal broker snapshot cannot recover an unknown order");
+                Check(journal.RecoveryRequired&&journal.Snapshot.Executions.Count==0&&journal.Snapshot.Orders.Single().FillCheckpoint==null,
+                    "rejected terminal evidence leaves the original unknown record and individual execution ledger untouched");
+                Check(journal.ReconcileKnownTerminalFill(id,TerminalEvidence(journal,order),Utc(5)),"fresh exact account-scoped terminal snapshot recovers the already accepted order");
+                var recovered=journal.Snapshot.Orders.Single();
+                Check(recovered.Status==LiveOrderStatus.Filled&&recovered.FilledQuantity==10&&recovered.FillCheckpoint.FilledQuantity==10
+                    &&recovered.FillCheckpoint.AverageFillPrice==9900&&journal.Snapshot.Executions.Count==0&&!journal.RecoveryRequired&&journal.ReservedBuyAmount==0,
+                    "terminal aggregate is persisted separately without inventing individual executions or retaining a filled buy reserve");
+                Check(LiveOrderJournal.HasTerminalFillCheckpoint(recovered,journal.Snapshot.AccountFingerprint)
+                    &&!LiveOrderJournal.HasTerminalFillCheckpoint(recovered,"other-account"),"terminal checkpoint helper validates the stored account identity");
+                var detached=recovered.FillCheckpoint;detached.AverageFillPrice=1;
+                Check(journal.Snapshot.Orders.Single().FillCheckpoint.AverageFillPrice==9900,"caller mutation cannot replace the durable broker aggregate checkpoint");
+                Reject(()=>journal.RecordExecution("812345","late-new-id",1,9900,Utc(6)),"terminal checkpoint cannot accept an extra execution beyond the reported full fill");
+            }
+            using(var restarted=new LiveOrderJournal(path)) {
+                var recovered=restarted.Snapshot.Orders.Single();
+                Check(!restarted.RecoveryRequired&&recovered.Status==LiveOrderStatus.Filled&&recovered.FilledQuantity==10
+                    &&restarted.Snapshot.Executions.Count==0&&recovered.FillCheckpoint.QueryName=="SABA231Q1",
+                    "restart preserves terminal snapshot recovery without manufacturing an execution ID or reopening the filled order");
+                restarted.MarkBrokerEvidenceUnknown(id,Utc(6));
+                Check(restarted.RecoveryRequired&&!LiveOrderJournal.HasTerminalFillCheckpoint(restarted.Snapshot.Orders.Single(),restarted.Snapshot.AccountFingerprint),
+                    "later contradictory broker evidence can invalidate a terminal checkpoint without erasing its previous observation");
+                var evidence=TerminalEvidence(restarted,recovered);evidence.RequestStartedUtc=Utc(7);evidence.ReceivedUtc=Utc(8);
+                Check(restarted.ReconcileKnownTerminalFill(id,evidence,Utc(8)),"only a newer full account-scoped snapshot can re-establish a contradicted terminal checkpoint");
+            }
+            var document=new XmlDocument();document.Load(path);
+            document.SelectSingleNode("/LiveOrderJournalState/Orders/LiveOrderRecord/FillCheckpoint/AccountFingerprint").InnerText="tampered-account";
+            document.Save(path);Reject(()=>new LiveOrderJournal(path),"tampered persisted terminal-checkpoint identity fails closed on restart");
+
+            foreach(var kind in new[]{LiveOrderKind.Buy,LiveOrderKind.Sell}) {
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"terminal-partial-"+kind+".xml"))) {
+                    journal.BindAccount("12345678901");var intent=Buy("partial-known-"+kind);intent.Kind=kind;
+                    var order=AcceptedWithEvidence(journal,intent,"000812346",Utc());
+                    decimal validPrice=kind==LiveOrderKind.Buy?9900:10100;
+                    journal.RecordExecution("812346","real-AA-subset",3,validPrice,Utc(1));journal.MarkUnknown(order.Id,Utc(2));
+                    var evidence=TerminalEvidence(journal,order);
+                    Check(journal.ReconcileKnownTerminalFill(order.Id,evidence,Utc(5)),kind+" terminal snapshot may cover a genuine earlier partial execution subset");
+                    Check(journal.Snapshot.Executions.Count==1&&journal.Snapshot.Executions.Single().Quantity==3
+                        &&journal.Snapshot.Orders.Single().FilledQuantity==10,
+                        kind+" checkpoint total is not added on top of the real AA subset");
+                    Check(!journal.RecordExecution("812346","real-AA-subset",3,validPrice,Utc(6)),kind+" real prior execution ID remains idempotent after terminal recovery");
+                }
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"terminal-inconsistent-value-"+kind+".xml"))) {
+                    journal.BindAccount("12345678901");var intent=Buy("bad-partial-"+kind);intent.Kind=kind;
+                    var order=AcceptedWithEvidence(journal,intent,"000812347",Utc());
+                    journal.RecordExecution("812347","real-AA-inconsistent",3,kind==LiveOrderKind.Buy?9000:11000,Utc(1));journal.MarkUnknown(order.Id,Utc(2));
+                    Reject(()=>journal.ReconcileKnownTerminalFill(order.Id,TerminalEvidence(journal,order),Utc(5)),
+                        kind+" aggregate must explain a limit-valid remaining notional after its real AA subset");
+                    Check(journal.RecoveryRequired&&journal.Snapshot.Orders.Single().FilledQuantity==3&&journal.Snapshot.Orders.Single().FillCheckpoint==null,
+                        kind+" inconsistent aggregate cannot erase or supplement existing individual fills");
+                }
+                string invalidPricePath=Path.Combine(directory,"terminal-invalid-known-price-"+kind+".xml");string invalidPriceId;
+                using(var journal=new LiveOrderJournal(invalidPricePath)) {
+                    journal.BindAccount("12345678901");var intent=Buy("invalid-price-"+kind);intent.Kind=kind;
+                    var order=AcceptedWithEvidence(journal,intent,"000812350",Utc());invalidPriceId=order.Id;
+                    journal.RecordExecution("812350","real-AA-price",1,kind==LiveOrderKind.Buy?9900:10100,Utc(1));journal.MarkUnknown(order.Id,Utc(2));
+                }
+                var invalidPriceXml=new XmlDocument();invalidPriceXml.Load(invalidPricePath);
+                invalidPriceXml.SelectSingleNode("/LiveOrderJournalState/Executions/LiveExecutionRecord/Price").InnerText=kind==LiveOrderKind.Buy?"11000":"9000";
+                invalidPriceXml.Save(invalidPricePath);
+                using(var journal=new LiveOrderJournal(invalidPricePath)) {
+                    var order=journal.Snapshot.Orders.Single();
+                    Reject(()=>journal.ReconcileKnownTerminalFill(invalidPriceId,TerminalEvidence(journal,order),Utc(5)),
+                        kind+" terminal recovery rejects an individual price outside the original limit even when aggregate and remaining value could fit");
+                }
+            }
+            using(var journal=new LiveOrderJournal(Path.Combine(directory,"terminal-no-accepted-proof.xml"))) {
+                journal.BindAccount("12345678901");var order=Accepted(journal,Buy("legacy-without-proof"),"812348",Utc());journal.MarkUnknown(order.Id,Utc(2));
+                Reject(()=>journal.ReconcileKnownTerminalFill(order.Id,TerminalEvidence(journal,order),Utc(5)),"positive ID without preserved accepted response is not a terminal-recovery identity proof");
+            }
+            using(var journal=new LiveOrderJournal(Path.Combine(directory,"terminal-no-id.xml"))) {
+                journal.BindAccount("12345678901");var order=journal.Prepare(Buy("no-id"),Utc());journal.MarkUnknown(order.Id,Utc(2));
+                var evidence=TerminalEvidence(journal,new LiveOrderRecord{BrokerOrderNumber="812349",Code="005930",TradingDate="20261112",Quantity=10,LimitPrice=10000,TradeKind=LiveOrderKind.Buy});
+                Reject(()=>journal.ReconcileKnownTerminalFill(order.Id,evidence,Utc(5)),"matching stock and amount never attach a broker order to an unacknowledged unknown request");
+            }
+            using(var journal=new LiveOrderJournal(Path.Combine(directory,"terminal-wrong-venue.xml"))) {
+                journal.BindAccount("12345678901");var order=journal.Prepare(Buy("wrong-venue"),Utc());
+                journal.MarkDispatching(order.Id,Utc());journal.MarkRequestAccepted(order.Id,7,Utc());
+                var values=new[]{"812351","0","0","","0","synthetic SOR","0","0"};
+                var response=LiveOrderResponseParser.Read(7,index=>values[index],new IndiDiagnosticSnapshot{ErrorState=0},OrderResponseLayout.Modern,new string[0]);
+                journal.RecordAcknowledgement(order.Id,7,response.BrokerOrderNumber,false,Utc(),response);journal.MarkUnknown(order.Id,Utc(2));
+                var evidence=TerminalEvidence(journal,journal.Snapshot.Orders.Single());
+                Reject(()=>journal.ReconcileKnownTerminalFill(order.Id,evidence,Utc(5)),"modern SOR identity cannot be recovered as the requested KRX order by a numeric match alone");
+            }
+            foreach(var kind in new[]{LiveOrderKind.Amend,LiveOrderKind.Cancel}) {
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"terminal-child-"+kind+".xml"))) {
+                    journal.BindAccount("12345678901");AcceptedWithEvidence(journal,Buy("child-parent"),"812352",Utc());
+                    var child=AcceptedWithEvidence(journal,Modify(kind,"child-"+kind,"812352"),"812353",Utc(1),8);journal.MarkUnknown(child.Id,Utc(2));
+                    Reject(()=>journal.ReconcileKnownTerminalFill(child.Id,TerminalEvidence(journal,child),Utc(5)),
+                        kind+" command cannot be recovered as a plain new order from a terminal aggregate row");
+                }
+            }
+            using(var journal=new LiveOrderJournal(Path.Combine(directory,"terminal-global-barrier.xml"))) {
+                journal.BindAccount("12345678901");var order=AcceptedWithEvidence(journal,Buy("barrier-target"),"812354",Utc());
+                var other=AcceptedWithEvidence(journal,Buy("barrier-other","000660"),"812355",Utc(1),8);
+                journal.MarkUnknown(order.Id,Utc(2));journal.MarkBrokerEvidenceUnknown(other.Id,Utc(5));
+                var evidence=TerminalEvidence(journal,order);evidence.ReceivedUtc=Utc(6);
+                Reject(()=>journal.ReconcileKnownTerminalFill(order.Id,evidence,Utc(6)),"a request preceding another broker change cannot provide a fresh terminal checkpoint");
+            }
+        }
         public static int Run() {
             checks=0;
             int startupTraces=0;
@@ -461,6 +599,7 @@ namespace ShinhanNativeTrader {
                     Check(journal.StorageFault,"actual-order journal latches a storage fault");
                     Reject(()=>journal.Prepare(Buy("retry"),Utc()),"storage failure cannot be bypassed with another order key");
                 }
+                TerminalRecoveryTests(directory);
                 return checks;
             }finally{Directory.Delete(directory,true);}
         }
