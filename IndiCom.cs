@@ -372,7 +372,7 @@ namespace ShinhanNativeTrader {
             public string Kind,Code;public int? Id;
             public string Query;
             public IDictionary<int,string> Input;
-            public bool Retried;
+            public bool Retried,RequestEntered;
             public DateTime? RetryDueUtc;
             public bool TradeBasisRequested,OrdinaryOnlyRequested,OrdersScopeRequested;
             public decimal? RequestedPrice;
@@ -483,6 +483,10 @@ namespace ShinhanNativeTrader {
                 if(disposed||failed||pending!=current)return false;
                 stage="RequestData";
                 current.RequestStartedUtc=DateTime.UtcNow;
+                // Input setters may pump old ReceiveData callbacks. A timestamp
+                // cannot distinguish those callbacks on a coarse Windows clock;
+                // only callbacks after entering this invocation can be ours.
+                current.RequestEntered=true;
                 object raw=io.Invoke("RequestData");
                 Log("RequestData return type="+(raw==null?"null":raw.GetType().Name));
                 var id=RequestId(raw);
@@ -524,6 +528,7 @@ namespace ShinhanNativeTrader {
             if(disposed||failed)return;
             var current=pending;
             if(current==null){Log("Ignored unsolicited/duplicate ReceiveData rid="+id);return;}
+            if(!current.RequestEntered){Log("Ignored ReceiveData before RequestData entry; response scope not established.");return;}
             if(current.RetryDueUtc.HasValue){Log("Ignored ReceiveData while an unaccepted read is awaiting its bounded retry.");return;}
             if(current.Id.HasValue&&current.Id.Value!=id){Log("Ignored mismatched ReceiveData rid="+id);return;}
             var snapshot=new Snapshot{Id=id,ReceivedUtc=DateTime.UtcNow};
@@ -558,7 +563,7 @@ namespace ShinhanNativeTrader {
             if(snapshot.Reply.Capacity!=null)snapshot.Reply.Capacity.ReceivedUtc=snapshot.ReceivedUtc;
             if(snapshot.Reply.BrokerOrders!=null) {
                 string number=null;if(current.Input!=null)current.Input.TryGetValue(1,out number);
-                bool verified=current.OrdersScopeRequested&&snapshot.NormalResponse
+                bool verified=current.RequestEntered&&current.OrdersScopeRequested&&snapshot.NormalResponse
                     &&current.Id.HasValue&&current.Id.Value>0&&current.Id.Value==snapshot.Id
                     &&current.RequestStartedUtc.Kind==DateTimeKind.Utc&&current.RequestStartedUtc<=snapshot.ReceivedUtc;
                 snapshot.Reply.BrokerOrders.BindRequestScope(current.RequestStartedUtc,snapshot.ReceivedUtc,verified,number);

@@ -280,8 +280,20 @@ namespace ShinhanNativeTrader {
             fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
             fake.DuringSetField=()=>fake.Data(7);
             requests.Begin("ORDERS","SABA231Q1",AccountQueries.OrdersInputs(number,secret,day),day);
-            Check(reply!=null&&!reply.BrokerOrders.RequestScopeVerified,
-                "a callback copied before RequestData begins cannot certify a later accepted order request");requests.Dispose();
+            Check(reply==null&&requests.Busy&&!requests.Failed,
+                "callbacks pumped by setters are ignored before RequestData entry regardless of timestamp resolution");
+            fake.Data(7);
+            Check(reply!=null&&reply.BrokerOrders.RequestScopeVerified&&reply.BrokerOrders.MatchesRequestAccount(number),
+                "discarding setter-phase callbacks preserves the subsequent actual matching order response");requests.Dispose();
+
+            fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+            fake.DuringSetField=()=>{fake.ResponseErrorState=2;fake.Data(7);};
+            requests.Begin("ORDERS","SABA231Q1",AccountQueries.OrdersInputs(number,secret,day),day);
+            Check(reply==null&&requests.Busy&&!requests.Failed,
+                "provider errors on pre-entry callbacks cannot poison a later accepted order read");
+            fake.ResponseErrorState=0;fake.Data(7);
+            Check(reply!=null&&reply.BrokerOrders.RequestScopeVerified,
+                "normal callback after RequestData entry establishes scope despite an earlier setter-pumped error");requests.Dispose();
 
             fake=new FakeIndi();requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
             var mutable=AccountQueries.OrdersInputs(number,secret,day);fake.DuringSetField=()=>{mutable[0]="20261111";mutable[1]="bad";mutable[2]="changed";mutable[5]="1";};
