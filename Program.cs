@@ -16,7 +16,7 @@ namespace ShinhanNativeTrader {
         public AccountUserActionException(string message):base(message){}
     }
     internal static class Program {
-        internal const string Version="2.2.8";
+        internal const string Version="2.2.9";
         [STAThread]
         static int Main(string[] args) {
             if(args.Contains("--selftest")) {
@@ -91,6 +91,7 @@ namespace ShinhanNativeTrader {
             public RealtimeQuote Quote;
             public AccountOrderCapacity Capacity;
             public bool AutoSize;
+            public string StrategyKey;
             public readonly Queue<string> Reads=new Queue<string>();
             public string WaitingFor;
             public int Attempts,NotSentAttempts;
@@ -121,6 +122,7 @@ namespace ShinhanNativeTrader {
         readonly Timer scheduler=new Timer{Interval=1000};
         readonly UnattendedSession session=new UnattendedSession(rescanDuringSession:false);
         readonly LiveTradingSession authorization=new LiveTradingSession();
+        readonly Func<string,bool> legacySellAttestation=LegacySellAttestation.MatchesAccountKey;
         readonly UnattendedAwakeLease awake=new UnattendedAwakeLease();
         readonly List<Stock> symbols=new List<Stock>();
         readonly List<Holding> holdings=new List<Holding>();
@@ -130,6 +132,7 @@ namespace ShinhanNativeTrader {
         readonly Dictionary<string,DateTime> quoteDue=new Dictionary<string,DateTime>(),priceReceivedUtc=new Dictionary<string,DateTime>();
         readonly Dictionary<string,DateTime> candidateQuoteSince=new Dictionary<string,DateTime>(),candidateQuoteDue=new Dictionary<string,DateTime>();
         readonly Dictionary<string,HoldingSellDecision> sellDecisions=new Dictionary<string,HoldingSellDecision>(StringComparer.Ordinal);
+        readonly Dictionary<string,string> automaticSellStatus=new Dictionary<string,string>(StringComparer.Ordinal);
         readonly Dictionary<string,CashInstrument> instruments=new Dictionary<string,CashInstrument>(StringComparer.Ordinal);
         readonly Dictionary<string,string> balanceSignatures=new Dictionary<string,string>(StringComparer.Ordinal);
         readonly HashSet<string> trackedQuotes=new HashSet<string>(StringComparer.Ordinal);
@@ -199,7 +202,7 @@ namespace ShinhanNativeTrader {
             var ordersPanel=new TableLayoutPanel{Dock=DockStyle.Fill,RowCount=3,ColumnCount=1};ordersPanel.RowStyles.Add(new RowStyle(SizeType.Absolute,38));ordersPanel.RowStyles.Add(new RowStyle(SizeType.Percent,100));ordersPanel.RowStyles.Add(new RowStyle(SizeType.Absolute,90));
             var orderButtons=new FlowLayoutPanel{Dock=DockStyle.Fill};orderButtons.Controls.Add(new Label{Text="선택 주문 수량",AutoSize=true});orderButtons.Controls.Add(orderQuantity);orderButtons.Controls.Add(new Label{Text="정정 단가",AutoSize=true});orderButtons.Controls.Add(orderPrice);
             AddButton(orderButtons,"선택 주문 취소",()=>ChangeSelectedOrder(false));AddButton(orderButtons,"선택 주문 정정",()=>ChangeSelectedOrder(true));
-            AddButton(orderButtons,"선택 거절 매도 재시도",()=>RetrySelectedRejectedSellAt(DateTime.UtcNow));
+            orderButtons.Controls.Add(new Label{AutoSize=true,Text="거절 자동 재검증: 종목·방향별 추가3회/일"});
             ordersPanel.Controls.Add(orderButtons,0,0);ordersPanel.Controls.Add(ordersGrid,0,1);ordersPanel.Controls.Add(orderResponseDetails,0,2);
             ordersGrid.SelectionChanged+=(s,e)=>UpdateSelectedOrderResponse();
             AddTab(tabs,"주문·체결",ordersPanel);AddTab(tabs,"발굴 후보",candidatesGrid);
@@ -379,11 +382,25 @@ namespace ShinhanNativeTrader {
             }
             if(!EnsureRealtime(true))return;
             var now=DateTime.UtcNow;authorization.Authorize(credentials.Account,now);readiness.SetAuthorization(true);
+            AuthorizeConfirmedLegacySells(now);
             session.Arm(now);awake.Start();monitoring=true;liveDayCompleted=false;blockedSignals.Clear();QueueAccountRefresh();
             BeginResearch(now,false);
             UpdateOrderStatus("매 주문 전 실제 계좌·실시간 시세 확인");
             state.Text="실주문 운영 시작: "+(session.NextScanUtc.HasValue?MarketTime.ToKorea(session.NextScanUtc.Value).ToString("MM-dd HH:mm",CultureInfo.InvariantCulture):"장중")+" / 기존·신규 보유 같은 매도 규칙 적용";
             Log("사용자 버튼으로 현재 계좌 실주문 운영 시작. 데이터 조건이 충족된 주문만 전송합니다.");
+            Log("거절 자동 재검증 활성: 매수·매도 현재 조건 재확인, 30/60/120초 대기, 종목·방향별 당일 최대3회. 접수·불명 주문 재전송 없음.");
+        }
+        void AuthorizeConfirmedLegacySells(DateTime now) {
+            if(journal==null||credentials==null||!authorization.Allows(credentials.Account,now)||!legacySellAttestation(boundKey))return;
+            var stateSnapshot=journal.Snapshot;
+            string day=MarketTime.ToKorea(now).ToString("yyyyMMdd",CultureInfo.InvariantCulture);
+            foreach(var root in stateSnapshot.Orders.Where(value=>value.TradingDate==day&&LiveOrderJournal.IsOperatorConfirmedLegacySellRoot(value))) {
+                if(!holdings.Any(value=>value.Code==root.Code&&value.Quantity>0))continue;
+                if(stateSnapshot.Orders.Any(value=>value.Id!=root.Id&&value.TradingDate==root.TradingDate&&value.Code==root.Code
+                    &&value.TradeKind==LiveOrderKind.Sell&&value.Status!=LiveOrderStatus.Rejected&&value.Status!=LiveOrderStatus.NotSent))continue;
+                if(journal.AuthorizeLegacySellRecheck(root.Id,now))
+                    Log("사용자 미접수 확인의 구버전 매도 자동 재평가 허용 "+root.Code+" / 당일 원본 기록별1회 / 현재 전략·실계좌 재검증 / 증권사 거절 증거와 별도 저장");
+            }
         }
         void StartScan(){RequireIdle();RequireStorage();StartScanCore();}
         void StartScanCore(){BeginResearch(DateTime.UtcNow,true);}
@@ -480,17 +497,21 @@ namespace ShinhanNativeTrader {
                 if(candidate==null){SetCandidateStatus(prepared.Code,status);continue;}
                 SetCandidateStatus(prepared.Code,status);
                 string key="entry-"+MarketTime.ToKorea(now).ToString("yyyyMMdd",CultureInfo.InvariantCulture)+"-"+candidate.Code;
-                if(journal==null||journal.Snapshot.Orders.Any(x=>x.ClientKey==key))continue;
+                if(journal==null)continue;
+                var retry=AutoOrderRetry.Evaluate(journal.Snapshot,key,candidate.Code,LiveOrderKind.Buy,boundKey,brokerOrders,now);
+                if(retry.State!=AutoRetryState.NotNeeded&&retry.State!=AutoRetryState.Eligible) {
+                    ShowAutomaticRetryStatus(candidate.Code,LiveOrderKind.Buy,retry);continue;
+                }
                 buyQuotes.Enqueue(candidate);SetCandidateStatus(candidate.Code,"실시간 돌파·거래량 확인 / 계좌 재조회 대기");
             }
         }
-        void ClearWork(){scanning=false;requestedScan=false;firstQueryQueued=false;pendingSessionScan=false;connectionEpoch++;scans.Clear();buyQuotes.Clear();entry=null;preflightDirty=false;accountReads.Clear();InvalidateResearch();}
+        void ClearWork(){scanning=false;requestedScan=false;firstQueryQueued=false;pendingSessionScan=false;connectionEpoch++;scans.Clear();buyQuotes.Clear();entry=null;preflightDirty=false;accountReads.Clear();automaticSellStatus.Clear();InvalidateResearch();}
         void PauseOrdersForReconciliation(string reason,DateTime utc) {
             // A blocked or disconnected order must not destroy the session
             // needed to read the broker's authoritative account/order result.
             // Authorization is revoked; only read-only monitoring continues.
             authorization.Revoke();if(readiness!=null)readiness.SetAuthorization(false);
-            session.Disarm();awake.Dispose();entry=null;preflightDirty=false;buyQuotes.Clear();
+            session.Disarm();awake.Dispose();entry=null;preflightDirty=false;buyQuotes.Clear();automaticSellStatus.Clear();
             if(api!=null)api.CancelPending();
             accountReads.Clear();monitoring=credentials!=null&&journal!=null;nextAccountReadUtc=utc;
             if(monitoring)QueueAccountRefresh();
@@ -712,6 +733,8 @@ namespace ShinhanNativeTrader {
         }
         void ApplyHoldings(IEnumerable<Holding> values,DateTime? receivedUtc) {
             sellDecisions.Clear();holdings.Clear();holdings.AddRange(values);holdingsReceivedUtc=receivedUtc;
+            foreach(var symbol in automaticSellStatus.Keys.Where(symbol=>!holdings.Any(value=>value.Code==symbol&&value.Quantity>0)).ToArray())automaticSellStatus.Remove(symbol);
+            if(LiveStarted)AuthorizeConfirmedLegacySells(DateTime.UtcNow);
             foreach(var holding in holdings) {
                 if(holding.Price>0&&receivedUtc.HasValue)priceReceivedUtc[holding.Code]=receivedUtc.Value;
                 if(holding.Quantity>0)EnsureLiveQuote(holding.Code);
@@ -766,6 +789,14 @@ namespace ShinhanNativeTrader {
             if(journal==null)return true;
             return journal.Snapshot.Orders.Any(x=>(x.ClientKey==intent.ClientKey&&x.Status!=LiveOrderStatus.NotSent)||((intent.Kind==LiveOrderKind.Buy||intent.Kind==LiveOrderKind.Sell)&&x.Code==intent.Code&&LiveOrderJournal.IsUnresolved(x)));
         }
+        void ShowAutomaticRetryStatus(string symbol,LiveOrderKind side,AutoRetryDecision retry) {
+            SetCandidateStatus(symbol,retry.Status);
+            if(side==LiveOrderKind.Sell) {
+                var held=holdings.SingleOrDefault(value=>value.Code==symbol&&value.Quantity>0);
+                if(held!=null){automaticSellStatus[symbol]=retry.Status;RefreshAccount();}
+            }
+            if(retry.State==AutoRetryState.RefreshRequired)QueueAccountRefresh();
+        }
         void QueueOrder(LiveOrderIntent intent,RealtimeQuote quote,Candidate candidate,bool autoSize,DateTime now) {
             if(orderPreparing||!LiveStarted||entry!=null||gateway==null||gateway.Busy||readiness==null||journal==null)return;
             if(journal.RecoveryRequired){PauseOrdersForReconciliation("미확정 주문 자동 대사 중 / 계좌 조회·감시 유지",now);return;}
@@ -773,6 +804,17 @@ namespace ShinhanNativeTrader {
             CashInstrument instrument;instruments.TryGetValue(intent.Code,out instrument);
             if(intent.Kind!=LiveOrderKind.Cancel&&!CashMarketRules.CanUseQuoteLimit(instrument,quote,intent.LimitPrice,now)) {
                 SetCandidateStatus(intent.Code,"현재 정규장 체결가격 확인 필요");UpdateOrderStatus("현재 정규장 체결가격과 같은 지정가만 지원합니다.");return;
+            }
+            string strategyKey=null;
+            string dailyKey=(intent.Kind==LiveOrderKind.Buy?"entry-":"exit-")+MarketTime.ToKorea(now).ToString("yyyyMMdd",CultureInfo.InvariantCulture)+"-"+intent.Code;
+            if((intent.Kind==LiveOrderKind.Buy||intent.Kind==LiveOrderKind.Sell)&&intent.ClientKey==dailyKey) {
+                strategyKey=dailyKey;
+                var retry=AutoOrderRetry.Evaluate(journal.Snapshot,strategyKey,intent.Code,intent.Kind,boundKey,brokerOrders,now);
+                if(retry.State!=AutoRetryState.NotNeeded&&retry.State!=AutoRetryState.Eligible) {
+                    ShowAutomaticRetryStatus(intent.Code,intent.Kind,retry);return;
+                }
+                intent.ClientKey=retry.ClientKey;
+                if(retry.State==AutoRetryState.Eligible)Log("거절 자동 재검증 준비 "+intent.Code+" / "+intent.Kind+" / "+retry.Attempt+"/3 / 현재 전략·시세·수량 새 검증");
             }
             if(AlreadyRecorded(intent)){SetCandidateStatus(intent.Code,"기존 주문 접수·체결 확인");return;}
             // Initialize the dedicated order control before invalidating and
@@ -788,7 +830,8 @@ namespace ShinhanNativeTrader {
                 state.Text="새 주문 준비 중단 / 계좌·운영 시작·장중 상태가 변경되었습니다.";
                 UpdateOrderStatus(state.Text);Log(state.Text);return;
             }
-            entry=new EntryRequest{Intent=intent,Quote=quote,Candidate=candidate,AutoSize=autoSize};RestartPreflight(now,false);
+            automaticSellStatus.Remove(intent.Code);
+            entry=new EntryRequest{Intent=intent,Quote=quote,Candidate=candidate,AutoSize=autoSize,StrategyKey=strategyKey};RestartPreflight(now,false);
             UpdateOrderStatus("새 주문 "+intent.Code+" / 사전검증 대기 (기존 주문 기록 유지)");
         }
         void RestartPreflight(DateTime now,bool delay) {
@@ -823,6 +866,14 @@ namespace ShinhanNativeTrader {
         void SubmitPending(DateTime now) {
             var pending=entry;if(pending==null||!LiveStarted||readiness==null||journal==null)return;
             if(AlreadyRecorded(pending.Intent)){entry=null;return;}
+            if(pending.StrategyKey!=null) {
+                var retry=AutoOrderRetry.Evaluate(journal.Snapshot,pending.StrategyKey,pending.Intent.Code,pending.Intent.Kind,boundKey,brokerOrders,now);
+                if((retry.State!=AutoRetryState.NotNeeded&&retry.State!=AutoRetryState.Eligible)||retry.ClientKey!=pending.Intent.ClientKey) {
+                    ShowAutomaticRetryStatus(pending.Intent.Code,pending.Intent.Kind,retry);
+                    if(retry.State==AutoRetryState.RefreshRequired)RestartPreflight(now,true);else entry=null;
+                    return;
+                }
+            }
             RealtimeQuote quote=pending.Quote;
             if(pending.Intent.Kind!=LiveOrderKind.Cancel) {
                 RealtimeQuote latest;
@@ -910,7 +961,9 @@ namespace ShinhanNativeTrader {
                 throw new AccountUserActionException("접수번호 없는 거절 매도만 재검증할 수 있습니다. 결과 불명·접수된 주문은 증권사 대사가 필요합니다.");
             if(orderPreparing||!LiveStarted||!ActiveSession||gateway==null||gateway.Busy||entry!=null||journal.RecoveryRequired)
                 throw new AccountUserActionException("현재 계좌의 운영 시작과 앞선 주문 확인이 필요합니다.");
-            if(journal.Snapshot.Orders.Count(item=>item.Code==previous.Code&&item.TradingDate==previous.TradingDate&&item.ClientKey.StartsWith("retry-",StringComparison.Ordinal))>=3)
+            if(journal.Snapshot.Orders.Count(item=>item.Code==previous.Code&&item.TradingDate==previous.TradingDate&&item.TradeKind==LiveOrderKind.Sell
+                &&item.Status!=LiveOrderStatus.NotSent&&(item.ClientKey.StartsWith("retry-",StringComparison.Ordinal)
+                    ||item.ClientKey.StartsWith(AutoOrderRetry.KeyPrefix,StringComparison.Ordinal)||item.ClientKey.StartsWith(AutoOrderRetry.LegacyKeyPrefix,StringComparison.Ordinal)))>=AutoOrderRetry.MaximumAttemptsPerDay)
                 throw new AccountUserActionException("이 종목의 거절 재시도3회 기록을 먼저 확인하십시오.");
             var held=holdings.SingleOrDefault(item=>item.Code==previous.Code&&item.Quantity>0);RealtimeQuote quote;
             if(held==null||!EnsureLiveQuote(previous.Code)||!realtime.TryGetQuote(previous.Code,now,out quote))
@@ -954,13 +1007,15 @@ namespace ShinhanNativeTrader {
             settingsStore.ObserveHigh(boundKey,held,quote,utc);
             string reason=Rules.Exit(new PositionRiskState{Code=held.Code,Qty=checked((int)held.Quantity),Entry=held.AvgPrice,
                 High=settingsStore.High(boundKey,held.Code,held.AvgPrice)},quote.Price,configuration.Strategy);
+            if(string.IsNullOrEmpty(reason))automaticSellStatus.Remove(held.Code);
             SetHoldingDecision(held,string.IsNullOrEmpty(reason)?"보유":reason);return reason;
         }
         void RefreshAccount() {
             holdingsGrid.Rows.Clear();
             foreach(var held in holdings) {
                 var value=HoldingValuation.From(held);DateTime stamp;
-                holdingsGrid.Rows.Add(value.Code,value.Name,value.Quantity,Amount(value.AveragePrice>0?(decimal?)value.AveragePrice:null),Amount(value.CurrentPrice>0?(decimal?)value.CurrentPrice:null),Amount(value.CostBasis),Amount(value.MarketValue),Amount(value.UnrealizedProfit),value.ReturnPercent.HasValue?value.ReturnPercent.Value.ToString("N2",CultureInfo.CurrentCulture):"미확인",priceReceivedUtc.TryGetValue(held.Code,out stamp)?MarketTime.ToKorea(stamp).ToString("MM-dd HH:mm:ss",CultureInfo.InvariantCulture):"미조회",HoldingDecision(held));
+                string automaticStatus;
+                holdingsGrid.Rows.Add(value.Code,value.Name,value.Quantity,Amount(value.AveragePrice>0?(decimal?)value.AveragePrice:null),Amount(value.CurrentPrice>0?(decimal?)value.CurrentPrice:null),Amount(value.CostBasis),Amount(value.MarketValue),Amount(value.UnrealizedProfit),value.ReturnPercent.HasValue?value.ReturnPercent.Value.ToString("N2",CultureInfo.CurrentCulture):"미확인",priceReceivedUtc.TryGetValue(held.Code,out stamp)?MarketTime.ToKorea(stamp).ToString("MM-dd HH:mm:ss",CultureInfo.InvariantCulture):"미조회",automaticSellStatus.TryGetValue(held.Code,out automaticStatus)?automaticStatus:HoldingDecision(held));
             }
             if(holdingsReceivedUtc.HasValue){var total=AccountValuation.From(holdings);portfolio.Text="매입 "+Amount(total.CostBasis)+"원 / 평가 "+Amount(total.MarketValue)+"원 / 평가손익 "+Amount(total.UnrealizedProfit)+"원 (비용 제외)";}
             else portfolio.Text="실계좌 잔고·평가손익: 미조회";

@@ -54,6 +54,124 @@ namespace ShinhanNativeTrader {
                     Quantity=order.Quantity,LimitPrice=order.LimitPrice,FilledQuantity=order.Quantity,OpenQuantity=0,ConfirmedQuantity=0,
                     AutoCancelledQuantity=0,AverageFillPrice=order.TradeKind==LiveOrderKind.Buy?9900:10100}};
         }
+        static DateTime LegacyUtc(int seconds=0){return Utc(seconds).AddDays(1);}
+        static LiveOrderRecord LegacyRejected(LiveOrderJournal journal,string code="069500",LiveOrderKind kind=LiveOrderKind.Sell,
+            string key=null,DateTime? time=null,string responseNumber="0",bool detailed=false) {
+            var utc=time??LegacyUtc();var order=journal.Prepare(new LiveOrderIntent{Kind=kind,Code=code,Quantity=10,LimitPrice=10000,
+                ClientKey=key??"exit-"+MarketTime.ToKorea(utc).ToString("yyyyMMdd",System.Globalization.CultureInfo.InvariantCulture)+"-"+code},utc);
+            journal.MarkDispatching(order.Id,utc);journal.MarkRequestAccepted(order.Id,7,utc);
+            OrderResponseEvidence response=null;
+            if(detailed) {
+                var values=new[]{"0","0","0","","0","synthetic rejection","0","0"};
+                response=LiveOrderResponseParser.Read(7,index=>values[index],new IndiDiagnosticSnapshot{ErrorState=0},OrderResponseLayout.Modern,new string[0]);
+            }
+            journal.RecordAcknowledgement(order.Id,7,responseNumber,false,utc,response);return journal.Snapshot.Orders.Single(value=>value.Id==order.Id);
+        }
+        static void LegacySellRecheckTests(string directory) {
+            string path=Path.Combine(directory,"legacy-sell-once.xml");string rootId;DateTime originalGrant;
+            using(var journal=new LiveOrderJournal(path)) {
+                journal.BindAccount("12345678901");var root=LegacyRejected(journal);rootId=root.Id;
+                string key="auto-legacy-"+rootId+"-1";
+                var intent=new LiveOrderIntent{Kind=LiveOrderKind.Sell,Code=root.Code,Quantity=7,LimitPrice=9000,ClientKey=key};
+                Reject(()=>journal.Prepare(intent,LegacyUtc(40)),"a legacy rejected sell cannot use an automatic reevaluation key without the operator grant");
+                Check(journal.AuthorizeLegacySellRecheck(rootId,LegacyUtc(5)),"the specifically attested day and sell root receive one durable operator reevaluation grant");
+                originalGrant=journal.Snapshot.LegacySellRechecks.Single().GrantedUtc;
+                Check(!journal.AuthorizeLegacySellRecheck(rootId,LegacyUtc(6))&&journal.Snapshot.LegacySellRechecks.Count==1
+                    &&journal.Snapshot.LegacySellRechecks.Single().GrantedUtc==originalGrant,"repeated arm cannot refresh or duplicate a legacy reevaluation grant");
+                var snapshot=journal.Snapshot;var permission=snapshot.LegacySellRechecks.Single();
+                Check(permission.Source==LiveOrderJournal.LegacySellRecheckSource&&permission.AccountFingerprint==snapshot.AccountFingerprint
+                    &&permission.RootOrderId==rootId&&permission.TradingDate=="20261113"
+                    &&LiveOrderJournal.IsAuthorizedLegacySellRecheck(snapshot,root,LegacyUtc(40)),"operator attestation is bound to the exact account root day and source separately from broker response evidence");
+                Check(!LiveOrderJournal.IsAuthorizedLegacySellRecheck(snapshot,root,LegacyUtc().AddDays(1)),"an attested legacy reevaluation cannot carry into the following trading day");
+                snapshot.AccountFingerprint="other-account";
+                Check(!LiveOrderJournal.IsAuthorizedLegacySellRecheck(snapshot,root,LegacyUtc(40)),"a persisted legacy permission does not transfer to a different account");
+                snapshot=journal.Snapshot;snapshot.LegacySellRechecks.Single().Source="BrokerConfirmedNoOrder";
+                Check(!LiveOrderJournal.IsAuthorizedLegacySellRecheck(snapshot,root,LegacyUtc(40)),"operator confirmation is never relabeled as an inferred broker proof");
+                snapshot=journal.Snapshot;snapshot.LegacySellRechecks.Add(snapshot.LegacySellRechecks.Single());
+                Check(!LiveOrderJournal.IsAuthorizedLegacySellRecheck(snapshot,root,LegacyUtc(40)),"duplicate grants are ambiguous rather than multiple reevaluation permissions");
+                var wrong=new LiveOrderIntent{Kind=LiveOrderKind.Buy,Code=root.Code,Quantity=1,LimitPrice=10000,ClientKey=key};
+                Reject(()=>journal.Prepare(wrong,LegacyUtc(40)),"a legacy sell reevaluation grant never authorizes a legacy buy");
+                wrong.Kind=LiveOrderKind.Sell;wrong.Code="305720";
+                Reject(()=>journal.Prepare(wrong,LegacyUtc(40)),"the one-time legacy key cannot be transferred to the other attested symbol");
+                wrong.Code=root.Code;wrong.ClientKey="auto-legacy-"+rootId+"-2";
+                Reject(()=>journal.Prepare(wrong,LegacyUtc(40)),"a legacy source cannot create a second automatic reevaluation audit key");
+                wrong.ClientKey=key.ToUpperInvariant();
+                Reject(()=>journal.Prepare(wrong,LegacyUtc(40)),"case variation cannot bypass the reserved legacy audit-key guard");
+                var notSent=journal.Prepare(intent,LegacyUtc(40));journal.MarkDispatching(notSent.Id,LegacyUtc(40));journal.RecordNotSent(notSent.Id,LegacyUtc(41));
+                Check(journal.Snapshot.Orders.Single(value=>value.Id==notSent.Id).OriginalClientKey==key
+                    &&journal.Snapshot.Orders.Single(value=>value.Id==notSent.Id).Status==LiveOrderStatus.NotSent,
+                    "proven pre-request refusal retains a separate audit and does not falsely consume the one-time transmission allowance");
+                var child=journal.Prepare(intent,LegacyUtc(42));
+                Check(child.Quantity==7&&child.LimitPrice==9000&&journal.Snapshot.Orders.Single(value=>value.Id==rootId).Quantity==10
+                    &&journal.Snapshot.Orders.Single(value=>value.Id==rootId).LimitPrice==10000,
+                    "legacy reevaluation uses newly validated quantity and price instead of replaying the old request");
+                journal.MarkDispatching(child.Id,LegacyUtc(42));journal.MarkRequestAccepted(child.Id,8,LegacyUtc(42));
+                journal.RecordAcknowledgement(child.Id,8,"0",false,LegacyUtc(43));
+                Reject(()=>journal.Prepare(intent,LegacyUtc(44)),"a dispatched legacy child permanently consumes its exact one-time key even when rejected");
+                Check(!journal.AuthorizeLegacySellRecheck(rootId,LegacyUtc(45))&&journal.Snapshot.LegacySellRechecks.Single().GrantedUtc==originalGrant,
+                    "arming after consumption cannot reset the prior operator permission");
+                var unchanged=journal.Snapshot.Orders.Single(value=>value.Id==rootId);
+                Check(unchanged.Status==LiveOrderStatus.Rejected&&unchanged.ResponseEvidence==null&&string.IsNullOrEmpty(unchanged.BrokerOrderNumber)
+                    &&journal.Snapshot.Executions.Count==0,"legacy attestation preserves the original incomplete rejection and creates no broker or fill evidence");
+                Check(!File.ReadAllText(path).Contains("12345678901"),"durable legacy attestation stores the account fingerprint rather than its credential");
+            }
+            using(var restarted=new LiveOrderJournal(path)) {
+                Check(restarted.Snapshot.LegacySellRechecks.Count==1&&restarted.Snapshot.LegacySellRechecks.Single().GrantedUtc==originalGrant
+                    &&!restarted.AuthorizeLegacySellRecheck(rootId,LegacyUtc(50)),"restart preserves the consumed one-time legacy reevaluation permission");
+                Reject(()=>restarted.Prepare(new LiveOrderIntent{Kind=LiveOrderKind.Sell,Code="069500",Quantity=1,LimitPrice=10000,
+                    ClientKey="auto-legacy-"+rootId+"-1"},LegacyUtc(51)),"restart cannot reopen a consumed legacy automatic attempt");
+                Reject(()=>restarted.AuthorizeLegacySellRecheck(rootId,LegacyUtc().AddDays(1)),"the historical attestation cannot be newly granted on a later day");
+                restarted.MarkUnknown(rootId,LegacyUtc(55));
+                Check(restarted.Snapshot.LegacySellRechecks.Single().GrantedUtc==originalGrant
+                    &&restarted.Snapshot.Orders.Single(order=>order.Id==rootId).UpdatedUtc==LegacyUtc(55),
+                    "later root observations preserve historical permission without invalidating already recorded legacy child audits");
+            }
+            string saved=File.ReadAllText(path);
+            string correctedPath=Path.Combine(directory,"legacy-root-later-unknown.xml");var correctedXml=new XmlDocument();correctedXml.LoadXml(saved);
+            var correctedRoot=correctedXml.SelectSingleNode("/LiveOrderJournalState/Orders/LiveOrderRecord[Id='"+rootId+"']");
+            correctedRoot.SelectSingleNode("Status").InnerText="Unknown";
+            correctedRoot.SelectSingleNode("UpdatedUtc").InnerText=LegacyUtc(60).ToString("o",System.Globalization.CultureInfo.InvariantCulture);correctedXml.Save(correctedPath);
+            using(var corrected=new LiveOrderJournal(correctedPath)) {
+                var root=corrected.Snapshot.Orders.Single(order=>order.Id==rootId);
+                Check(corrected.RecoveryRequired&&corrected.Snapshot.LegacySellRechecks.Single().GrantedUtc==originalGrant
+                    &&!LiveOrderJournal.IsAuthorizedLegacySellRecheck(corrected.Snapshot,root,LegacyUtc(61)),
+                    "a later unknown root loads with its historical attestation intact but loses all active retry permission");
+                Reject(()=>corrected.AuthorizeLegacySellRecheck(rootId,LegacyUtc(61)),"historical permission cannot reauthorize an uncertain root");
+                Reject(()=>corrected.Prepare(Buy("after-root-contradiction","000660"),LegacyUtc(61)),
+                    "a later uncertain root globally blocks new orders instead of being hidden by its historical permission");
+                corrected.BindRecoveryOrder(rootId,new LiveRecoveryOrderEvidence{AccountFingerprint=corrected.Snapshot.AccountFingerprint,
+                    BrokerOrderNumber="812398",TradingDate=root.TradingDate,Code=root.Code,Kind=root.Kind,TradeKind=root.TradeKind,
+                    Quantity=root.Quantity,LimitPrice=root.LimitPrice,ReceivedUtc=LegacyUtc(62),AccountMatched=true,IdentityProven=true,SnapshotComplete=true},LegacyUtc(62));
+                root=corrected.Snapshot.Orders.Single(order=>order.Id==rootId);
+                Check(root.Status==LiveOrderStatus.Unknown&&root.BrokerOrderNumber=="812398"&&corrected.Snapshot.LegacySellRechecks.Single().GrantedUtc==originalGrant
+                    &&!LiveOrderJournal.IsAuthorizedLegacySellRecheck(corrected.Snapshot,root,LegacyUtc(63)),
+                    "authoritative later broker identity correction can be recorded without erasing the operator audit or reactivating its grant");
+            }
+            foreach(string field in new[]{"AccountFingerprint","Source","TradingDate","RootOrderId"}) {
+                string corrupt=Path.Combine(directory,"legacy-grant-corrupt-"+field+".xml");var document=new XmlDocument();document.LoadXml(saved);
+                document.SelectSingleNode("/LiveOrderJournalState/LegacySellRechecks/LegacySellRecheckGrant/"+field).InnerText="tampered";document.Save(corrupt);
+                Reject(()=>new LiveOrderJournal(corrupt),"tampered legacy attestation "+field+" fails closed on restart");
+            }
+            using(var journal=new LiveOrderJournal(Path.Combine(directory,"legacy-second-attested-code.xml"))) {
+                journal.BindAccount("12345678901");var root=LegacyRejected(journal,"305720");
+                Check(journal.AuthorizeLegacySellRecheck(root.Id,LegacyUtc(5)),"the second specifically attested legacy sell symbol is eligible without a hardcoded quantity or price");
+            }
+            var scenarios=new[]{"unbound","other-code","buy","other-day","other-key","accepted","unknown","detailed"};
+            foreach(string scenario in scenarios) {
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"legacy-out-of-scope-"+scenario+".xml"))) {
+                    if(scenario!="unbound")journal.BindAccount("12345678901");
+                    var root=LegacyRejected(journal,scenario=="other-code"?"005930":"069500",scenario=="buy"?LiveOrderKind.Buy:LiveOrderKind.Sell,
+                        scenario=="other-key"?"manual-sell":null,scenario=="other-day"?(DateTime?)Utc():null,
+                        scenario=="accepted"?"812399":scenario=="unknown"?"":"0",scenario=="detailed");
+                    Reject(()=>journal.AuthorizeLegacySellRecheck(root.Id,LegacyUtc(5)),"legacy operator attestation excludes "+scenario+" records");
+                }
+            }
+            string compatible=Path.Combine(directory,"legacy-no-grant-element.xml");
+            using(var journal=new LiveOrderJournal(compatible)){journal.BindAccount("12345678901");LegacyRejected(journal);}
+            var oldDocument=new XmlDocument();oldDocument.Load(compatible);var oldElement=oldDocument.SelectSingleNode("/LiveOrderJournalState/LegacySellRechecks");oldElement.ParentNode.RemoveChild(oldElement);oldDocument.Save(compatible);
+            using(var oldJournal=new LiveOrderJournal(compatible))Check(oldJournal.Snapshot.LegacySellRechecks.Count==0,
+                "old journal XML without the additive grant collection loads with no implicit legacy permission");
+        }
         static void TerminalRecoveryTests(string directory) {
             string path=Path.Combine(directory,"terminal-checkpoint.xml");string id;
             using(var journal=new LiveOrderJournal(path)) {
@@ -600,6 +718,7 @@ namespace ShinhanNativeTrader {
                     Reject(()=>journal.Prepare(Buy("retry"),Utc()),"storage failure cannot be bypassed with another order key");
                 }
                 TerminalRecoveryTests(directory);
+                LegacySellRecheckTests(directory);
                 return checks;
             }finally{Directory.Delete(directory,true);}
         }

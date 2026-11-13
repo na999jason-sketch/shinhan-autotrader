@@ -19,6 +19,6 @@
     <Reference Include="System.Xml" />
     <Reference Include="ShinhanNativeTrader"><HintPath>..\..\bin\Release\ShinhanNativeTrader.exe</HintPath><Private>true</Private></Reference>
   </ItemGroup>
-  <ItemGroup><Compile Include="PremarketUiTests.cs" /><Compile Include="TerminalRecoveryUiCases.cs" /></ItemGroup>
+  <ItemGroup><Compile Include="PremarketUiTests.cs" /><Compile Include="TerminalRecoveryUiCases.cs" /><Compile Include="AutomaticRetryUiCases.cs" /></ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
 </Project>

@@ -208,6 +208,12 @@ namespace ShinhanNativeTrader {
         public int MatchingOrderCount;
         public BrokerOrderRow Row;
     }
+    // A narrow operator attestation authorizes one fresh strategy reevaluation.
+    // It is not a broker rejection/acceptance proof and never rewrites the root.
+    public sealed class LegacySellRecheckGrant {
+        public string RootOrderId,AccountFingerprint,TradingDate,Source;
+        public DateTime GrantedUtc;
+    }
     public sealed class LiveOrderJournalState {
         public int Version=1;
         public string Mode="RealAccount";
@@ -216,10 +222,13 @@ namespace ShinhanNativeTrader {
         public List<LiveOrderRecord> Orders=new List<LiveOrderRecord>();
         public List<LiveExecutionRecord> Executions=new List<LiveExecutionRecord>();
         public List<string> ConfirmationIds=new List<string>();
+        public List<LegacySellRecheckGrant> LegacySellRechecks=new List<LegacySellRecheckGrant>();
     }
     // This is a journal of broker evidence, not an execution simulator. Submission,
     // acknowledgement, execution and cancellation are distinct durable transitions.
     public sealed class LiveOrderJournal : IDisposable {
+        public const string LegacySellRecheckSource="UserConfirmedNoOrder";
+        public const string LegacySellRecheckTradingDate="20261113";
         static readonly XmlSerializer Serializer=new XmlSerializer(typeof(LiveOrderJournalState));
         readonly string path;readonly FileStream lease;readonly object sync=new object();
         LiveOrderJournalState state;bool disposed,storageFault;
@@ -252,11 +261,67 @@ namespace ShinhanNativeTrader {
         public static bool IsUnresolved(LiveOrderRecord order) {
             return order.Status!=LiveOrderStatus.Filled&&order.Status!=LiveOrderStatus.Cancelled&&order.Status!=LiveOrderStatus.Rejected&&order.Status!=LiveOrderStatus.Replaced&&order.Status!=LiveOrderStatus.NotSent;
         }
+        static bool IsAttestedLegacySellIdentity(LiveOrderRecord root) {
+            return root!=null&&!string.IsNullOrEmpty(root.Id)&&root.Id.Length<=64
+                &&root.TradingDate==LegacySellRecheckTradingDate&&(root.Code=="069500"||root.Code=="305720")
+                &&root.ClientKey=="exit-"+LegacySellRecheckTradingDate+"-"+root.Code
+                &&root.Kind==LiveOrderKind.Sell&&root.TradeKind==LiveOrderKind.Sell
+                &&root.CreatedUtc.Kind==DateTimeKind.Utc&&TradeDate(root.CreatedUtc)==LegacySellRecheckTradingDate;
+        }
+        public static bool IsOperatorConfirmedLegacySellRoot(LiveOrderRecord root) {
+            return IsAttestedLegacySellIdentity(root)
+                &&root.Quantity>0&&root.Quantity<=1000000&&root.LimitPrice>0
+                &&root.Status==LiveOrderStatus.Rejected
+                &&root.ResponseEvidence==null&&root.FillCheckpoint==null&&string.IsNullOrEmpty(root.BrokerOrderNumber)
+                &&AbsentBrokerNumber(root.OriginalBrokerOrderNumber)&&root.FilledQuantity==0&&root.CancelledQuantity==0
+                &&root.RequestId.HasValue&&root.RequestId.Value>0&&root.UpdatedUtc.Kind==DateTimeKind.Utc&&root.CreatedUtc<=root.UpdatedUtc;
+        }
+        // Historical permission is an audit fact. Later broker corrections may
+        // change the root's status/evidence without erasing that earlier action.
+        static bool HasHistoricalLegacySellRecheck(LiveOrderJournalState value,LiveOrderRecord root,DateTime utc) {
+            if(utc.Kind!=DateTimeKind.Utc||value==null||value.Version!=1||value.Mode!="RealAccount"||string.IsNullOrEmpty(value.AccountFingerprint)||value.Orders==null
+                ||value.LegacySellRechecks==null||!IsAttestedLegacySellIdentity(root)
+                ||TradeDate(utc)!=LegacySellRecheckTradingDate)return false;
+            var roots=value.Orders.Where(order=>order!=null&&order.Id==root.Id).ToArray();
+            var grants=value.LegacySellRechecks.Where(grant=>grant!=null&&grant.RootOrderId==root.Id).ToArray();
+            if(roots.Length!=1||!IsAttestedLegacySellIdentity(roots[0])||root.Code!=roots[0].Code||root.ClientKey!=roots[0].ClientKey||grants.Length!=1)return false;
+            var permission=grants[0];
+            return permission.AccountFingerprint==value.AccountFingerprint&&permission.TradingDate==LegacySellRecheckTradingDate
+                &&permission.Source==LegacySellRecheckSource&&permission.GrantedUtc.Kind==DateTimeKind.Utc
+                &&permission.GrantedUtc>=roots[0].CreatedUtc&&permission.GrantedUtc<=utc&&TradeDate(permission.GrantedUtc)==LegacySellRecheckTradingDate;
+        }
+        public static bool IsAuthorizedLegacySellRecheck(LiveOrderJournalState value,LiveOrderRecord root,DateTime utc) {
+            if(!HasHistoricalLegacySellRecheck(value,root,utc)||!IsOperatorConfirmedLegacySellRoot(root)||value.Executions==null)return false;
+            var current=value.Orders.Single(order=>order.Id==root.Id);
+            return IsOperatorConfirmedLegacySellRoot(current)&&value.LegacySellRechecks.Single(permission=>permission.RootOrderId==root.Id).GrantedUtc>=current.UpdatedUtc
+                &&!value.Executions.Any(execution=>execution==null||execution.OrderId==root.Id);
+        }
+        public bool AuthorizeLegacySellRecheck(string rootId,DateTime utc) {
+            LiveOrderSafety.RequireUtc(utc);bool granted=false;
+            Change(copy=>{
+                var root=Find(copy,rootId);
+                if(string.IsNullOrEmpty(copy.AccountFingerprint)||!IsOperatorConfirmedLegacySellRoot(root)
+                    ||TradeDate(utc)!=LegacySellRecheckTradingDate||utc<root.UpdatedUtc||copy.Executions.Any(execution=>execution.OrderId==rootId))
+                    throw new InvalidOperationException("사용자가 미접수를 확인한 당일 기존 매도 기록만 한 번 재검증할 수 있습니다.");
+                if(copy.LegacySellRechecks.Any(grant=>grant.RootOrderId==rootId)) {
+                    if(!IsAuthorizedLegacySellRecheck(copy,root,utc))throw new InvalidOperationException("기존 매도 재검증 승인 기록의 계좌·범위가 일치하지 않습니다.");
+                    return;
+                }
+                copy.LegacySellRechecks.Add(new LegacySellRecheckGrant{RootOrderId=rootId,AccountFingerprint=copy.AccountFingerprint,
+                    TradingDate=root.TradingDate,GrantedUtc=utc,Source=LegacySellRecheckSource});granted=true;
+            });return granted;
+        }
         public LiveOrderRecord Prepare(LiveOrderIntent intent,DateTime utc) {
             LiveOrderProtocol.ValidateIntent(intent);LiveOrderSafety.RequireUtc(utc);string id=Guid.NewGuid().ToString("N");
             Change(copy=>{
                 if(copy.Orders.Any(o=>o.Status==LiveOrderStatus.Unknown))throw new InvalidOperationException("불명 주문의 증권사 대사가 필요합니다.");
                 if(copy.Orders.Any(o=>o.ClientKey==intent.ClientKey))throw new InvalidOperationException("동일 중복방지 키의 주문이 이미 기록됐습니다.");
+                if(intent.ClientKey.StartsWith("auto-legacy",StringComparison.OrdinalIgnoreCase)) {
+                    var roots=copy.Orders.Where(root=>intent.ClientKey=="auto-legacy-"+root.Id+"-1").ToArray();
+                    if(roots.Length!=1||intent.Kind!=LiveOrderKind.Sell||intent.Code!=roots[0].Code
+                        ||!IsAuthorizedLegacySellRecheck(copy,roots[0],utc))
+                        throw new InvalidOperationException("기존 매도 자동 재검증의 계좌·일회 승인·감사 키가 일치하지 않습니다.");
+                }
                 var tradeKind=intent.Kind;
                 if(intent.Kind==LiveOrderKind.Buy||intent.Kind==LiveOrderKind.Sell) {
                     if(copy.Orders.Any(o=>o.Code==intent.Code&&IsUnresolved(o)))throw new InvalidOperationException("동일 종목의 미완료 주문이 있습니다.");
@@ -561,7 +626,8 @@ namespace ShinhanNativeTrader {
         }
         static LiveOrderJournalState Copy(LiveOrderJournalState value){using(var stream=new MemoryStream()){Serializer.Serialize(stream,value);stream.Position=0;return(LiveOrderJournalState)Serializer.Deserialize(stream);}}
         static void Validate(LiveOrderJournalState value) {
-            if(value==null||value.Version!=1||value.Mode!="RealAccount"||string.IsNullOrEmpty(value.AccountSalt)||value.Orders==null||value.Executions==null||value.ConfirmationIds==null||value.LastBrokerChangeUtc.Kind!=DateTimeKind.Utc)
+            if(value==null||value.Version!=1||value.Mode!="RealAccount"||string.IsNullOrEmpty(value.AccountSalt)||value.Orders==null||value.Executions==null||value.ConfirmationIds==null
+                ||value.LegacySellRechecks==null||value.LastBrokerChangeUtc.Kind!=DateTimeKind.Utc)
                 throw new InvalidDataException("손상되거나 지원하지 않는 실주문 기록입니다.");
             if(value.Orders.Any(o=>o==null||string.IsNullOrWhiteSpace(o.Id)||o.Id.Length>64||string.IsNullOrWhiteSpace(o.ClientKey)||o.ClientKey.Length>128||string.IsNullOrEmpty(o.Code)||Rules.Code(o.Code)!=o.Code
                 ||o.Quantity<=0||o.Quantity>1000000||o.LimitPrice<=0||o.FilledQuantity<0||o.CancelledQuantity<0||Remaining(o)<0||o.CreatedUtc.Kind!=DateTimeKind.Utc||o.UpdatedUtc.Kind!=DateTimeKind.Utc||o.UpdatedUtc<o.CreatedUtc||o.TradingDate!=TradeDate(o.CreatedUtc)
@@ -574,7 +640,17 @@ namespace ShinhanNativeTrader {
             if(value.Executions.Any(f=>f==null||string.IsNullOrWhiteSpace(f.ExecutionId)||f.Quantity<=0||f.Price<=0||f.ExecutedUtc.Kind!=DateTimeKind.Utc
                 ||!value.Orders.Any(o=>o.Id==f.OrderId&&o.BrokerOrderNumber==f.BrokerOrderNumber&&o.TradingDate==f.TradingDate&&f.ExecutedUtc>=o.CreatedUtc)))
                 throw new InvalidDataException("손상된 증권사 체결 기록입니다.");
+            if(value.LegacySellRechecks.Any(grant=>grant==null||!HasHistoricalLegacySellRecheck(value,
+                value.Orders.SingleOrDefault(order=>order.Id==grant.RootOrderId),grant.GrantedUtc)))
+                throw new InvalidDataException("기존 매도 일회 재검증 승인의 계좌·출처·거래일·원기록이 일치하지 않습니다.");
             foreach(var order in value.Orders) {
+                string auditKey=order.Status==LiveOrderStatus.NotSent?order.OriginalClientKey:order.ClientKey;
+                if(auditKey!=null&&auditKey.StartsWith("auto-legacy",StringComparison.OrdinalIgnoreCase)) {
+                    var roots=value.Orders.Where(root=>auditKey=="auto-legacy-"+root.Id+"-1").ToArray();
+                    if(roots.Length!=1||order.Kind!=LiveOrderKind.Sell||order.TradeKind!=LiveOrderKind.Sell||order.Code!=roots[0].Code
+                        ||!HasHistoricalLegacySellRecheck(value,roots[0],order.CreatedUtc))
+                        throw new InvalidDataException("기존 매도 자동 재검증의 감사 기록과 일회 승인이 일치하지 않습니다.");
+                }
                 if(order.ResponseEvidence!=null) {
                     if(!order.RequestId.HasValue)throw new InvalidDataException("주문 응답에 요청번호가 없습니다.");
                     ValidateResponse(order.ResponseEvidence,order.RequestId.Value);
