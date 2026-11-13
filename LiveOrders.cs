@@ -156,6 +156,7 @@ namespace ShinhanNativeTrader {
         public decimal LimitPrice;
         public int? RequestId;
         public DateTime CreatedUtc,UpdatedUtc;
+        public OrderResponseEvidence ResponseEvidence;
     }
     public sealed class LiveExecutionRecord {
         public string ExecutionId,OrderId,BrokerOrderNumber,TradingDate;
@@ -259,9 +260,19 @@ namespace ShinhanNativeTrader {
                 order.Status=LiveOrderStatus.Unknown;
             },true);
         }
-        public void RecordAcknowledgement(string id,int requestId,string brokerOrderNumber,bool providerError,DateTime utc) {
+        public void RecordAcknowledgement(string id,int requestId,string brokerOrderNumber,bool providerError,DateTime utc,OrderResponseEvidence evidence=null) {
             Update(id,utc,order=>{
                 if(order.Status!=LiveOrderStatus.AwaitingAcknowledgement||order.RequestId!=requestId)throw new InvalidOperationException("주문 접수 응답의 요청번호가 다릅니다.");
+                if(evidence!=null) {
+                    ValidateResponse(evidence,requestId);
+                    order.ResponseEvidence=CopyResponse(evidence);
+                    // The identified response layout, not SO0 alone, decides whether
+                    // a zero SOR ID represents rejection or a separate KRX order.
+                    if(evidence.Disposition==OrderResponseDisposition.Unknown){order.Status=LiveOrderStatus.Unknown;return;}
+                    if(evidence.Disposition==OrderResponseDisposition.Rejected){order.Status=LiveOrderStatus.Rejected;return;}
+                    brokerOrderNumber=evidence.BrokerOrderNumber;providerError=false;
+                }
+                // Legacy callers supply an explicitly identified legacy response.
                 // Indi can report ErrorState0 with order number0. That is rejection.
                 bool positive=LiveOrderProtocol.ValidBrokerNumber(brokerOrderNumber);
                 bool zero=!string.IsNullOrEmpty(brokerOrderNumber)&&brokerOrderNumber.All(c=>c=='0');
@@ -271,6 +282,36 @@ namespace ShinhanNativeTrader {
                 order.BrokerOrderNumber=brokerOrderNumber;
                 order.Status=providerError?LiveOrderStatus.Unknown:order.Kind==LiveOrderKind.Amend||order.Kind==LiveOrderKind.Cancel?LiveOrderStatus.AwaitingConfirmation:LiveOrderStatus.Working;
             },true);
+        }
+        static OrderResponseEvidence CopyResponse(OrderResponseEvidence value) {
+            return new OrderResponseEvidence{RequestId=value.RequestId,Layout=value.Layout,Disposition=value.Disposition,
+                BrokerOrderNumber=value.BrokerOrderNumber,Slot0OrderNumber=value.Slot0OrderNumber,Slot1OrderNumber=value.Slot1OrderNumber,
+                Slot2OrderNumber=value.Slot2OrderNumber,Slot3OrderNumber=value.Slot3OrderNumber,ProviderError=value.ProviderError,
+                ParseFailed=value.ParseFailed,Message1Number=value.Message1Number,Message2Number=value.Message2Number,
+                Message3Number=value.Message3Number,SafeDiagnostic=value.SafeDiagnostic};
+        }
+        static bool ResponseSlot(string value){return value!=null&&(value.Length==0||value.Length<=32&&value.All(c=>c>='0'&&c<='9'));}
+        static bool ResponseZero(string value){return !string.IsNullOrEmpty(value)&&value.All(c=>c=='0');}
+        static void ValidateResponse(OrderResponseEvidence value,int requestId) {
+            if(value==null||value.RequestId<=0||value.RequestId!=requestId||!Enum.IsDefined(typeof(OrderResponseLayout),value.Layout)
+                ||!Enum.IsDefined(typeof(OrderResponseDisposition),value.Disposition)||value.SafeDiagnostic==null
+                ||value.SafeDiagnostic.Length>IndiDiagnosticFormatter.MaximumLength
+                ||value.SafeDiagnostic.Any(c=>char.IsControl(c)||char.GetUnicodeCategory(c)==UnicodeCategory.Format)
+                ||!ResponseSlot(value.Slot0OrderNumber)||!ResponseSlot(value.Slot1OrderNumber)||!ResponseSlot(value.Slot2OrderNumber)||!ResponseSlot(value.Slot3OrderNumber)
+                ||value.BrokerOrderNumber==null||value.BrokerOrderNumber.Length>0&&!LiveOrderProtocol.ValidBrokerNumber(value.BrokerOrderNumber))
+                throw new InvalidDataException("지원하지 않는 주문 응답 증거입니다.");
+            if(value.Layout==OrderResponseLayout.Unknown&&value.Disposition!=OrderResponseDisposition.Unknown)
+                throw new InvalidDataException("미확인 응답 형식은 접수 또는 거절 근거가 아닙니다.");
+            var ids=value.Layout==OrderResponseLayout.Legacy?new[]{value.Slot0OrderNumber}:new[]{value.Slot0OrderNumber,value.Slot1OrderNumber,value.Slot2OrderNumber};
+            var positive=ids.Where(LiveOrderProtocol.ValidBrokerNumber).Select(LiveOrderProtocol.BrokerNumberKey).Distinct(StringComparer.Ordinal).ToArray();
+            if(value.Disposition==OrderResponseDisposition.Accepted&&(value.ProviderError||value.ParseFailed
+                ||positive.Length!=1||positive[0]!=LiveOrderProtocol.BrokerNumberKey(value.BrokerOrderNumber)))
+                throw new InvalidDataException("주문 접수번호와 응답 근거가 일치하지 않습니다.");
+            if(value.Disposition==OrderResponseDisposition.Rejected&&(value.ParseFailed||value.BrokerOrderNumber.Length!=0
+                ||positive.Length!=0||!(ids.All(ResponseZero)||value.ProviderError)))
+                throw new InvalidDataException("거절 응답 근거가 일치하지 않습니다.");
+            if(value.Disposition==OrderResponseDisposition.Unknown&&value.BrokerOrderNumber.Length!=0)
+                throw new InvalidDataException("미확인 응답의 후보 번호는 접수번호가 아닙니다.");
         }
         public bool RecordExecution(string brokerOrderNumber,string executionId,int quantity,decimal price,DateTime utc) {
             return RecordExecutionCore(null,brokerOrderNumber,executionId,quantity,price,utc,false);
@@ -417,6 +458,10 @@ namespace ShinhanNativeTrader {
                 ||!value.Orders.Any(o=>o.Id==f.OrderId&&o.BrokerOrderNumber==f.BrokerOrderNumber&&o.TradingDate==f.TradingDate&&f.ExecutedUtc>=o.CreatedUtc)))
                 throw new InvalidDataException("손상된 증권사 체결 기록입니다.");
             foreach(var order in value.Orders) {
+                if(order.ResponseEvidence!=null) {
+                    if(!order.RequestId.HasValue)throw new InvalidDataException("주문 응답에 요청번호가 없습니다.");
+                    ValidateResponse(order.ResponseEvidence,order.RequestId.Value);
+                }
                 if(value.Executions.Where(f=>f.OrderId==order.Id).Sum(f=>f.Quantity)!=order.FilledQuantity
                     ||(order.Status==LiveOrderStatus.Filled&&Remaining(order)!=0)
                     ||(order.Status==LiveOrderStatus.PartiallyFilled&&(order.FilledQuantity==0||Remaining(order)==0))
@@ -437,6 +482,7 @@ namespace ShinhanNativeTrader {
         public string BrokerOrderNumber;
         public bool ProviderError;
         public bool ParseFailed;
+        public OrderResponseEvidence ResponseEvidence;
     }
     public interface ILiveOrderWire : IDisposable {
         event Action<LiveOrderAcknowledgement> Acknowledged;
@@ -447,12 +493,20 @@ namespace ShinhanNativeTrader {
     // login session or changes credentials/permissions on the user's behalf.
     public sealed class ComLiveOrderWire : ILiveOrderWire {
         readonly IIndiReadOnlyDispatch dispatch;readonly ComEventSubscriptions subscriptions;readonly int ownerThread;
+        readonly Func<LiveOrderIntent,OrderResponseLayout> layoutProvider;
+        readonly Func<IndiDiagnosticSnapshot> diagnosticsProvider;readonly Action<string> trace;
+        readonly Action<LiveOrderIntent,SortedDictionary<int,string>> configureFields;
+        readonly List<string> redactionValues=new List<string>();
+        OrderResponseLayout responseLayout=OrderResponseLayout.Unknown;
         bool disposed,busy;int? pendingId;readonly List<LiveOrderAcknowledgement> early=new List<LiveOrderAcknowledgement>();
         public event Action<LiveOrderAcknowledgement> Acknowledged;
-        public ComLiveOrderWire(object nativeControl) {
+        public ComLiveOrderWire(object nativeControl,Func<LiveOrderIntent,OrderResponseLayout> layoutProvider=null,
+            Func<IndiDiagnosticSnapshot> diagnosticsProvider=null,Action<string> trace=null,
+            Action<LiveOrderIntent,SortedDictionary<int,string>> configureFields=null) {
             if(nativeControl==null||!Marshal.IsComObject(nativeControl))throw new ArgumentException("An actual native Indi ActiveX control is required.");
             if(Thread.CurrentThread.GetApartmentState()!=ApartmentState.STA)throw new InvalidOperationException("Indi orders require an owning STA.");
             ownerThread=Thread.CurrentThread.ManagedThreadId;dispatch=(IIndiReadOnlyDispatch)nativeControl;
+            this.layoutProvider=layoutProvider;this.diagnosticsProvider=diagnosticsProvider;this.trace=trace;this.configureFields=configureFields;
             var source=ComTypeDiscovery.Discover(nativeControl);subscriptions=new ComEventSubscriptions(nativeControl,source.SourceInterface);
             try{subscriptions.AddInt32Callback(source.DispIds["ReceiveData"],source.ArgumentTypes["ReceiveData"],OnData);}catch{subscriptions.Dispose();throw;}
         }
@@ -461,9 +515,15 @@ namespace ShinhanNativeTrader {
             try {
                 LiveOrderSafety.EnsureAllowed(checks,credentials,utc);LiveOrderSafety.ValidatePreflight(intent,checks,utc,DateTime.SpecifyKind(DateTime.MinValue,DateTimeKind.Utc));
                 if(disposed)throw new ObjectDisposedException("ComLiveOrderWire");if(Thread.CurrentThread.ManagedThreadId!=ownerThread||busy)throw new InvalidOperationException("Indi order control is busy or outside its owning STA.");
-                busy=true;ownsPending=true;pendingId=null;early.Clear();
+                busy=true;ownsPending=true;pendingId=null;early.Clear();redactionValues.Clear();
+                redactionValues.Add(credentials.Account);redactionValues.Add(credentials.Password);
+                responseLayout=layoutProvider==null?OrderResponseLayout.Unknown:layoutProvider(intent);
+                if(responseLayout==OrderResponseLayout.Unknown||!Enum.IsDefined(typeof(OrderResponseLayout),responseLayout))
+                    throw new InvalidOperationException("Installed order response definition is not identified.");
+                var fields=LiveOrderProtocol.BuildFields(intent,credentials);
+                if(configureFields!=null)configureFields(intent,fields);
                 var query=LiveOrderProtocol.QueryName(intent);if(!dispatch.SetQueryName(query)||!string.Equals(Convert.ToString(dispatch.GetQueryName(),CultureInfo.InvariantCulture),query,StringComparison.OrdinalIgnoreCase))throw new InvalidOperationException("Indi order query selection failed.");
-                foreach(var field in LiveOrderProtocol.BuildFields(intent,credentials))if(!dispatch.SetSingleData(checked((short)field.Key),field.Value))throw new InvalidOperationException("Indi order input failed.");
+                foreach(var field in fields)if(!dispatch.SetSingleData(checked((short)field.Key),field.Value))throw new InvalidOperationException("Indi order input failed.");
                 // COM calls may pump the UI. A user stop/account change during
                 // input preparation must revoke permission before the side effect.
                 var dispatchUtc=DateTime.UtcNow;
@@ -473,7 +533,7 @@ namespace ShinhanNativeTrader {
                 int id=dispatch.RequestData();if(id<=0)throw new InvalidOperationException("Indi order submission did not return an accepted request ID.");
                 pendingId=id;var match=early.FirstOrDefault(a=>a.RequestId==id);early.Clear();if(match!=null)Emit(match);return id;
             }catch{
-                if(ownsPending){busy=false;pendingId=null;early.Clear();}
+                if(ownsPending){busy=false;pendingId=null;early.Clear();redactionValues.Clear();responseLayout=OrderResponseLayout.Unknown;}
                 if(!enteredRequestData)throw new LiveOrderNotSentException();
                 throw new InvalidOperationException("실주문 요청 실행 이후 응답을 확인할 수 없습니다. 증권사 주문·체결 대사가 필요합니다.");
             }
@@ -482,12 +542,31 @@ namespace ShinhanNativeTrader {
             if(disposed||!busy||Thread.CurrentThread.ManagedThreadId!=ownerThread)return;
             if(pendingId.HasValue&&pendingId.Value!=id)return;
             LiveOrderAcknowledgement acknowledgement;
-            try{acknowledgement=new LiveOrderAcknowledgement{RequestId=id,ProviderError=dispatch.GetErrorState()>0,BrokerOrderNumber=(Convert.ToString(dispatch.GetSingleData(0),CultureInfo.InvariantCulture)??"").Trim()};}
-            catch{acknowledgement=new LiveOrderAcknowledgement{RequestId=id,ParseFailed=true,BrokerOrderNumber=""};}
+            try {
+                // Snapshot provider status before field getters can replace the
+                // native diagnostic buffer, then copy every field in this callback.
+                var diagnostic=diagnosticsProvider==null?ReadDiagnostics():diagnosticsProvider();
+                var evidence=LiveOrderResponseParser.Read(id,index=>dispatch.GetSingleData(checked((short)index)),diagnostic,responseLayout,redactionValues);
+                acknowledgement=new LiveOrderAcknowledgement{RequestId=id,ProviderError=evidence.ProviderError,
+                    BrokerOrderNumber=evidence.BrokerOrderNumber,ParseFailed=evidence.ParseFailed,ResponseEvidence=evidence};
+            }catch{acknowledgement=new LiveOrderAcknowledgement{RequestId=id,ParseFailed=true,BrokerOrderNumber="",
+                ResponseEvidence=new OrderResponseEvidence{RequestId=id,Layout=OrderResponseLayout.Unknown,ParseFailed=true,SafeDiagnostic="OrderResponse: response evidence unavailable; provider text omitted."}};}
             if(!pendingId.HasValue){if(early.Count<16)early.Add(acknowledgement);return;}Emit(acknowledgement);
         }
-        void Emit(LiveOrderAcknowledgement value){busy=false;pendingId=null;if(Acknowledged!=null)Acknowledged(value);}
-        public void Dispose(){if(disposed)return;disposed=true;subscriptions.Dispose();early.Clear();}
+        IndiDiagnosticSnapshot ReadDiagnostics() {
+            var value=new IndiDiagnosticSnapshot();
+            try{value.ErrorState=dispatch.GetErrorState();}catch{}
+            try{value.ErrorCode=Convert.ToString(dispatch.GetErrorCode(),CultureInfo.InvariantCulture);}catch{}
+            try{value.Message=Convert.ToString(dispatch.GetErrorMessage(),CultureInfo.InvariantCulture);}catch{}
+            try{value.CommState=dispatch.GetCommState();}catch{}
+            return value;
+        }
+        void Emit(LiveOrderAcknowledgement value) {
+            busy=false;pendingId=null;redactionValues.Clear();responseLayout=OrderResponseLayout.Unknown;
+            try{if(trace!=null&&value.ResponseEvidence!=null)trace(value.ResponseEvidence.SafeDiagnostic);}catch{}
+            if(Acknowledged!=null)Acknowledged(value);
+        }
+        public void Dispose(){if(disposed)return;disposed=true;try{subscriptions.Dispose();}finally{early.Clear();redactionValues.Clear();responseLayout=OrderResponseLayout.Unknown;}}
     }
     public sealed class LiveOrderGateway : IDisposable {
         readonly LiveOrderJournal journal;readonly ILiveOrderWire wire;readonly Func<DateTime> clock;
@@ -549,7 +628,9 @@ namespace ShinhanNativeTrader {
             if(acknowledgement.RequestId!=pendingRequest.Value)return;
             var changedId=pendingOrder;
             try {
-                if(acknowledgement.ParseFailed)journal.MarkUnknown(pendingOrder,clock());
+                if(acknowledgement.ResponseEvidence!=null)
+                    journal.RecordAcknowledgement(pendingOrder,acknowledgement.RequestId,acknowledgement.BrokerOrderNumber,acknowledgement.ProviderError,clock(),acknowledgement.ResponseEvidence);
+                else if(acknowledgement.ParseFailed)journal.MarkUnknown(pendingOrder,clock());
                 else journal.RecordAcknowledgement(pendingOrder,acknowledgement.RequestId,acknowledgement.BrokerOrderNumber,acknowledgement.ProviderError,clock());
             }catch{try{journal.MarkUnknown(pendingOrder,clock());}catch{ /* StorageFault is latched. Never turn read/validation failure into rejection. */ }}
             pendingOrder=null;pendingRequest=null;pendingSince=null;early.Clear();

@@ -302,10 +302,115 @@ static class PremarketUiTests {
                 &&Get<object>(form,"entry")==null,"candidate status changes cannot queue or transmit an order without an order journal");
         }finally {Call(form,"DisposeRealtime");}
     }
+    sealed class NoOrderWire : ILiveOrderWire {
+        public int Sends;
+        public event Action<LiveOrderAcknowledgement> Acknowledged {add{} remove{}}
+        public int Send(LiveOrderIntent intent,LiveAccountCredentials credentials,LiveOrderPreflight checks,DateTime utc) {
+            Sends++;throw new InvalidOperationException("This UI fixture must never transmit even a synthetic order.");
+        }
+        public void Dispose(){}
+    }
+    static LiveOrderRecord RejectedSell(LiveOrderJournal journal,string code,string key,int requestId,bool evidence) {
+        var utc=Opening.AddSeconds(1);
+        var order=journal.Prepare(new LiveOrderIntent{Kind=LiveOrderKind.Sell,Code=code,Quantity=code=="069500"?2:8,
+            LimitPrice=code=="069500"?86295:13205,ClientKey=key},utc);
+        journal.MarkDispatching(order.Id,utc);journal.MarkRequestAccepted(order.Id,requestId,utc);
+        OrderResponseEvidence response=null;
+        if(evidence) {
+            var fields=new[]{"0","0","0","0","1","수량부족 계좌12345678901 암호1111","0","0"};
+            response=LiveOrderResponseParser.Read(requestId,index=>fields[index],new IndiDiagnosticSnapshot{ErrorState=1},
+                OrderResponseLayout.Modern,new[]{"12345678901","1111"});
+        }
+        journal.RecordAcknowledgement(order.Id,requestId,"0",true,utc,response);
+        return journal.Snapshot.Orders.Single(item=>item.Id==order.Id);
+    }
+    static void RejectedOrderStatus(string data) {
+        using(var form=NewForm()) {
+            var fixture=new Fixture(form);Bind(form);Get<UnattendedSession>(form,"session").Tick(Opening,false);
+            using(var journal=new LiveOrderJournal(Path.Combine(data,"ui-rejection-journal.xml"))) {
+                journal.BindAccount("12345678901");Set(form,"journal",journal);
+                var legacy=RejectedSell(journal,"069500","legacy-rejected",11,false);
+                var detailed=RejectedSell(journal,"305720","detailed-rejected",12,true);
+                var identified=journal.Prepare(new LiveOrderIntent{Kind=LiveOrderKind.Sell,Code="035420",Quantity=1,LimitPrice=70000,ClientKey="identified-rejected"},Opening.AddSeconds(1));
+                journal.MarkDispatching(identified.Id,Opening.AddSeconds(1));journal.MarkRequestAccepted(identified.Id,13,Opening.AddSeconds(1));
+                journal.RecordAcknowledgement(identified.Id,13,"777",false,Opening.AddSeconds(1));
+                journal.RecordBrokerRejection("777",MarketTime.ToKorea(Opening).ToString("yyyyMMdd",CultureInfo.InvariantCulture),"09",Opening.AddSeconds(1));
+                var unknown=journal.Prepare(new LiveOrderIntent{Kind=LiveOrderKind.Sell,Code="005930",Quantity=1,LimitPrice=70000,ClientKey="unknown-order"},Opening.AddSeconds(1));
+                journal.MarkUnknown(unknown.Id,Opening.AddSeconds(1));
+                var wire=new NoOrderWire();Set(form,"gateway",new LiveOrderGateway(journal,wire));
+                Set(form,"readiness",new BrokerReadiness(Get<string>(form,"boundKey"),journal.Snapshot.AccountFingerprint));
+                Call(form,"RefreshOrders");var grid=Get<DataGridView>(form,"ordersGrid");
+                Check(grid.Columns.Count==10&&grid.Columns.Contains("응답 사유"),"order grid exposes a separate response-reason column");
+                var rows=grid.Rows.Cast<DataGridViewRow>().ToDictionary(row=>((LiveOrderRecord)row.Tag).Id,StringComparer.Ordinal);
+                Check(Convert.ToString(rows[legacy.Id].Cells["주문번호"].Value,CultureInfo.InvariantCulture)=="접수 거절"
+                    &&Convert.ToString(rows[legacy.Id].Cells["미체결"].Value,CultureInfo.InvariantCulture)=="해당 없음",
+                    "a local rejection without a broker order number is not displayed as a working unfilled order");
+                Check(Convert.ToString(rows[legacy.Id].Cells["응답 사유"].Value,CultureInfo.InvariantCulture)=="이전 버전: 상세 응답 미기록",
+                    "historical rejected records explicitly identify absent response diagnostics");
+                string reason=Convert.ToString(rows[detailed.Id].Cells["응답 사유"].Value,CultureInfo.InvariantCulture);
+                Check(reason.Contains("수량부족")&&!reason.Contains("12345678901")&&!reason.Contains("1111"),
+                    "actual order row displays the stored rejection explanation with credentials redacted");
+                grid.ClearSelection();grid.CurrentCell=rows[detailed.Id].Cells[0];rows[detailed.Id].Selected=true;
+                var details=Get<TextBox>(form,"orderResponseDetails");
+                Check(details.ReadOnly&&details.Multiline&&details.Text==reason&&details.Text.Contains("수량부족"),
+                    "selecting a rejection exposes its complete sanitized explanation in the read-only details area");
+                Check(Convert.ToString(rows[identified.Id].Cells["주문번호"].Value,CultureInfo.InvariantCulture)=="777"
+                    &&Convert.ToString(rows[identified.Id].Cells["확인상태"].Value,CultureInfo.InvariantCulture)=="거절",
+                    "a later rejection preserves an already identified broker order number");
+                Check(Convert.ToString(rows[unknown.Id].Cells["주문번호"].Value,CultureInfo.InvariantCulture)!="접수 거절"
+                    &&Convert.ToString(rows[unknown.Id].Cells["확인상태"].Value,CultureInfo.InvariantCulture)=="결과 불명",
+                    "unknown order evidence remains visually distinct from a definite rejection");
+                grid.ClearSelection();grid.CurrentCell=rows[unknown.Id].Cells[0];rows[unknown.Id].Selected=true;
+                bool refused=false;try{Call(form,"RetrySelectedRejectedSellAt",Opening.AddSeconds(1));}catch(InvalidOperationException){refused=true;}
+                Check(refused&&Get<object>(form,"entry")==null&&wire.Sends==0&&journal.Snapshot.Orders.Count==4,
+                    "selecting an unknown order cannot retry it or create a new journal record");
+                Check(fixture.Wire.Queries.Count==1,"displaying and refusing uncertain order retries requests no additional broker query");
+                Close(form,data);
+            }
+        }
+    }
+    static void RejectedSellQueue(string data) {
+        using(var form=NewForm()) {
+            var fixture=new Fixture(form);Bind(form);Get<UnattendedSession>(form,"session").Tick(Opening,false);
+            using(var journal=new LiveOrderJournal(Path.Combine(data,"ui-retry-journal.xml"))) {
+                journal.BindAccount("12345678901");Set(form,"journal",journal);
+                var previous=RejectedSell(journal,"069500","original-rejected-sell",21,true);
+                var wire=new NoOrderWire();Set(form,"gateway",new LiveOrderGateway(journal,wire));
+                Set(form,"readiness",new BrokerReadiness(Get<string>(form,"boundKey"),journal.Snapshot.AccountFingerprint));
+                var trade=CashProfileSnapshot(false);var ordinary=CashProfileSnapshot(true);var utc=Opening.AddSeconds(1);
+                foreach(var source in new[]{trade,ordinary}){source.RequestStartedUtc=utc.AddMilliseconds(-10);source.ReceivedUtc=utc;}
+                Set(form,"tradeHoldings",trade);Set(form,"ordinaryHoldings",ordinary);Get<List<Holding>>(form,"holdings").AddRange(trade.Holdings);
+                Get<Dictionary<string,CashInstrument>>(form,"instruments")["069500"]=new CashInstrument{Code="069500",Market="0",Product="EF"};
+                var fields=new Dictionary<int,object>{{1,"069500"},{2,"090000"},{3,"86295"},{7,"100"},{17,"1"}};
+                var processor=new RealtimeEventProcessor(index=>fields[index]);processor.Track("069500");processor.Process("SC",Opening);
+                fields[2]="090001";fields[7]="101";processor.Process("SC",utc);
+                var realtime=(RealtimeIndi)FormatterServices.GetUninitializedObject(typeof(RealtimeIndi));
+                Set(realtime,"processor",processor);Set(realtime,"watch",new HashSet<string>(StringComparer.Ordinal){"069500"});Set(realtime,"native",new object());
+                Set(form,"realtime",realtime);Get<HashSet<string>>(form,"trackedQuotes").Add("069500");
+                Call(form,"RefreshOrders");var grid=Get<DataGridView>(form,"ordersGrid");grid.ClearSelection();grid.CurrentCell=grid.Rows[0].Cells[0];grid.Rows[0].Selected=true;
+                Call(form,"RetrySelectedRejectedSellAt",utc);
+                var pending=Get<object>(form,"entry");
+                var intent=pending==null?null:(LiveOrderIntent)pending.GetType().GetField("Intent").GetValue(pending);
+                Check(intent!=null&&intent.ClientKey.StartsWith("retry-"+previous.Id+"-",StringComparison.Ordinal)
+                    &&intent.ClientKey!=previous.ClientKey&&intent.Kind==LiveOrderKind.Sell&&intent.Code=="069500"&&intent.Quantity==2&&intent.LimitPrice==86295,
+                    "selected definite rejection creates a distinct retry intent using current holdings and confirmed quote");
+                var reads=(Queue<string>)pending.GetType().GetField("Reads").GetValue(pending);
+                Check(new[]{"BARS","ORDINARYHOLDINGS","TRADEHOLDINGS","CASH","ORDERS"}.All(reads.Contains),
+                    "manual retry queues fresh price account classification cash and broker-order preflight instead of reusing old approval evidence");
+                Check(journal.Snapshot.Orders.Count==1&&journal.Snapshot.Orders.Single().Id==previous.Id
+                    &&journal.Snapshot.Orders.Single().Status==LiveOrderStatus.Rejected&&wire.Sends==0&&fixture.Wire.Queries.Count==1,
+                    "queueing a manual retry preserves rejected audit history and transmits no order or additional query");
+                bool refused=false;try{Call(form,"RetrySelectedRejectedSellAt",utc);}catch(InvalidOperationException){refused=true;}
+                Check(refused&&ReferenceEquals(Get<object>(form,"entry"),pending)&&wire.Sends==0,
+                    "repeated retry clicks cannot replace an already queued preflight or transmit an order");
+                Close(form,data);
+            }
+        }
+    }
 
     static void Run(string data,string screenshot) {
         using(var form=NewForm()) {
-            Check(form.Text.Contains("2.2.3"),"premarket regression runs against version 2.2.3");
+            Check(form.Text.Contains("2.2.4"),"premarket regression runs against version 2.2.4");
             Check(!Get<LiveTradingSession>(form,"authorization").Active,"application startup never authorizes live orders");
             var fixture=new Fixture(form);Bind(form);
             Call(form,"BeginResearch",Opening.AddHours(-10),false);
@@ -417,6 +522,8 @@ static class PremarketUiTests {
         }
         RealtimeStatus(data);
         OrdinarySourceStatus(data);
+        RejectedOrderStatus(data);
+        RejectedSellQueue(data);
     }
 
     [STAThread] static int Main(string[] arguments) {

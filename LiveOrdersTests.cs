@@ -332,6 +332,59 @@ namespace ShinhanNativeTrader {
                     Check(wire.Sends==1,"broker-zero rejection cannot create a second transport call with the same key");
                     Reject(()=>journal.RecordNotSent(rejected.Id,Utc()),"broker rejection with an accepted request cannot be rewritten to free the original key");
                 }
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"modern-krx-response.xml")))using(var wire=new FakeWire())using(var gateway=new LiveOrderGateway(journal,wire,()=>Utc())) {
+                    var slots=new object[]{"0","00008222","0","9000","0","100000","20","0"};
+                    var evidence=LiveOrderResponseParser.Read(7,index=>slots[index],new IndiDiagnosticSnapshot{ErrorState=0},OrderResponseLayout.Modern,new[]{credentials.Account,credentials.Password});
+                    wire.DuringSend=()=>wire.Emit(new LiveOrderAcknowledgement{RequestId=7,BrokerOrderNumber=evidence.BrokerOrderNumber,ResponseEvidence=evidence});
+                    var accepted=gateway.Submit(Buy(),credentials,Authorized(Utc(),credentials),Utc());
+                    Check(accepted.Status==LiveOrderStatus.Working&&accepted.BrokerOrderNumber=="00008222","identified modern response accepts its KRX identity even when the SOR slot is zero");
+                    Check(accepted.ResponseEvidence.Layout==OrderResponseLayout.Modern&&accepted.ResponseEvidence.Slot0OrderNumber=="0"&&accepted.ResponseEvidence.Slot1OrderNumber=="00008222","journal retains actual response layout and separate candidate identifiers");
+                    Check(accepted.FilledQuantity==0&&journal.Snapshot.Executions.Count==0,"modern acknowledgement still supplies no execution evidence");
+                    evidence.Slot1OrderNumber="00009999";evidence.SafeDiagnostic="CHANGED";
+                    var stored=journal.Snapshot.Orders.Single();
+                    Check(stored.ResponseEvidence.Slot1OrderNumber=="00008222"&&stored.ResponseEvidence.SafeDiagnostic!="CHANGED","caller changes cannot mutate the response copied into the durable journal");
+                    stored.ResponseEvidence.Slot1OrderNumber="00001111";
+                    Check(journal.Snapshot.Orders.Single().ResponseEvidence.Slot1OrderNumber=="00008222","snapshot callers also receive detached response evidence");
+                }
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"unknown-layout-response.xml")))using(var wire=new FakeWire())using(var gateway=new LiveOrderGateway(journal,wire,()=>Utc())) {
+                    var slots=new object[]{"0","00008333","0","9001","0","","",""};
+                    var evidence=LiveOrderResponseParser.Read(7,index=>slots[index],new IndiDiagnosticSnapshot{ErrorState=0},OrderResponseLayout.Unknown,new[]{credentials.Account,credentials.Password});
+                    wire.DuringSend=()=>wire.Emit(new LiveOrderAcknowledgement{RequestId=7,BrokerOrderNumber="0",ResponseEvidence=evidence});
+                    var unknown=gateway.Submit(Buy(),credentials,Authorized(Utc(),credentials),Utc());
+                    Check(unknown.Status==LiveOrderStatus.Unknown&&journal.RecoveryRequired&&string.IsNullOrEmpty(unknown.BrokerOrderNumber),"unidentified zero-SOR response is unresolved rather than declared rejected");
+                    Check(unknown.ResponseEvidence.Slot1OrderNumber=="00008333"&&unknown.ResponseEvidence.Disposition==OrderResponseDisposition.Unknown,"possible exchange identity remains separate evidence for reconciliation");
+                    Reject(()=>gateway.Submit(Buy("new-key"),credentials,Authorized(Utc(),credentials),Utc()),"changing the strategy key cannot bypass an unresolved response layout");
+                    Check(wire.Sends==1,"unresolved modern or legacy identity does not produce an automatic second request");
+                }
+                var responsePath=Path.Combine(directory,"rejected-response-diagnostics.xml");
+                using(var journal=new LiveOrderJournal(responsePath))using(var wire=new FakeWire())using(var gateway=new LiveOrderGateway(journal,wire,()=>Utc())) {
+                    var slots=new object[]{"0","0","0","9002","1","0","0","0"};
+                    var diagnostic=new IndiDiagnosticSnapshot{ErrorState=0,ErrorCode="INPUT37",Message="주문방식 확인 "+credentials.Account+" "+credentials.Password};
+                    var evidence=LiveOrderResponseParser.Read(7,index=>slots[index],diagnostic,OrderResponseLayout.Modern,new[]{credentials.Account,credentials.Password});
+                    wire.DuringSend=()=>wire.Emit(new LiveOrderAcknowledgement{RequestId=7,ResponseEvidence=evidence});
+                    var rejected=gateway.Submit(Buy(),credentials,Authorized(Utc(),credentials),Utc());
+                    Check(rejected.Status==LiveOrderStatus.Rejected&&!journal.RecoveryRequired,"identified all-zero venue response is retained as explicit rejection");
+                    Check(rejected.ResponseEvidence.SafeDiagnostic.Contains("INPUT37")&&rejected.ResponseEvidence.SafeDiagnostic.Contains("주문방식"),"broker response code and redacted explanation survive the journal transition");
+                    var responseXml=File.ReadAllText(responsePath);
+                    Check(!responseXml.Contains(credentials.Account)&&!responseXml.Contains(credentials.Password)&&responseXml.Contains("ResponseEvidence"),"durable response diagnostics contain no account credentials");
+                }
+                using(var journal=new LiveOrderJournal(responsePath)) {
+                    var rejected=journal.Snapshot.Orders.Single();
+                    Check(rejected.Status==LiveOrderStatus.Rejected&&rejected.ResponseEvidence.Layout==OrderResponseLayout.Modern
+                        &&rejected.ResponseEvidence.SafeDiagnostic.Contains("INPUT37"),"restart preserves the identified response and its safe rejection diagnostic");
+                }
+                using(var journal=new LiveOrderJournal(Path.Combine(directory,"malformed-response-evidence.xml"))) {
+                    var order=journal.Prepare(Buy(),Utc());journal.MarkDispatching(order.Id,Utc());journal.MarkRequestAccepted(order.Id,7,Utc());
+                    var evidence=new OrderResponseEvidence{RequestId=7,Layout=OrderResponseLayout.Unknown,Disposition=OrderResponseDisposition.Accepted,BrokerOrderNumber="123",Slot0OrderNumber="123",SafeDiagnostic="safe"};
+                    Reject(()=>journal.RecordAcknowledgement(order.Id,7,"123",false,Utc(),evidence),"unknown schema cannot be forged into an accepted journal response");
+                    evidence.Layout=OrderResponseLayout.Legacy;evidence.SafeDiagnostic="line1\nline2";
+                    Reject(()=>journal.RecordAcknowledgement(order.Id,7,"123",false,Utc(),evidence),"journal refuses unformatted multiline response diagnostics");
+                    evidence.SafeDiagnostic="safe";evidence.RequestId=8;
+                    Reject(()=>journal.RecordAcknowledgement(order.Id,7,"123",false,Utc(),evidence),"response evidence must match the actual accepted request identifier");
+                    evidence.RequestId=7;evidence.Slot0OrderNumber="456";
+                    Reject(()=>journal.RecordAcknowledgement(order.Id,7,"123",false,Utc(),evidence),"accepted canonical order identity must be present in the selected layout's exchange slots");
+                    Check(journal.Snapshot.Orders.Single().Status==LiveOrderStatus.AwaitingAcknowledgement&&journal.Snapshot.Orders.Single().ResponseEvidence==null,"invalid response evidence cannot partially replace durable pending state");
+                }
                 var notSentPath=Path.Combine(directory,"not-sent-persisted.xml");
                 using(var journal=new LiveOrderJournal(notSentPath))using(var wire=new FakeWire())using(var gateway=new LiveOrderGateway(journal,wire,()=>Utc())) {
                     int notifications=0;gateway.OrderChanged+=order=>{if(order.Status==LiveOrderStatus.NotSent)notifications++;};

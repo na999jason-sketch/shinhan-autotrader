@@ -118,6 +118,7 @@ namespace ShinhanNativeTrader {
         // Exposed only to the separate owned order connection below. Ordinary
         // query callers cannot obtain the native RCW or widen the read allowlist.
         internal object NativeControl {get{if(disposed)throw new ObjectDisposedException("ComIndiTransport");return com;}}
+        internal string InstalledStarterPath {get;private set;}
         public event Action<int> ReceiveData;
         public event Action<int> ReceiveSysMsg;
         public event Action<string> Error;
@@ -140,6 +141,7 @@ namespace ShinhanNativeTrader {
                     throw new IndiConnectionException("설치된 Indi의 StartIndi 초기화 서명이 지원되지 않습니다.");
                 string starter=IndiInstallation.FindStarter(Type.GetTypeFromProgID("GIEXPERTCONTROL.GiExpertControlCtrl.1",true).GUID);
                 if(starter==null)throw new IndiConnectionException("등록된 신한 Indi 설치 폴더에서 giexpertstarter.exe를 찾지 못했습니다.");
+                InstalledStarterPath=starter;
                 log(IndiInstallation.DescribeBalanceSchema(starter));
                 // A running Helper establishes the shared service, not this newly-created
                 // OCX instance. Follow the C# sample's per-control initialization call.
@@ -526,15 +528,38 @@ namespace ShinhanNativeTrader {
     internal sealed class IndiLiveOrderConnection : ILiveOrderWire {
         readonly Control surface;readonly Action<string> log;
         ComIndiTransport owner;ComLiveOrderWire wire;bool disposed;
+        IndiOrderSchemaInfo activeSchema;string activeQuery,lastSchemaDiagnostic;
         public event Action<LiveOrderAcknowledgement> Acknowledged;
         public IndiLiveOrderConnection(Control surface,Action<string> log){this.surface=surface;this.log=log;PrepareChannel();}
         void PrepareChannel() {
             // Site/initialize the dedicated control before collecting a short-lived
             // order preflight. Initialization itself does not submit any order.
             try {
-                owner=new ComIndiTransport(surface,log);wire=new ComLiveOrderWire(owner.NativeControl);
+                owner=new ComIndiTransport(surface,log);
+                InspectSchema("SABA101U1");InspectSchema("SABA102U1");
+                wire=new ComLiveOrderWire(owner.NativeControl,SelectLayout,owner.ReadDiagnostics,null,ConfigureFields);
                 wire.Acknowledged+=Forward;
             }catch{if(wire!=null){wire.Dispose();wire=null;}if(owner!=null){owner.Dispose();owner=null;}throw;}
+        }
+        IndiOrderSchemaInfo InspectSchema(string query) {
+            var info=IndiOrderSchema.ReadInstalled(owner.InstalledStarterPath,query);
+            if(info.Diagnostic!=lastSchemaDiagnostic){lastSchemaDiagnostic=info.Diagnostic;if(log!=null)log(info.Diagnostic);}
+            return info;
+        }
+        OrderResponseLayout SelectLayout(LiveOrderIntent intent) {
+            activeQuery=LiveOrderProtocol.QueryName(intent);activeSchema=InspectSchema(activeQuery);
+            return activeSchema.Kind==IndiOrderSchemaKind.Legacy?OrderResponseLayout.Legacy:
+                activeSchema.Kind==IndiOrderSchemaKind.Modern?OrderResponseLayout.Modern:OrderResponseLayout.Unknown;
+        }
+        void ConfigureFields(LiveOrderIntent intent,SortedDictionary<int,string> fields) {
+            if(activeSchema==null||activeQuery!=LiveOrderProtocol.QueryName(intent)||activeSchema.Kind==IndiOrderSchemaKind.Unknown)
+                throw new InvalidOperationException("설치된 주문 정의를 확인할 수 없습니다.");
+            if(activeSchema.Kind==IndiOrderSchemaKind.Legacy)return;
+            if(!activeSchema.KrxRouteInputIndex.HasValue||string.IsNullOrEmpty(activeSchema.KrxRouteCode)) {
+                if(log!=null)log("주문 전 중단: 설치된 신형 주문 정의의 KRX 전송 코드가 확인되지 않았습니다. 주문 정의 진단을 확인하십시오.");
+                throw new InvalidOperationException("설치된 주문 방식 코드가 확인되지 않았습니다.");
+            }
+            fields[activeSchema.KrxRouteInputIndex.Value]=activeSchema.KrxRouteCode;
         }
         public int Send(LiveOrderIntent intent,LiveAccountCredentials credentials,LiveOrderPreflight checks,DateTime utc) {
             try {
@@ -544,7 +569,13 @@ namespace ShinhanNativeTrader {
             }catch{throw new LiveOrderNotSentException();}
             return wire.Send(intent,credentials,checks,utc);
         }
-        void Forward(LiveOrderAcknowledgement reply){if(Acknowledged!=null)Acknowledged(reply);}
+        void Forward(LiveOrderAcknowledgement reply){
+            if(activeSchema!=null&&activeSchema.Kind==IndiOrderSchemaKind.Modern&&reply.ResponseEvidence!=null) {
+                LiveOrderResponseParser.RequireKrxRoute(reply.ResponseEvidence);
+                reply.BrokerOrderNumber=reply.ResponseEvidence.BrokerOrderNumber;
+            }
+            if(Acknowledged!=null)Acknowledged(reply);
+        }
         public void Dispose() {
             if(disposed)return;disposed=true;
             try {if(wire!=null){wire.Acknowledged-=Forward;wire.Dispose();wire=null;}}
