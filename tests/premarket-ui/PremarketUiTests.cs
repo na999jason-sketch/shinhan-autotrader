@@ -302,9 +302,10 @@ static class PremarketUiTests {
                 &&Get<object>(form,"entry")==null,"candidate status changes cannot queue or transmit an order without an order journal");
         }finally {Call(form,"DisposeRealtime");}
     }
-    sealed class NoOrderWire : ILiveOrderWire {
-        public int Sends;
+    sealed class NoOrderWire : ILiveOrderWire,ILiveOrderChannelPreparation {
+        public int Sends,Preparations;
         public event Action<LiveOrderAcknowledgement> Acknowledged {add{} remove{}}
+        public void PrepareChannel(){Preparations++;}
         public int Send(LiveOrderIntent intent,LiveAccountCredentials credentials,LiveOrderPreflight checks,DateTime utc) {
             Sends++;throw new InvalidOperationException("This UI fixture must never transmit even a synthetic order.");
         }
@@ -362,7 +363,7 @@ static class PremarketUiTests {
                     "unknown order evidence remains visually distinct from a definite rejection");
                 grid.ClearSelection();grid.CurrentCell=rows[unknown.Id].Cells[0];rows[unknown.Id].Selected=true;
                 bool refused=false;try{Call(form,"RetrySelectedRejectedSellAt",Opening.AddSeconds(1));}catch(InvalidOperationException){refused=true;}
-                Check(refused&&Get<object>(form,"entry")==null&&wire.Sends==0&&journal.Snapshot.Orders.Count==4,
+                Check(refused&&Get<object>(form,"entry")==null&&wire.Sends==0&&wire.Preparations==0&&journal.Snapshot.Orders.Count==4,
                     "selecting an unknown order cannot retry it or create a new journal record");
                 Check(fixture.Wire.Queries.Count==1,"displaying and refusing uncertain order retries requests no additional broker query");
                 Close(form,data);
@@ -376,6 +377,7 @@ static class PremarketUiTests {
                 journal.BindAccount("12345678901");Set(form,"journal",journal);
                 var previous=RejectedSell(journal,"069500","original-rejected-sell",21,true);
                 var wire=new NoOrderWire();Set(form,"gateway",new LiveOrderGateway(journal,wire));
+                Check(wire.Preparations==0&&wire.Sends==0,"constructing the order gateway does not initialize or send through its order channel");
                 Set(form,"readiness",new BrokerReadiness(Get<string>(form,"boundKey"),journal.Snapshot.AccountFingerprint));
                 var trade=CashProfileSnapshot(false);var ordinary=CashProfileSnapshot(true);var utc=Opening.AddSeconds(1);
                 foreach(var source in new[]{trade,ordinary}){source.RequestStartedUtc=utc.AddMilliseconds(-10);source.ReceivedUtc=utc;}
@@ -398,19 +400,62 @@ static class PremarketUiTests {
                 Check(new[]{"BARS","ORDINARYHOLDINGS","TRADEHOLDINGS","CASH","ORDERS"}.All(reads.Contains),
                     "manual retry queues fresh price account classification cash and broker-order preflight instead of reusing old approval evidence");
                 Check(journal.Snapshot.Orders.Count==1&&journal.Snapshot.Orders.Single().Id==previous.Id
-                    &&journal.Snapshot.Orders.Single().Status==LiveOrderStatus.Rejected&&wire.Sends==0&&fixture.Wire.Queries.Count==1,
+                    &&journal.Snapshot.Orders.Single().Status==LiveOrderStatus.Rejected&&wire.Sends==0&&wire.Preparations==1&&fixture.Wire.Queries.Count==1,
                     "queueing a manual retry preserves rejected audit history and transmits no order or additional query");
                 bool refused=false;try{Call(form,"RetrySelectedRejectedSellAt",utc);}catch(InvalidOperationException){refused=true;}
-                Check(refused&&ReferenceEquals(Get<object>(form,"entry"),pending)&&wire.Sends==0,
+                Check(refused&&ReferenceEquals(Get<object>(form,"entry"),pending)&&wire.Sends==0&&wire.Preparations==1,
                     "repeated retry clicks cannot replace an already queued preflight or transmit an order");
                 Close(form,data);
             }
         }
     }
+    sealed class DeferredReadTransport : IIndiTransport,IIndiDiagnostics {
+        public event Action<int> ReceiveData;
+        public event Action<int> ReceiveSysMsg {add{} remove{}}
+        public event Action<string> Error {add{} remove{}}
+        public int Requests;bool completed;string query;
+        public IndiDiagnosticSnapshot ReadDiagnostics(){return new IndiDiagnosticSnapshot{ErrorState=completed?0:Requests==1?1:Requests==0?0:2,ErrorCode=Requests==1?"GI004":""};}
+        public object Invoke(string method,params object[] arguments) {
+            if(method=="SetQueryName"){query=(string)arguments[0];if(query!="SABA609Q1")throw new InvalidOperationException("Only a synthetic read-only balance query is supported.");return true;}
+            if(method=="GetQueryName")return query;
+            if(method=="SetSingleData")return true;
+            if(method=="RequestData"){Requests++;return Requests==1?(short)0:(short)41;}
+            if(method=="GetMultiRowCount")return 0;
+            if(method=="GetSingleData")return (int)arguments[0]==0?MarketTime.NowKorea.ToString("yyyyMMdd",CultureInfo.InvariantCulture):"";
+            throw new InvalidOperationException("Unsupported synthetic read-only provider method: "+method);
+        }
+        public void Complete(){completed=true;if(ReceiveData!=null)ReceiveData(41);}
+        public void Dispose(){}
+    }
+    static void DeferredReadStatus(string data) {
+        using(var form=NewForm()) {
+            var wire=new DeferredReadTransport();var requests=new IndiRequestCoordinator(wire);
+            var api=new IndiApi(Get<Panel>(form,"nativeArea"));Set(api,"requests",requests);Set(api,"hasReceivedData",true);Set(form,"api",api);
+            int received=0;requests.Fatal+=message=>{throw new InvalidOperationException("Synthetic read-only retry failed: "+message);};
+            requests.Done+=reply=>{received++;Get<Timer>(api,"timeout").Stop();Call(form,"Reply",reply);};
+            var before=DateTime.UtcNow;
+            Check(api.TradeHoldings("12345678901","1111")&&api.Busy&&wire.Requests==1&&received==0,
+                "an unaccepted GI004 balance read remains pending without inventing a holdings response");
+            Schedule(form,before.AddMilliseconds(200));
+            Check(wire.Requests==1&&api.Busy&&received==0,"actual form scheduler respects the read-only retry delay while the API is busy");
+            Schedule(form,before.AddSeconds(2));
+            Check(wire.Requests==2&&api.Busy&&received==0,"actual form scheduler polls and dispatches the deferred read before its busy-API return");
+            wire.Complete();
+            var source=Get<BrokerHoldingsSnapshot>(form,"tradeHoldings");
+            Check(received==1&&!api.Busy&&source!=null&&source.RequestBasisVerified&&source.BasisVerified&&source.Holdings.Count==0,
+                "only the accepted retry callback updates the actual form with verified synthetic balance data");
+            Schedule(form,before.AddSeconds(3));
+            Check(wire.Requests==2&&received==1,"later scheduler ticks do not repeat a completed read-only retry");
+            Check(Get<LiveOrderGateway>(form,"gateway")==null&&Get<LiveOrderJournal>(form,"journal")==null&&Get<RealtimeIndi>(form,"realtime")==null
+                &&Get<object>(form,"entry")==null&&Get<object>(form,"credentials")==null,"deferred read-only retry initializes no order channel account session or order intent");
+            Close(form,data);
+        }
+    }
 
     static void Run(string data,string screenshot) {
         using(var form=NewForm()) {
-            Check(form.Text.Contains("2.2.4"),"premarket regression runs against version 2.2.4");
+            Check(form.Text.Contains("2.2.5"),"premarket regression runs against version 2.2.5");
+            Check(All(form).OfType<Button>().Any(button=>button.Text=="조회 정의 내보내기"),"static query-definition export is available without invoking registry COM or provider queries");
             Check(!Get<LiveTradingSession>(form,"authorization").Active,"application startup never authorizes live orders");
             var fixture=new Fixture(form);Bind(form);
             Call(form,"BeginResearch",Opening.AddHours(-10),false);
@@ -524,6 +569,7 @@ static class PremarketUiTests {
         OrdinarySourceStatus(data);
         RejectedOrderStatus(data);
         RejectedSellQueue(data);
+        DeferredReadStatus(data);
     }
 
     [STAThread] static int Main(string[] arguments) {

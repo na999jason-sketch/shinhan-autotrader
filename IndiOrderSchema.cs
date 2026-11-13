@@ -12,6 +12,12 @@ namespace ShinhanNativeTrader {
 
     public sealed class IndiOrderSchemaInfo {
         public IndiOrderSchemaKind Kind {get;internal set;}
+        public string QueryName {get;internal set;}
+        public int SizeBytes {get;internal set;}
+        public string FailureCode {get;internal set;}
+        public string ParseStage {get;internal set;}
+        public int ParseOffset {get;internal set;}
+        public string HelperSource {get;internal set;}
         public int InputCount {get;internal set;}
         public int OutputCount {get;internal set;}
         public string Sha256 {get;internal set;}
@@ -28,22 +34,43 @@ namespace ShinhanNativeTrader {
         static readonly Encoding Unicode=new UnicodeEncoding(false,false,true);
         static string Canonical(string value){return (value??"").Replace(" ","").Replace("메시지","메세지");}
         static bool Query(string value){return value=="SABA101U1"||value=="SABA102U1";}
-        static IndiOrderSchemaInfo Unknown(string code){return new IndiOrderSchemaInfo{Kind=IndiOrderSchemaKind.Unknown,Diagnostic="Order schema: "+code};}
+        static IndiOrderSchemaInfo Unknown(string query,string code,string stage,int size=0) {
+            var result=new IndiOrderSchemaInfo{Kind=IndiOrderSchemaKind.Unknown,QueryName=Query(query)?query:"Unknown",SizeBytes=size,
+                FailureCode=code,ParseStage=stage,HelperSource="Absent"};Describe(result);return result;
+        }
+        static void Describe(IndiOrderSchemaInfo result) {
+            result.Diagnostic="Order schema: "+result.QueryName+"; status="+result.FailureCode+"; kind="+result.Kind
+                +"; bytes="+result.SizeBytes.ToString(CultureInfo.InvariantCulture)+"; SHA256="+(result.Sha256??"Unavailable")
+                +"; stage="+result.ParseStage+"; offset="+result.ParseOffset.ToString(CultureInfo.InvariantCulture)
+                +"; inputs="+result.InputCount.ToString(CultureInfo.InvariantCulture)+"; outputs="+result.OutputCount.ToString(CultureInfo.InvariantCulture)
+                +"; helper="+result.HelperSource+"; KRX route="+(result.KrxRouteCode==null?"Unverified":"Verified");
+        }
 
         public static IndiOrderSchemaInfo ReadInstalled(string starterPath,string queryName) {
             try {
                 if(!Query(queryName)||string.IsNullOrWhiteSpace(starterPath)||!Path.IsPathRooted(starterPath)
-                    ||starterPath.IndexOf('"')>=0||starterPath.Any(char.IsControl))return Unknown("Unavailable");
+                    ||starterPath.IndexOf('"')>=0||starterPath.Any(char.IsControl))return Unknown(queryName,"Unavailable","Starter");
                 string starter=Path.GetFullPath(starterPath);
                 if(!string.Equals(Path.GetFileName(starter),IndiInstallation.StarterFileName,StringComparison.OrdinalIgnoreCase)
-                    ||!File.Exists(starter))return Unknown("Unavailable");
+                    ||!File.Exists(starter))return Unknown(queryName,"Unavailable","Starter");
                 string root=Path.GetDirectoryName(starter);
                 var data=ReadBounded(Path.Combine(root,"qry",queryName.ToLowerInvariant()+".xtr"));
-                byte[] helper=null;
-                try{helper=ReadBounded(Path.Combine(root,"config","helpertrinfo.dat"));}catch{}
-                return Inspect(data,queryName,helper);
-            }catch{return Unknown("Unavailable");}
+                byte[] primary=OptionalRead(Path.Combine(root,"qry","config","helpertrinfo.dat"));
+                byte[] legacy=OptionalRead(Path.Combine(root,"config","helpertrinfo.dat"));
+                var result=Inspect(data,queryName,primary??legacy);
+                result.HelperSource=primary!=null?"Primary":legacy!=null?"Legacy":"Absent";
+                if(primary!=null&&legacy!=null) {
+                    var legacyResult=Inspect(data,queryName,legacy);
+                    if(result.KrxRouteCode!=null&&legacyResult.KrxRouteCode!=null&&
+                        (result.KrxRouteInputIndex!=legacyResult.KrxRouteInputIndex||result.KrxRouteCode!=legacyResult.KrxRouteCode)) {
+                        result.KrxRouteInputIndex=null;result.KrxRouteCode=null;result.HelperSource="Conflict";
+                    }
+                }
+                Describe(result);return result;
+            }catch{return Unknown(queryName,"Unavailable","ReadDefinition");}
         }
+
+        static byte[] OptionalRead(string path){try{return ReadBounded(path);}catch{return null;}}
 
         static byte[] ReadBounded(string path) {
             using(var input=new FileStream(path,FileMode.Open,FileAccess.Read,FileShare.Read)) {
@@ -55,28 +82,33 @@ namespace ShinhanNativeTrader {
         }
 
         public static IndiOrderSchemaInfo Inspect(byte[] bytes,string queryName,byte[] helperBytes=null) {
-            if(!Query(queryName)||bytes==null||bytes.Length==0||bytes.Length>MaximumLength)return Unknown("UnsupportedFormat");
+            if(!Query(queryName)||bytes==null||bytes.Length==0||bytes.Length>MaximumLength)return Unknown(queryName,"UnsupportedFormat","Bounds",bytes==null?0:bytes.Length);
             string hash;
             using(var algorithm=SHA256.Create())hash=BitConverter.ToString(algorithm.ComputeHash(bytes)).Replace("-","").ToLowerInvariant();
-            var result=Unknown("UnsupportedFormat");result.Sha256=hash;
+            var result=Unknown(queryName,"UnsupportedFormat","Header",bytes.Length);result.Sha256=hash;
+            result.HelperSource=helperBytes==null?"Absent":"Provided";
+            var reader=new DefinitionReader(bytes);
             try {
-                var reader=new DefinitionReader(bytes);
                 if(reader.Word()!=0x0207||reader.String()!=queryName)throw new InvalidDataException();
+                result.ParseStage="Identity";
                 reader.String();if(reader.String()!="113"||reader.String()!="Q2")throw new InvalidDataException();
+                result.ParseStage="RecordHeader";
                 reader.Skip(19);if(reader.Word()!=2)throw new InvalidDataException();
-                var input=reader.Record(1);var output=reader.Record(2);if(!reader.End)throw new InvalidDataException();
-                result.InputCount=input.Count;result.OutputCount=output.Count;
+                result.ParseStage="InputRecord";var input=reader.Record(1);result.InputCount=input.Count;
+                result.ParseStage="OutputRecord";var output=reader.Record(2);result.OutputCount=output.Count;
+                result.ParseStage="Trailing";if(!reader.End)throw new InvalidDataException();
                 int legacyInputs=queryName=="SABA101U1"?36:35;
+                result.ParseStage="InputSemantics";
                 if(!InputsMatch(input))throw new InvalidDataException();
+                result.ParseStage="OutputSemantics";
                 bool legacy=input.Count==legacyInputs&&Matches(output,new[]{"주문번호","ORC주문번호","메세지구분","메세지1","메세지2","메세지3"});
                 bool modern=input.Count==legacyInputs+2&&ModernOutput(output);
                 result.Kind=legacy?IndiOrderSchemaKind.Legacy:modern?IndiOrderSchemaKind.Modern:IndiOrderSchemaKind.Unknown;
                 if(modern)ReadRoute(result,input,queryName,helperBytes);
-                result.Diagnostic="Order schema: "+queryName+"; kind="+result.Kind+"; inputs="+result.InputCount.ToString(CultureInfo.InvariantCulture)
-                    +"; outputs="+result.OutputCount.ToString(CultureInfo.InvariantCulture)+"; SHA256="+hash
-                    +"; KRX route="+(result.KrxRouteCode==null?"Unverified":"Verified");
-                return result;
-            }catch{return result;}
+                result.FailureCode=result.Kind==IndiOrderSchemaKind.Unknown?"UnsupportedSchema":"Recognized";
+                if(result.Kind!=IndiOrderSchemaKind.Unknown)result.ParseStage="Complete";
+            }catch{}
+            result.ParseOffset=reader.Position;Describe(result);return result;
         }
 
         static bool InputsMatch(IList<string> names) {
@@ -122,6 +154,7 @@ namespace ShinhanNativeTrader {
             readonly byte[] data;int position,nextClassIndex=1;
             readonly Dictionary<int,string> classes=new Dictionary<int,string>();
             public DefinitionReader(byte[] data){this.data=data;}
+            public int Position {get{return position;}}
             public bool End {get{return position==data.Length;}}
             public void Skip(int count){if(count<0||position>data.Length-count)throw new InvalidDataException();position+=count;}
             byte Byte(){if(position>=data.Length)throw new InvalidDataException();return data[position++];}

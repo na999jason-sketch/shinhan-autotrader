@@ -19,12 +19,14 @@ namespace ShinhanNativeTrader {
             public string ThrowMethod;
             public Action DuringRequest,DuringSetField;
             public readonly Dictionary<string,object> Fields=new Dictionary<string,object>();
+            public readonly Dictionary<int,string> Inputs=new Dictionary<int,string>();
+            public int QuerySetCount,FieldSetCount;
             public object Invoke(string method,params object[] args) {
                 if(method==ThrowMethod)throw new InvalidOperationException("account-123-password-SECRET");
                 switch(method) {
-                    case "SetQueryName":QueryName=Convert.ToString(args[0],CultureInfo.InvariantCulture);return OverrideSetterReturns?QuerySetterReturn:(object)SetQueryAccepted;
+                    case "SetQueryName":QuerySetCount++;Inputs.Clear();QueryName=Convert.ToString(args[0],CultureInfo.InvariantCulture);return OverrideSetterReturns?QuerySetterReturn:(object)SetQueryAccepted;
                     case "GetQueryName":return QueryReadbackOverride??QueryName;
-                    case "SetSingleData":if(DuringSetField!=null)DuringSetField();return OverrideSetterReturns?FieldSetterReturn:(object)SetFieldAccepted;
+                    case "SetSingleData":FieldSetCount++;Inputs[(int)args[0]]=Convert.ToString(args[1],CultureInfo.InvariantCulture);if(DuringSetField!=null)DuringSetField();return OverrideSetterReturns?FieldSetterReturn:(object)SetFieldAccepted;
                     case "RequestData":RequestCount++;if(DuringRequest!=null)DuringRequest();if(ErrorAfterRequest)Diagnostic.ErrorState=2;return OverrideRequestReturn?RequestReturn:Id;
                     case "GetMultiRowCount":return Rows;
                     case "GetSingleData":return Field("s:"+args[0]);
@@ -125,9 +127,71 @@ namespace ShinhanNativeTrader {
             requests.Begin("ORDINARYHOLDINGS","SABA609Q1",mutable,"");fake.Data(7);
             Check(reply!=null&&reply.TradeHoldings.RequestOrdinaryOnlyVerified,"ordinary-only provenance uses the accepted private snapshot when caller fields mutate during COM setters");requests.Dispose();
         }
+        static FakeIndi Gi004() {
+            var fake=new FakeIndi{Id=0};fake.Diagnostic.ErrorState=2;fake.Diagnostic.ErrorCode="GI004";return fake;
+        }
+        static void ReadOnlyGi004Recovery() {
+            const string account="12345678901",secret="5678";
+            var fake=Gi004();fake.TradeHolding("1");
+            var requests=new IndiRequestCoordinator(fake);IndiReply reply=null;int fatal=0;string trace="";
+            requests.Done+=value=>reply=value;requests.Fatal+=value=>fatal++;requests.Trace+=value=>trace+=value;
+            var inputs=AccountQueries.HoldingsInputs(account,secret);
+            Check(requests.Begin("TRADEHOLDINGS","SABA609Q1",inputs,"")&&requests.Busy&&!requests.Failed&&fatal==0,"unaccepted GI004 balance read schedules a single bounded recovery without declaring received data");
+            Check(reply==null&&fake.RequestCount==1&&!requests.PollReadOnlyRetry(DateTime.UtcNow),"read recovery waits one second without sleeping or submitting early");
+            Check(!requests.Begin("CASH","SABA602Q1",AccountQueries.CashInputs(account,secret),"")&&fake.RequestCount==1,"deferred read retains the serial busy slot");
+            fake.Data(0);fake.Data(7);Check(reply==null&&requests.Busy,"callbacks arriving during a rejected-read delay cannot create account evidence");
+            inputs[0]="99999999999";inputs[2]="changed";inputs[3]="2";fake.Id=8;
+            var beforeRetry=DateTime.UtcNow;
+            Check(requests.PollReadOnlyRetry(DateTime.UtcNow.AddSeconds(2))&&requests.Busy&&fake.RequestCount==2&&fake.QuerySetCount==2&&fake.FieldSetCount==14,"read recovery rebinds the complete query and every input once");
+            Check(fake.Inputs[0]==account&&fake.Inputs[2]==secret&&fake.Inputs[3]=="1","deferred recovery uses the original private input snapshot rather than caller mutations");
+            fake.Data(7);Check(reply==null&&requests.Busy,"a mismatched callback after recovery cannot complete the new accepted request");
+            fake.Data(8);
+            Check(reply!=null&&reply.TradeHoldings.BasisVerified&&reply.RequestStartedUtc>=beforeRetry&&reply.RequestStartedUtc<=DateTime.UtcNow,"recovered balance proof is tied to the new accepted ID and actual fresh request-start timestamp");
+            Check(!requests.Busy&&!requests.PollReadOnlyRetry(DateTime.UtcNow.AddHours(1))&&fake.RequestCount==2,"completed recovery never repeats automatically");
+            Check(!trace.Contains(account)&&!trace.Contains(secret)&&!trace.Contains("99999999999")&&!trace.Contains("changed"),"read recovery diagnostics do not expose original or mutated credentials");requests.Dispose();
+
+            fake=Gi004();requests=new IndiRequestCoordinator(fake);fatal=0;requests.Fatal+=value=>fatal++;
+            requests.Begin("TRADEHOLDINGS","SABA609Q1",AccountQueries.HoldingsInputs(account,secret),"");
+            Check(!requests.PollReadOnlyRetry(DateTime.UtcNow.AddSeconds(2))&&requests.Failed&&!requests.Busy&&fake.RequestCount==2&&fatal==1,"second GI004 read failure halts instead of recursively scheduling another recovery");
+            Check(!requests.PollReadOnlyRetry(DateTime.UtcNow.AddHours(1))&&fake.RequestCount==2&&fatal==1,"failed recovery remains latched");requests.Dispose();
+
+            foreach(var stop in new[]{"Cancel","Halt","Dispose"}) {
+                fake=Gi004();requests=new IndiRequestCoordinator(fake);
+                requests.Begin("TRADEHOLDINGS","SABA609Q1",AccountQueries.HoldingsInputs(account,secret),"");
+                if(stop=="Cancel")requests.CancelPending();else if(stop=="Halt")requests.Halt("owned stop");else requests.Dispose();
+                Check(!requests.PollReadOnlyRetry(DateTime.UtcNow.AddSeconds(2))&&fake.RequestCount==1,"stopped or disposed account sessions discard deferred read recovery: "+stop);requests.Dispose();
+            }
+            foreach(var invalid in new[]{"DifferentCode","UnknownState","ZeroState","NoDiagnostics","NegativeId","RawBool","RawText","OrderQuery","WrongKind"}) {
+                fake=Gi004();if(invalid=="DifferentCode")fake.Diagnostic.ErrorCode="GI005";
+                if(invalid=="UnknownState")fake.Diagnostic.ErrorState=null;
+                if(invalid=="ZeroState")fake.Diagnostic.ErrorState=0;
+                if(invalid=="NoDiagnostics")fake.DiagnosticThrows=true;
+                if(invalid=="NegativeId")fake.Id=-1;
+                if(invalid=="RawBool"||invalid=="RawText"){fake.OverrideRequestReturn=true;fake.RequestReturn=invalid=="RawBool"?(object)false:"0";}
+                requests=new IndiRequestCoordinator(fake);
+                var kind=invalid=="WrongKind"?"QUOTE":"TRADEHOLDINGS";var query=invalid=="OrderQuery"?"SABA101U1":"SABA609Q1";
+                Check(!requests.Begin(kind,query,AccountQueries.HoldingsInputs(account,secret),"")&&requests.Failed&&!requests.PollReadOnlyRetry(DateTime.UtcNow.AddSeconds(2))&&fake.RequestCount==1,"read recovery refuses unsupported diagnostics, returns or query scope: "+invalid);requests.Dispose();
+            }
+            foreach(var entry in new[]{new[]{"ORDINARYHOLDINGS","SABA609Q1"},new[]{"CASH","SABA602Q1"},new[]{"CAPACITY","SABA415Q1"},new[]{"ORDERS","SABA231Q1"},new[]{"HOLDINGS","SABA200QB"}}) {
+                fake=Gi004();requests=new IndiRequestCoordinator(fake);
+                Check(requests.Begin(entry[0],entry[1],new Dictionary<int,string>(),"")&&requests.Busy&&!requests.Failed,"bounded GI004 recovery accepts only an enumerated read-only account query: "+entry[0]);requests.Dispose();
+            }
+            fake=Gi004();fake.TradeHolding("1");requests=new IndiRequestCoordinator(fake);reply=null;requests.Done+=value=>reply=value;
+            requests.Begin("TRADEHOLDINGS","SABA609Q1",AccountQueries.HoldingsInputs(account,secret),"");
+            fake.Id=7;fake.OverrideSetterReturns=true;fake.QuerySetterReturn=true;fake.FieldSetterReturn=1;
+            requests.PollReadOnlyRetry(DateTime.UtcNow.AddSeconds(2));fake.Data(7);
+            Check(reply!=null&&!reply.TradeHoldings.BasisVerified,"recovery recomputes setter provenance instead of reusing the failed attempt's confirmation");requests.Dispose();
+            fake=Gi004();requests=new IndiRequestCoordinator(fake);
+            requests.Begin("TRADEHOLDINGS","SABA609Q1",AccountQueries.HoldingsInputs(account,secret),"");
+            fake.Id=7;fake.DuringSetField=()=>requests.CancelPending();
+            Check(!requests.PollReadOnlyRetry(DateTime.UtcNow.AddSeconds(2))&&!requests.Busy&&fake.RequestCount==1,"stop reentrancy during recovery setters prevents its new native request");requests.Dispose();
+            fake=Gi004();requests=new IndiRequestCoordinator(fake);fake.DuringRequest=()=>fake.Data(0);
+            Check(!requests.Begin("TRADEHOLDINGS","SABA609Q1",AccountQueries.HoldingsInputs(account,secret),"")&&requests.Failed,"a zero return with an early callback is not silently reinterpreted as safe delayed evidence");requests.Dispose();
+        }
         public static int Run() {
             checks=0;
             OrdinaryHoldingsProvenance();
+            ReadOnlyGi004Recovery();
             var fake=new FakeIndi();fake.Quote();var requests=new IndiRequestCoordinator(fake);
             int received=0,fatal=0;IndiReply reply=null;
             requests.Done+=value=>{received++;reply=value;};requests.Fatal+=reason=>fatal++;

@@ -370,6 +370,10 @@ namespace ShinhanNativeTrader {
         sealed class Snapshot { public int Id;public int? ProviderErrorState;public IndiReply Reply;public Exception Error;public DateTime ReceivedUtc; }
         sealed class Pending {
             public string Kind,Code;public int? Id;
+            public string Query;
+            public IDictionary<int,string> Input;
+            public bool Retried;
+            public DateTime? RetryDueUtc;
             public bool TradeBasisRequested,OrdinaryOnlyRequested;
             public decimal? RequestedPrice;
             public DateTime RequestStartedUtc;
@@ -420,13 +424,21 @@ namespace ShinhanNativeTrader {
                 &&input.TryGetValue(5,out selection)&&selection=="1"&&input.TryGetValue(6,out output)&&output=="0";
         }
         public bool Begin(string kind,string query,IDictionary<int,string> input,string code,decimal? requestedPrice=null) {
+            return BeginCore(kind,query,input,code,requestedPrice,false);
+        }
+        static bool RetryableRead(string kind,string query) {
+            if(query=="SABA609Q1")return kind=="TRADEHOLDINGS"||kind=="ORDINARYHOLDINGS";
+            return kind=="CASH"&&query=="SABA602Q1"||kind=="CAPACITY"&&query=="SABA415Q1"
+                ||kind=="ORDERS"&&query=="SABA231Q1"||kind=="HOLDINGS"&&query=="SABA200QB";
+        }
+        bool BeginCore(string kind,string query,IDictionary<int,string> input,string code,decimal? requestedPrice,bool retried) {
             if(disposed)throw new ObjectDisposedException("IndiRequestCoordinator");
             if(failed)throw new InvalidOperationException("Indi requests halted after an earlier error; reconnect required.");
             if(Busy){Log("Rejected request while another TR is pending.");return false;}
             // COM can pump callbacks. Bind provenance to a private snapshot of
             // the fields actually sent, never a caller-mutated dictionary.
             if(input!=null)input=new SortedDictionary<int,string>(input);
-            var current=new Pending{Kind=kind,Code=code,RequestedPrice=requestedPrice};pending=current;
+            var current=new Pending{Kind=kind,Code=code,RequestedPrice=requestedPrice,Query=query,Input=input,Retried=retried};pending=current;
             if((kind=="HOLDINGS"||kind=="TRADEHOLDINGS"||kind=="ORDINARYHOLDINGS"||kind=="CASH"||kind=="CAPACITY"||kind=="ORDERS")&&input!=null) {
                 var accountIndex=kind=="ORDERS"?1:0;
                 current.Sensitive=input.Where(x=>x.Key==accountIndex||x.Key==2).Select(x=>x.Value).ToArray();
@@ -452,14 +464,23 @@ namespace ShinhanNativeTrader {
                 // explicitly contradictory returned basis still blocks orders.
                 current.TradeBasisRequested=VerifiedHoldingsRequest(kind,"TRADEHOLDINGS",query,input,settersConfirmed,"1");
                 current.OrdinaryOnlyRequested=VerifiedHoldingsRequest(kind,"ORDINARYHOLDINGS",query,input,settersConfirmed,"5");
+                // Input COM calls may pump a stop/dispose/account-change event.
+                // An obsolete pending instance must not start its deferred read.
+                if(disposed||failed||pending!=current)return false;
                 stage="RequestData";
                 current.RequestStartedUtc=DateTime.UtcNow;
                 object raw=io.Invoke("RequestData");
                 Log("RequestData return type="+(raw==null?"null":raw.GetType().Name));
                 var id=RequestId(raw);
-                Diagnose(current,"after RequestData rid="+id);
+                var acceptance=Diagnose(current,"after RequestData rid="+id);
                 // The official OCX's RequestData returns a positive ID on acceptance;
                 // connection/query/WM_COPYDATA failures return zero (GI004 included).
+                if(id==0&&!failed&&!disposed&&pending==current&&!current.Retried&&current.Early.Count==0
+                    &&RetryableRead(kind,query)&&acceptance!=null&&acceptance.ErrorState>0&&acceptance.ErrorCode=="GI004") {
+                    current.RetryDueUtc=DateTime.UtcNow.AddSeconds(1);
+                    Log("READ-ONLY GI004: "+query+" was not accepted (rid=0); one fresh read will be attempted after one second. No order retry.");
+                    return true;
+                }
                 if(id<=0)throw new InvalidOperationException("RequestData did not return a positive accepted request ID.");
                 if(failed)return false;
                 // RequestData clears the OCX's response status, so GetErrorState can
@@ -474,10 +495,22 @@ namespace ShinhanNativeTrader {
                 return !failed;
             }catch(Exception ex){Diagnose(current,"failed "+stage);Halt("Indi "+stage+" failed ("+ex.GetBaseException().GetType().Name+"); request values and exception text omitted.");return false;}
         }
+        public bool PollReadOnlyRetry(DateTime utc) {
+            if(utc.Kind!=DateTimeKind.Utc)throw new ArgumentException("UTC retry polling time required.");
+            if(disposed||failed)return false;
+            var current=pending;
+            if(current==null||!current.RetryDueUtc.HasValue||utc<current.RetryDueUtc.Value)return false;
+            // This is still a read-only request. Repeat the full setter/query
+            // binding and use a new actual request-start time and accepted ID.
+            // CancelPending/Halt/Dispose removes this pending instance entirely.
+            pending=null;
+            return BeginCore(current.Kind,current.Query,current.Input,current.Code,current.RequestedPrice,true);
+        }
         void OnData(int id) {
             if(disposed||failed)return;
             var current=pending;
             if(current==null){Log("Ignored unsolicited/duplicate ReceiveData rid="+id);return;}
+            if(current.RetryDueUtc.HasValue){Log("Ignored ReceiveData while an unaccepted read is awaiting its bounded retry.");return;}
             if(current.Id.HasValue&&current.Id.Value!=id){Log("Ignored mismatched ReceiveData rid="+id);return;}
             var snapshot=new Snapshot{Id=id,ReceivedUtc=DateTime.UtcNow};
             // The OCX has now set this response's status. Capture it while the
@@ -525,21 +558,26 @@ namespace ShinhanNativeTrader {
     // A dedicated order OCX is initialized independently of short-lived proofs.
     // Sending still requires the account authorization and current preflight;
     // it never shares response buffers with the read-only OCX.
-    internal sealed class IndiLiveOrderConnection : ILiveOrderWire {
+    internal sealed class IndiLiveOrderConnection : ILiveOrderWire,ILiveOrderChannelPreparation {
         readonly Control surface;readonly Action<string> log;
-        ComIndiTransport owner;ComLiveOrderWire wire;bool disposed;
+        ComIndiTransport owner;ComLiveOrderWire wire;bool disposed,preparing;
         IndiOrderSchemaInfo activeSchema;string activeQuery,lastSchemaDiagnostic;
         public event Action<LiveOrderAcknowledgement> Acknowledged;
-        public IndiLiveOrderConnection(Control surface,Action<string> log){this.surface=surface;this.log=log;PrepareChannel();}
-        void PrepareChannel() {
+        public IndiLiveOrderConnection(Control surface,Action<string> log){this.surface=surface;this.log=log;}
+        public void PrepareChannel() {
+            if(disposed)throw new ObjectDisposedException("IndiLiveOrderConnection");if(wire!=null)return;
+            if(preparing)throw new InvalidOperationException("Order channel initialization is already in progress.");
+            preparing=true;
             // Site/initialize the dedicated control before collecting a short-lived
             // order preflight. Initialization itself does not submit any order.
             try {
                 owner=new ComIndiTransport(surface,log);
-                InspectSchema("SABA101U1");InspectSchema("SABA102U1");
+                if(disposed)throw new ObjectDisposedException("IndiLiveOrderConnection");
                 wire=new ComLiveOrderWire(owner.NativeControl,SelectLayout,owner.ReadDiagnostics,null,ConfigureFields);
+                if(disposed)throw new ObjectDisposedException("IndiLiveOrderConnection");
                 wire.Acknowledged+=Forward;
             }catch{if(wire!=null){wire.Dispose();wire=null;}if(owner!=null){owner.Dispose();owner=null;}throw;}
+            finally{preparing=false;}
         }
         IndiOrderSchemaInfo InspectSchema(string query) {
             var info=IndiOrderSchema.ReadInstalled(owner.InstalledStarterPath,query);
@@ -631,6 +669,12 @@ namespace ShinhanNativeTrader {
         public bool Capacity(string account,string password,string code,decimal limitPrice) {
             code=ValidateCode(code);
             return Request("CAPACITY","SABA415Q1",AccountQueries.CapacityInputs(account,password,code,limitPrice),code,limitPrice);
+        }
+        public void PollReadOnlyRetry(DateTime utc) {
+            if(disposed||requests==null)return;
+            if(requests.PollReadOnlyRetry(utc)) {
+                timeout.Stop();if(requests.Busy)timeout.Start();
+            }
         }
         bool Request(string kind,string query,IDictionary<int,string> input,string code,decimal? requestedPrice=null) {
             if(!TransportReady)throw new InvalidOperationException("Indi OCX is not attached or requests are halted.");

@@ -16,7 +16,7 @@ namespace ShinhanNativeTrader {
         public AccountUserActionException(string message):base(message){}
     }
     internal static class Program {
-        internal const string Version="2.2.4";
+        internal const string Version="2.2.5";
         [STAThread]
         static int Main(string[] args) {
             if(args.Contains("--selftest")) {
@@ -185,6 +185,7 @@ namespace ShinhanNativeTrader {
             buttons.Controls.Add(new Label{Text="계좌암호",AutoSize=true});password.Width=95;password.UseSystemPasswordChar=true;buttons.Controls.Add(password);
             AddButton(buttons,"실계좌 조회·감시",AttachAccount);
             AddButton(buttons,"보고서 폴더",OpenReports);
+            AddButton(buttons,"조회 정의 내보내기",ExportIndiDefinitions);
             state.Text="Indi 연결 후 계좌를 조회하고 부재중 운영을 시작하십시오.";
             var statusArea=new FlowLayoutPanel{Dock=DockStyle.Fill,FlowDirection=FlowDirection.TopDown,WrapContents=false};
             statusArea.SizeChanged+=(s,e)=>{quoteStatus.MaximumSize=new Size(Math.Max(400,statusArea.ClientSize.Width-12),0);};
@@ -496,6 +497,7 @@ namespace ShinhanNativeTrader {
         void Schedule(){ScheduleAt(DateTime.UtcNow);}
         void ScheduleAt(DateTime now) {
             if(now.Kind!=DateTimeKind.Utc)throw new ArgumentException("UTC scheduler time required.");
+            if(api!=null)api.PollReadOnlyRetry(now);
             // Persist the copied account state independently of TR queues and
             // preflight work. A busy broker must not starve a due report.
             SaveReportIfDue(now);
@@ -691,6 +693,11 @@ namespace ShinhanNativeTrader {
                 SetCandidateStatus(intent.Code,"현재 정규장 체결가격 확인 필요");UpdateOrderStatus("현재 정규장 체결가격과 같은 지정가만 지원합니다.");return;
             }
             if(AlreadyRecorded(intent)){SetCandidateStatus(intent.Code,"기존 주문 접수·체결 확인");return;}
+            // Initialize the dedicated order control before invalidating and
+            // collecting fresh proofs. Initial account queries never create it.
+            var activeGateway=gateway;string accountBinding=boundKey;
+            activeGateway.PrepareChannel();
+            if(gateway!=activeGateway||boundKey!=accountBinding||!LiveStarted||!ActiveSession||readiness==null)return;
             entry=new EntryRequest{Intent=intent,Quote=quote,Candidate=candidate,AutoSize=autoSize};RestartPreflight(now,false);
         }
         void RestartPreflight(DateTime now,bool delay) {
@@ -957,6 +964,20 @@ namespace ShinhanNativeTrader {
                 else reportStatus.Text="저장된 보고서 없음 / 실계좌 조회·감시를 먼저 실행하십시오.";
             } else if(boundKey!=null&&!HasReportSnapshot)reportStatus.Text="보고서 저장 대기: 잔고·현금·주문 응답을 먼저 수신해야 합니다.";
             return path;
+        }
+        void ExportIndiDefinitions() {
+            try {
+                var type=Type.GetTypeFromProgID("GIEXPERTCONTROL.GiExpertControlCtrl.1",false);
+                if(type==null)throw new AccountUserActionException("등록된 Indi 설치 경로를 찾을 수 없습니다.");
+                var starter=IndiInstallation.FindStarter(type.GUID);
+                if(starter==null)throw new AccountUserActionException("등록된 Indi의 조회 정의 폴더를 찾을 수 없습니다.");
+                var file=IndiDefinitionExport.Save(starter,Path.Combine(Program.DataDir,"support"));
+                state.Text="조회 정의 진단파일 저장: "+Path.GetFileName(file)+" / 이 XML 파일을 첨부해 주십시오.";
+                Log("정적 조회 정의 진단파일 생성: "+Path.GetFileName(file)+" / 계좌 조회·주문 전송 없음");
+                if(Environment.OSVersion.Platform==PlatformID.Win32NT)
+                    Process.Start(new ProcessStartInfo{FileName="explorer.exe",Arguments="/select,\""+file+"\"",UseShellExecute=true});
+            }catch(AccountUserActionException){throw;}
+            catch(Exception ex){throw new AccountUserActionException("조회 정의 내보내기 실패: "+ex.GetType().Name+". 파일을 변경하지 않고 중단했습니다.");}
         }
         void OpenReports(){
             string path=PrepareReports();

@@ -6,9 +6,10 @@ using System.Xml;
 
 namespace ShinhanNativeTrader {
     public static class LiveOrdersTests {
-        sealed class FakeWire : ILiveOrderWire {
+        sealed class FakeWire : ILiveOrderWire,ILiveOrderChannelPreparation {
             public event Action<LiveOrderAcknowledgement> Acknowledged;
-            public int Sends;public bool Disposed;
+            public int Sends,Preparations;public bool Disposed;
+            public void PrepareChannel(){Preparations++;}
             public int ReturnId=7;public bool ThrowOnSend;
             public Action BeforeSend,DuringSend;
             public int Send(LiveOrderIntent intent,LiveAccountCredentials credentials,LiveOrderPreflight checks,DateTime utc){
@@ -40,8 +41,18 @@ namespace ShinhanNativeTrader {
         }
         public static int Run() {
             checks=0;
+            int startupTraces=0;
+            using(var lazy=new IndiLiveOrderConnection(null,message=>startupTraces++))
+                Check(startupTraces==0,"creating an account's order connection performs no native initialization or schema inspection");
             var directory=Path.Combine(Path.GetTempPath(),"ShinhanLiveOrderTests-"+Guid.NewGuid().ToString("N"));Directory.CreateDirectory(directory);
             try {
+                using(var preparationJournal=new LiveOrderJournal(Path.Combine(directory,"prepare-only.xml")))using(var preparationWire=new FakeWire()) {
+                    var preparationGateway=new LiveOrderGateway(preparationJournal,preparationWire);
+                    Check(preparationWire.Preparations==0&&preparationWire.Sends==0,"gateway construction leaves initial read-only account queries independent of order preparation");
+                    preparationGateway.PrepareChannel();
+                    Check(preparationWire.Preparations==1&&preparationWire.Sends==0&&preparationJournal.Snapshot.Orders.Count==0,"explicit channel preparation sends no order and creates no journal request");
+                    preparationGateway.Dispose();Reject(()=>preparationGateway.PrepareChannel(),"disposed channel cannot initialize deferred native state");
+                }
                 var credentials=new LiveAccountCredentials("12345678901","Z!pw");
                 var intent=Buy();var fields=LiveOrderProtocol.BuildFields(intent,credentials);
                 Check(LiveOrderProtocol.QueryName(intent)=="SABA101U1","cash buy selects official new-order query");

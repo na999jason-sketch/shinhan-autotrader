@@ -45,6 +45,8 @@ namespace ShinhanNativeTrader {
             var info=IndiOrderSchema.Inspect(old,"SABA101U1");
             Check(info.Kind==IndiOrderSchemaKind.Legacy&&info.InputCount==36&&info.OutputCount==6,"declared legacy input/output records are parsed structurally");
             Check(info.Sha256!=null&&info.Sha256.Length==64&&!info.Diagnostic.Contains("합성"),"diagnostic contains fingerprint and finite metadata rather than resource contents");
+            Check(info.QueryName=="SABA101U1"&&info.SizeBytes==old.Length&&info.ParseStage=="Complete"&&info.ParseOffset==old.Length,
+                "recognized schema retains fixed source identity size and complete parser position");
             Check(IndiOrderSchema.Inspect(Definition("SABA102U1",Inputs(35),legacy),"SABA102U1").Kind==IndiOrderSchemaKind.Legacy,"legacy amendment input count is separately verified");
             var input=Inputs(38);input[37]="주문방식";byte[] current=Definition("SABA101U1",input,modern,true);
             info=IndiOrderSchema.Inspect(current,"SABA101U1");
@@ -66,16 +68,46 @@ namespace ShinhanNativeTrader {
             Check(IndiOrderSchema.Inspect(Definition("SABA101U1",bad,modern),"SABA101U1").Kind==IndiOrderSchemaKind.Unknown,"changed input index meanings invalidate recognition");
             Check(IndiOrderSchema.Inspect(current,"SABA102U1").Kind==IndiOrderSchemaKind.Unknown,"query identity inside the file must match its fixed requested path");
             Check(IndiOrderSchema.Inspect(Definition("SABA101U1",Inputs(36),modern),"SABA101U1").Kind==IndiOrderSchemaKind.Unknown,"output-only changes do not fabricate a verified modern schema");
-            foreach(int length in new[]{1,20,49,100,old.Length-1})Check(IndiOrderSchema.Inspect(old.Take(length).ToArray(),"SABA101U1").Kind==IndiOrderSchemaKind.Unknown,"truncated serialization fails closed");
+            foreach(int length in new[]{1,20,49,100,old.Length-1}) {
+                var failed=IndiOrderSchema.Inspect(old.Take(length).ToArray(),"SABA101U1");
+                Check(failed.Kind==IndiOrderSchemaKind.Unknown,"truncated serialization fails closed");
+                Check(failed.QueryName=="SABA101U1"&&failed.SizeBytes==length&&failed.Sha256.Length==64&&failed.ParseOffset<=length
+                    &&failed.Diagnostic.Contains("SABA101U1")&&failed.Diagnostic.Contains("SHA256="+failed.Sha256)
+                    &&failed.Diagnostic.Contains("stage="+failed.ParseStage)&&failed.Diagnostic.Contains("offset="+failed.ParseOffset),
+                    "unsupported serialization retains query size hash and bounded failure location");
+            }
+            info=IndiOrderSchema.Inspect(old.Take(1).ToArray(),"SABA101U1");
+            Check(info.ParseStage=="Header"&&info.ParseOffset==1&&info.FailureCode=="UnsupportedFormat","header failure is distinguishable from a layout semantic mismatch");
+            info=IndiOrderSchema.Inspect(Definition("SABA101U1",input,shuffled),"SABA101U1");
+            Check(info.ParseStage=="OutputSemantics"&&info.FailureCode=="UnsupportedSchema"&&info.InputCount==38&&info.OutputCount==8,
+                "a parsed but unsupported field layout reports counts without accepting its meanings");
             Check(IndiOrderSchema.Inspect(old.Concat(new byte[]{1}).ToArray(),"SABA101U1").Kind==IndiOrderSchemaKind.Unknown,"unparsed trailing nodes are rejected");
             Check(IndiOrderSchema.Inspect(new byte[1024*1024+1],"SABA101U1").Kind==IndiOrderSchemaKind.Unknown,"definition size is bounded before parsing");
             Check(IndiOrderSchema.Inspect(old,"../SABA101U1").Kind==IndiOrderSchemaKind.Unknown,"query names are a fixed allowlist");
+            Check(!IndiOrderSchema.Inspect(old,"SECRET12345678901").Diagnostic.Contains("SECRET12345678901"),"unsupported query text is never copied to diagnostics");
             var directory=Path.Combine(Path.GetTempPath(),"OrderSchema-"+Guid.NewGuid().ToString("N"));Directory.CreateDirectory(directory);
             try {
                 var starter=Path.Combine(directory,IndiInstallation.StarterFileName);Directory.CreateDirectory(Path.Combine(directory,"qry"));Directory.CreateDirectory(Path.Combine(directory,"config"));
                 File.WriteAllBytes(starter,new byte[0]);File.WriteAllBytes(Path.Combine(directory,"qry","saba101u1.xtr"),current);File.WriteAllBytes(Path.Combine(directory,"config","helpertrinfo.dat"),helper);
                 info=IndiOrderSchema.ReadInstalled(starter,"SABA101U1");Check(info.Kind==IndiOrderSchemaKind.Modern&&info.KrxRouteCode=="1","only fixed query/helper files under a verified starter directory are read");
                 Check(!info.Diagnostic.Contains(directory)&&File.ReadAllBytes(Path.Combine(directory,"qry","saba101u1.xtr")).SequenceEqual(current),"installed definition inspection exposes no path and changes no bytes");
+                Check(info.HelperSource=="Legacy","legacy helper is used only when the primary modern path is unavailable");
+                string primaryDirectory=Path.Combine(directory,"qry","config");Directory.CreateDirectory(primaryDirectory);
+                string primaryPath=Path.Combine(primaryDirectory,"helpertrinfo.dat");File.WriteAllBytes(primaryPath,helper);
+                info=IndiOrderSchema.ReadInstalled(starter,"SABA101U1");
+                Check(info.HelperSource=="Primary"&&info.KrxRouteCode=="1","modern qry/config helper takes precedence when both mappings agree");
+                File.WriteAllBytes(Path.Combine(directory,"config","helpertrinfo.dat"),Encoding.GetEncoding(949).GetBytes("*START,SABA101U1,x\nSI,37,주문방식,0:KRX^1:NXT,0\n*END"));
+                info=IndiOrderSchema.ReadInstalled(starter,"SABA101U1");
+                Check(info.HelperSource=="Conflict"&&info.KrxRouteCode==null&&!info.KrxRouteInputIndex.HasValue,
+                    "different verified helper mappings invalidate routing rather than silently selecting either value");
+                Check(info.Kind==IndiOrderSchemaKind.Modern&&info.Diagnostic.Contains("helper=Conflict")&&!info.Diagnostic.Contains(directory),
+                    "helper conflict preserves independently verified output layout and safe source diagnostics");
+                File.WriteAllBytes(primaryPath,Encoding.GetEncoding(949).GetBytes("*START,SABA101U1,x\nSI,37,주문방식,0:SOR^1:NXT,0\n*END"));
+                info=IndiOrderSchema.ReadInstalled(starter,"SABA101U1");
+                Check(info.HelperSource=="Primary"&&info.KrxRouteCode==null,"an existing primary helper without KRX proof cannot borrow an unrelated legacy mapping");
+                File.Delete(Path.Combine(directory,"config","helpertrinfo.dat"));File.WriteAllBytes(primaryPath,helper);
+                info=IndiOrderSchema.ReadInstalled(starter,"SABA101U1");
+                Check(info.HelperSource=="Primary"&&info.KrxRouteCode=="1","primary helper works without a legacy config directory entry");
                 Check(IndiOrderSchema.ReadInstalled(IndiInstallation.StarterFileName,"SABA101U1").Kind==IndiOrderSchemaKind.Unknown,"relative starter cannot select a local query");
                 Check(IndiOrderSchema.ReadInstalled(starter,"../SABA101U1").Kind==IndiOrderSchemaKind.Unknown,"query traversal never selects a file");
             }finally{Directory.Delete(directory,true);}

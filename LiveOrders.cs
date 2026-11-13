@@ -488,6 +488,7 @@ namespace ShinhanNativeTrader {
         event Action<LiveOrderAcknowledgement> Acknowledged;
         int Send(LiveOrderIntent intent,LiveAccountCredentials credentials,LiveOrderPreflight checks,DateTime utc);
     }
+    public interface ILiveOrderChannelPreparation {void PrepareChannel();}
     // Deliberately separate from the read-only adapter's allowlist. A dedicated
     // AxHost-created OCX on the owning STA is required; this class never creates a
     // login session or changes credentials/permissions on the user's behalf.
@@ -573,6 +574,10 @@ namespace ShinhanNativeTrader {
         readonly List<LiveOrderAcknowledgement> early=new List<LiveOrderAcknowledgement>();string pendingOrder;int? pendingRequest;DateTime? pendingSince;bool disposed,invalidating;
         public bool Busy {get{return pendingOrder!=null;}}
         public event Action<LiveOrderRecord> OrderChanged;
+        public void PrepareChannel() {
+            if(disposed||Busy)throw new InvalidOperationException("주문 채널을 준비할 수 없습니다.");
+            var preparation=wire as ILiveOrderChannelPreparation;if(preparation!=null)preparation.PrepareChannel();
+        }
         public LiveOrderGateway(LiveOrderJournal journal,ILiveOrderWire wire,Func<DateTime> utcNow=null) {
             if(journal==null||wire==null)throw new ArgumentNullException("Live-order journal and wire are required.");
             this.journal=journal;this.wire=wire;clock=utcNow??(()=>DateTime.UtcNow);wire.Acknowledged+=OnAcknowledged;
