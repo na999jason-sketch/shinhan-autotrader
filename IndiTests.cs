@@ -63,6 +63,12 @@ namespace ShinhanNativeTrader {
                 Fields["m:0:3"]="보통";Fields["m:0:4"]="2";Fields["m:0:10"]="2";Fields["m:0:11"]="0";
                 Fields["m:0:12"]="70000";Fields["m:0:13"]="-71000";Fields["m:0:22"]="0";
             }
+            public void EvaluationHolding() {
+                TradeHolding("0");Fields["m:0:4"]="0";Fields["m:0:8"]="18";Fields["m:0:9"]="18";
+                Fields["m:0:10"]="18";Fields["m:0:12"]="8160";Fields["m:0:13"]="7870";
+                Fields["m:0:18"]="141660";Fields["m:0:19"]="-5220";Fields["m:0:20"]="-3.55";Fields["m:0:32"]="18";
+                Fields["s:15"]="146880";Fields["s:18"]="141660";
+            }
             public void FilledModernOrder() {
                 Rows=1;
                 Fields["m:0:0"]="000345678";Fields["m:0:1"]="0";Fields["m:0:4"]="1";Fields["m:0:6"]="0";
@@ -417,6 +423,91 @@ namespace ShinhanNativeTrader {
                     "retry response derives profile and digest exclusively from its fresh resolver result: "+recognizedOnRetry);requests.Dispose();
             }
         }
+        static void ExpandedHoldingsSchemaProof() {
+            const string number="12345678901",secret="5678";
+            var schema=IndiHoldingsSchema.Inspect(IndiHoldingsSchemaTests.ModernDefinition());
+            var unknown=IndiHoldingsSchema.Inspect(new byte[]{0});
+            Check(schema.Recognized&&!unknown.Recognized,"holdings provenance tests use a recognized synthetic expanded definition and an unknown definition");
+            foreach(bool ordinary in new[]{false,true}) {
+                var fake=new FakeIndi();fake.EvaluationHolding();int resolved=0;bool beforeNative=false;
+                var requests=new IndiRequestCoordinator(fake,null,()=>{resolved++;return schema;});IndiReply reply=null;
+                requests.Done+=value=>reply=value;fake.DuringRequest=()=>beforeNative=resolved==1;
+                requests.Begin(ordinary?"ORDINARYHOLDINGS":"TRADEHOLDINGS","SABA609Q1",ordinary?
+                    AccountQueries.OrdinaryHoldingsInputs(number,secret):AccountQueries.HoldingsInputs(number,secret),"");
+                fake.Data(99);Check(reply==null&&requests.Busy,"wrong callback ID cannot publish expanded quantity evidence");
+                fake.Data(7);
+                Check(reply!=null&&reply.Holdings[0].Quantity==18&&resolved==1&&beforeNative
+                    &&(ordinary?reply.TradeHoldings.RequestOrdinaryOnlyVerified:reply.TradeHoldings.RequestBasisVerified),
+                    "normal accepted trade and ordinary callbacks receive the exact request-bound expanded quantity profile");
+                Check(reply.TradeHoldings.QuantitySchemaInfo!=null&&reply.TradeHoldings.QuantitySchemaInfo.Recognized
+                    &&reply.TradeHoldings.QuantitySchemaInfo.Sha256==schema.Sha256
+                    &&reply.TradeHoldings.ReportedQuantities["005930"]==0,
+                    "profile digest and original reported quantity remain separate from selected current quantity");
+                requests.Dispose();
+            }
+            foreach(string availability in new[]{"default","null","throws","unrecognized"}) {
+                var fake=new FakeIndi();fake.EvaluationHolding();string trace="";IndiReply reply=null;
+                Func<IndiHoldingsSchemaInfo> resolver=availability=="default"?null:new Func<IndiHoldingsSchemaInfo>(()=>{
+                    if(availability=="throws")throw new InvalidOperationException("provider-password-SECRET");
+                    return availability=="null"?null:unknown;
+                });
+                var requests=new IndiRequestCoordinator(fake,null,resolver);requests.Trace+=value=>trace+=value;requests.Done+=value=>reply=value;
+                requests.Begin("TRADEHOLDINGS","SABA609Q1",AccountQueries.HoldingsInputs(number,secret),"");fake.Data(7);
+                Check(reply!=null&&reply.Holdings[0].Quantity==0&&!trace.Contains("provider-password-SECRET"),
+                    "missing or unrecognized holdings schema never promotes MO32 or exposes resolver errors: "+availability);requests.Dispose();
+            }
+            foreach(string scope in new[]{"missing-input","other-basis","wrong-query","null-query-setter","null-field-setter","numeric-field-setter"}) {
+                var fake=new FakeIndi();fake.EvaluationHolding();int resolved=0;IndiReply reply=null;
+                if(scope.EndsWith("setter",StringComparison.Ordinal)) {
+                    fake.OverrideSetterReturns=true;fake.QuerySetterReturn=scope=="null-query-setter"?null:(object)true;
+                    fake.FieldSetterReturn=scope=="null-field-setter"?null:scope=="numeric-field-setter"?(object)1:true;
+                }
+                var requests=new IndiRequestCoordinator(fake,null,()=>{resolved++;return schema;});requests.Done+=value=>reply=value;
+                var inputs=AccountQueries.HoldingsInputs(number,secret);if(scope=="missing-input")inputs.Remove(7);if(scope=="other-basis")inputs[3]="2";
+                requests.Begin("TRADEHOLDINGS",scope=="wrong-query"?"SABA200QB":"SABA609Q1",inputs,"");fake.Data(7);
+                Check(reply!=null&&reply.Holdings[0].Quantity==0&&resolved==0,
+                    "expanded quantity proof cannot bypass exact eight setter and query scope: "+scope);requests.Dispose();
+            }
+            foreach(string diagnostic in new[]{"missing","throws","error"}) {
+                var fake=new FakeIndi();fake.EvaluationHolding();IndiReply reply=null;
+                if(diagnostic=="missing")fake.Diagnostic.ErrorState=null;
+                if(diagnostic=="throws")fake.DiagnosticThrows=true;
+                if(diagnostic=="error")fake.Diagnostic.ErrorState=2;
+                var requests=new IndiRequestCoordinator(fake,null,()=>schema);requests.Done+=value=>reply=value;
+                requests.Begin("TRADEHOLDINGS","SABA609Q1",AccountQueries.HoldingsInputs(number,secret),"");fake.DeliverWithoutSettingStatus(7);
+                Check(diagnostic=="error"?reply==null&&requests.Failed:reply!=null&&reply.Holdings[0].Quantity==0,
+                    "non-normal callback diagnostics cannot certify expanded quantity: "+diagnostic);requests.Dispose();
+            }
+            {
+                var fake=new FakeIndi();fake.EvaluationHolding();int resolved=0;IndiReply reply=null;
+                var requests=new IndiRequestCoordinator(fake,null,()=>{resolved++;fake.Data(7);return schema;});requests.Done+=value=>reply=value;
+                fake.DuringSetField=()=>fake.Data(7);
+                requests.Begin("TRADEHOLDINGS","SABA609Q1",AccountQueries.HoldingsInputs(number,secret),"");
+                Check(reply==null&&requests.Busy&&resolved==1,"callbacks pumped by setters or schema resolution do not publish a quantity response before RequestData");
+                fake.Data(7);Check(reply!=null&&reply.Holdings[0].Quantity==18,"only the later accepted normal callback publishes selected evaluation quantity");requests.Dispose();
+            }
+            {
+                var fake=new FakeIndi{ErrorAfterRequest=true};fake.EvaluationHolding();int completed=0;IndiReply reply=null;
+                var requests=new IndiRequestCoordinator(fake,null,()=>schema);requests.Done+=value=>{completed++;reply=value;};
+                fake.DuringRequest=()=>{fake.Data(99);fake.Data(7);};
+                Check(requests.Begin("TRADEHOLDINGS","SABA609Q1",AccountQueries.HoldingsInputs(number,secret),"")
+                    &&reply!=null&&reply.Holdings[0].Quantity==18&&completed==1,
+                    "reentrant accepted normal holdings response keeps its own schema proof despite stale post-return status");requests.Dispose();
+            }
+            foreach(bool recognizedOnRetry in new[]{false,true}) {
+                var fake=Gi004();fake.EvaluationHolding();int resolved=0;IndiReply reply=null;var current=recognizedOnRetry?unknown:schema;
+                var requests=new IndiRequestCoordinator(fake,null,()=>{resolved++;return current;});requests.Done+=value=>reply=value;
+                requests.Begin("TRADEHOLDINGS","SABA609Q1",AccountQueries.HoldingsInputs(number,secret),"");
+                Check(reply==null&&requests.Busy&&resolved==1,"unaccepted GI004 attempt cannot publish expanded quantity evidence");
+                current=recognizedOnRetry?schema:unknown;fake.Id=8;
+                Check(requests.PollReadOnlyRetry(DateTime.UtcNow.AddSeconds(2))&&resolved==2&&fake.FieldSetCount==16,
+                    "read-only retry rebinds every holdings input and resolves the installed profile again");
+                fake.Data(7);Check(reply==null&&requests.Busy,"old attempt callback cannot publish retry quantity evidence");
+                fake.Data(8);
+                Check(reply!=null&&reply.Holdings[0].Quantity==(recognizedOnRetry?18:0),
+                    "retry evaluation quantity depends only on the accepted retry's schema, never an earlier attempt");requests.Dispose();
+            }
+        }
         public static int Run() {
             checks=0;
             KrxHoldingsProvenance();
@@ -424,6 +515,7 @@ namespace ShinhanNativeTrader {
             ReadOnlyGi004Recovery();
             OrdersRequestScopeProof();
             ModernOrdersSchemaProof();
+            ExpandedHoldingsSchemaProof();
             var fake=new FakeIndi();fake.Quote();var requests=new IndiRequestCoordinator(fake);
             int received=0,fatal=0;IndiReply reply=null;
             requests.Done+=value=>{received++;reply=value;};requests.Fatal+=reason=>fatal++;

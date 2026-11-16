@@ -16,7 +16,7 @@ namespace ShinhanNativeTrader {
         public AccountUserActionException(string message):base(message){}
     }
     internal static class Program {
-        internal const string Version="2.2.14";
+        internal const string Version="2.2.15";
         [STAThread]
         static int Main(string[] args) {
             if(args.Contains("--selftest")) {
@@ -809,8 +809,18 @@ namespace ShinhanNativeTrader {
         }
         string HoldingQuantityPending(Holding held) {
             if(tradeHoldings==null||!tradeHoldings.HasQuantityConflict(held.Code))return null;
+            if(tradeHoldings.QuantitySchemaInfo!=null&&tradeHoldings.QuantitySchemaInfo.Recognized&&!tradeHoldings.IsCurrentQuantityVerified(held.Code))
+                return held.Code+" 현재 평가잔고수량·평가금액 확인 대기";
             return held.Code+" 잔고수량 "+held.Quantity.ToString(CultureInfo.InvariantCulture)+" / 주문가능수량 "
                 +tradeHoldings.SellableQuantities[held.Code].ToString(CultureInfo.InvariantCulture)+" · 수량 반영 확인 대기";
+        }
+        string HoldingQuantityDescription(Holding held) {
+            string pending=HoldingQuantityPending(held);if(pending!=null)return pending;
+            decimal reported;
+            if(tradeHoldings!=null&&tradeHoldings.QuantitySchemaInfo!=null&&tradeHoldings.QuantitySchemaInfo.Recognized
+                &&tradeHoldings.IsCurrentQuantityVerified(held.Code)&&tradeHoldings.ReportedQuantities.TryGetValue(held.Code,out reported))
+                return "평가잔고 "+held.Quantity.ToString(CultureInfo.InvariantCulture)+"주 확인 / 원본 잔고 "+reported.ToString(CultureInfo.InvariantCulture)+"주";
+            return "원본 잔고수량 표시";
         }
         string HoldingSourcePendingAt(Holding held,DateTime utc) {
             if(tradeHoldings==null)return null;
@@ -1107,7 +1117,7 @@ namespace ShinhanNativeTrader {
                 decimal? profit=details!=null&&details.UnrealizedProfit.HasValue?details.UnrealizedProfit:rowQuantityPending?null:value.UnrealizedProfit;
                 int available;object orderable=tradeHoldings!=null&&tradeHoldings.SellableQuantities.TryGetValue(held.Code,out available)?(object)available:"미조회";
                 string returnText=rate.HasValue?rate.Value.ToString("N2",CultureInfo.CurrentCulture)+(details!=null&&details.ReturnPercent.HasValue?" (증권사)":" (단가)"):"미확인";
-                int row=holdingsGrid.Rows.Add(value.Code,value.Name,value.Quantity,Amount(value.AveragePrice>0?(decimal?)value.AveragePrice:null),Amount(value.CurrentPrice>0?(decimal?)value.CurrentPrice:null),Amount(rowQuantityPending?null:value.CostBasis),Amount(market),Amount(profit),returnText,priceReceivedUtc.TryGetValue(held.Code,out stamp)?MarketTime.ToKorea(stamp).ToString("MM-dd HH:mm:ss",CultureInfo.InvariantCulture):"미조회",HoldingDecisionAt(held,now),HoldingOrderStatus(held,orderSnapshot),orderable,HoldingQuantityPending(held)??"원본 수량 표시");
+                int row=holdingsGrid.Rows.Add(value.Code,value.Name,value.Quantity,Amount(value.AveragePrice>0?(decimal?)value.AveragePrice:null),Amount(value.CurrentPrice>0?(decimal?)value.CurrentPrice:null),Amount(rowQuantityPending?null:value.CostBasis),Amount(market),Amount(profit),returnText,priceReceivedUtc.TryGetValue(held.Code,out stamp)?MarketTime.ToKorea(stamp).ToString("MM-dd HH:mm:ss",CultureInfo.InvariantCulture):"미조회",HoldingDecisionAt(held,now),HoldingOrderStatus(held,orderSnapshot),orderable,HoldingQuantityDescription(held));
                 holdingsGrid.Rows[row].Cells[8].ToolTipText=HoldingReturnTooltip(value,details);
                 holdingsGrid.Rows[row].Cells[6].ToolTipText=details!=null&&details.MarketValue.HasValue?"증권사 SABA609Q1 MO18 평가금액 / 잔고 응답 기준":"잔고수량 × 현재가 / 수량 대사 중에는 미확인";
                 holdingsGrid.Rows[row].Cells[7].ToolTipText=details!=null&&details.UnrealizedProfit.HasValue?"증권사 SABA609Q1 MO19 미실현손익 / 비용 포함 여부는 증권사 산출 기준":"잔고수량 × (현재가 - 평균단가), 비용 제외 / 수량 대사 중에는 미확인";

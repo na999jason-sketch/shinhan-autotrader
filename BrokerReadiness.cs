@@ -155,40 +155,51 @@ namespace ShinhanNativeTrader {
         }
         public bool ObserveTradeBalance(BrokerHoldingsSnapshot value) {
             if(value==null)throw new ArgumentNullException("value");
-            var stamp=new Stamp(value.RequestStartedUtc,value.ReceivedUtc);var values=CopyHoldings(value.Holdings);
+            var evidence=CopyBalance(value);
+            var stamp=new Stamp(evidence.RequestStartedUtc,evidence.ReceivedUtc);var values=evidence.Holdings;
             lock(sync){
                 if(!Newer(holdingTime,stamp))return false;
                 var next=new Dictionary<string,Sellable>(StringComparer.Ordinal);
-                bool basisVerified=value.BasisVerified;
+                bool basisVerified=evidence.BasisVerified;
                 foreach(var h in values) {
                     int quantity,unfilled;bool validated,basis;
-                    if(!value.SellableQuantities.TryGetValue(h.Code,out quantity)||quantity<0||!value.UnfilledQuantities.TryGetValue(h.Code,out unfilled)||unfilled<0)
+                    if(!evidence.SellableQuantities.TryGetValue(h.Code,out quantity)||quantity<0||!evidence.UnfilledQuantities.TryGetValue(h.Code,out unfilled)||unfilled<0)
                         throw new ArgumentException("Trade-basis holdings are missing broker quantities.");
-                    value.CashSourceValidated.TryGetValue(h.Code,out validated);
-                    basisVerified=basisVerified&&value.BasisValidated.TryGetValue(h.Code,out basis)&&basis;
+                    evidence.CashSourceValidated.TryGetValue(h.Code,out validated);
+                    basisVerified=basisVerified&&evidence.BasisValidated.TryGetValue(h.Code,out basis)&&basis;
                     next[h.Code]=new Sellable{Code=h.Code,Quantity=quantity,Unfilled=unfilled,Validated=validated,Time=stamp};
                 }
-                if(value.UnfilledQuantities.Any(x=>x.Value>0&&!next.ContainsKey(x.Key)))throw new ArgumentException("Unmatched pending broker position evidence.");
+                if(evidence.UnfilledQuantities.Any(x=>x.Value>0&&!next.ContainsKey(x.Key)))throw new ArgumentException("Unmatched pending broker position evidence.");
                 // Unknown basis remains displayable but must not certify the
                 // account exposure for either new buys or strategy sales.
                 // A verified empty frame is allowed only through the parser's
                 // explicitly bound trade-basis request context.
-                holdings=values;holdingTime=stamp;holdingsTradeBasis=basisVerified;tradeBalanceEvidence=CopyBalance(value);sellable.Clear();foreach(var pair in next)sellable[pair.Key]=pair.Value;
-                brokerDate=value.BrokerDate;brokerDateValidated=value.BrokerDateValidated;brokerDateTime=stamp;AdvanceEpoch();return true;
+                holdings=values;holdingTime=stamp;holdingsTradeBasis=basisVerified;tradeBalanceEvidence=evidence;sellable.Clear();foreach(var pair in next)sellable[pair.Key]=pair.Value;
+                brokerDate=evidence.BrokerDate;brokerDateValidated=evidence.BrokerDateValidated;brokerDateTime=stamp;AdvanceEpoch();return true;
             }
         }
 
         static BrokerHoldingsSnapshot CopyBalance(BrokerHoldingsSnapshot value) {
             var copy=new BrokerHoldingsSnapshot{BasisVerified=value.BasisVerified,RequestBasisVerified=value.RequestBasisVerified,
-                RequestOrdinaryOnlyVerified=value.RequestOrdinaryOnlyVerified,RequestStartedUtc=value.RequestStartedUtc,ReceivedUtc=value.ReceivedUtc};
+                RequestOrdinaryOnlyVerified=value.RequestOrdinaryOnlyVerified,RequestStartedUtc=value.RequestStartedUtc,ReceivedUtc=value.ReceivedUtc,
+                BrokerDate=value.BrokerDate,BrokerDateValidated=value.BrokerDateValidated,RealizedProfit=value.RealizedProfit,
+                UnrealizedProfit=value.UnrealizedProfit,BrokerCostBasis=value.BrokerCostBasis,BrokerMarketValue=value.BrokerMarketValue,
+                BrokerReturnPercent=value.BrokerReturnPercent};
             copy.Holdings.AddRange(CopyHoldings(value.Holdings));
             foreach(var x in value.BasisValidated)copy.BasisValidated.Add(x.Key,x.Value);
             foreach(var x in value.BasisDiagnostics)copy.BasisDiagnostics.Add(x.Key,x.Value);
+            foreach(var x in value.BasisValueDiagnostics)copy.BasisValueDiagnostics.Add(x.Key,x.Value);
+            foreach(var x in value.ReportedQuantities)copy.ReportedQuantities.Add(x.Key,x.Value);
+            foreach(var x in value.Details)copy.Details.Add(x.Key,x.Value==null?null:x.Value.Copy());
             foreach(var x in value.SellableQuantities)copy.SellableQuantities.Add(x.Key,x.Value);
             foreach(var x in value.UnfilledQuantities)copy.UnfilledQuantities.Add(x.Key,x.Value);
             foreach(var x in value.CashSourceValidated)copy.CashSourceValidated.Add(x.Key,x.Value);
             foreach(var x in value.CashProfileCompatible)copy.CashProfileCompatible.Add(x.Key,x.Value);
             foreach(var x in value.CashProfileDiagnostics)copy.CashProfileDiagnostics.Add(x.Key,x.Value);
+            // Copy the parser's immutable profile/row binding, then recompute
+            // source validity against these private original quantities and
+            // valuation fields. UI DTO mutation cannot replace broker proof.
+            copy.CopyQuantityEvidenceFrom(value);
             return copy;
         }
         public bool ObserveOrdinaryBalance(BrokerHoldingsSnapshot value) {
@@ -200,10 +211,15 @@ namespace ShinhanNativeTrader {
         static bool Fresh(Stamp stamp,DateTime now,DateTime barrier){return stamp!=null&&stamp.Started>barrier&&stamp.Received<=now&&now-stamp.Received<=TimeSpan.FromSeconds(5);}
         static string QuantityConflict(BrokerHoldingsSnapshot value,Holding position) {
             int quantity,unfilled;
-            if(value==null||position==null||!value.SellableQuantities.TryGetValue(position.Code,out quantity)||quantity<=position.Quantity)return null;
+            if(value==null||position==null)return null;
+            bool available=value.SellableQuantities.TryGetValue(position.Code,out quantity);
+            bool sourceVerified=value.QuantitySource(position.Code)==BrokerHoldingQuantitySource.ReportedMo4
+                ||value.IsCurrentQuantityVerified(position.Code);
+            if(sourceVerified&&(!available||quantity<=position.Quantity))return null;
             value.UnfilledQuantities.TryGetValue(position.Code,out unfilled);
             return "잔고 수량 대조 필요 "+position.Code+" (잔고 "+position.Quantity.ToString(CultureInfo.InvariantCulture)
-                +"주, 주문가능 "+quantity.ToString(CultureInfo.InvariantCulture)+"주, 미체결 "+unfilled.ToString(CultureInfo.InvariantCulture)+"주)";
+                +"주, 주문가능 "+(available?quantity.ToString(CultureInfo.InvariantCulture):"미확인")+"주, 미체결 "+unfilled.ToString(CultureInfo.InvariantCulture)+"주)"
+                +(sourceVerified?"":" / 현재 수량 출처 확인 필요: "+value.QuantityValidationDiagnostic(position.Code));
         }
         static List<string> QuantityConflicts(BrokerHoldingsSnapshot value) {
             return value==null?new List<string>():value.Holdings.OrderBy(position=>position.Code,StringComparer.Ordinal)
@@ -310,11 +326,13 @@ namespace ShinhanNativeTrader {
                 if(intent.Kind!=LiveOrderKind.Cancel){result.Require(checks.QuoteVerified,"종목별 실제 장중 시세 확인 필요");result.Require(checks.PriceRuleVerified,"종목별 가격·호가단위 확인 필요");}
                 checks.OperatingLimit=operatingRemainingLimit;
                 if(effective==LiveOrderKind.Buy) {
-                    // A larger raw orderable quantity cannot establish which
-                    // holding total is complete. Keep the copied values intact
-                    // and withhold new exposure until a fresh query agrees.
+                    // Exposure uses the privately verified current quantity,
+                    // including the expanded profile's direct MO32 source.
+                    // The independent raw MO4 is never enlarged from MO10.
                     var quantityConflicts=QuantityConflicts(tradeBalanceEvidence);
                     foreach(var reason in quantityConflicts)result.Require(false,reason+" / 보유 원가 확인 전 추가 매수 대기");
+                    bool quantitySourceVerified=tradeBalanceEvidence!=null&&tradeBalanceEvidence.QuantityExposureVerified;
+                    result.Require(quantitySourceVerified,"현재 잔고수량·평가 근거 확인 전 추가 매수 대기");
                     bool cf=Fresh(cashTime,nowUtc,barrier);AccountOrderCapacity capacity;Stamp ct;
                     bool capacityFound=capacities.TryGetValue(CapacityKey(intent.Code,intent.LimitPrice),out capacity)&&capacityTimes.TryGetValue(CapacityKey(intent.Code,intent.LimitPrice),out ct);
                     bool capf=capacityFound&&Fresh(capacityTimes[CapacityKey(intent.Code,intent.LimitPrice)],nowUtc,barrier);
@@ -322,7 +340,7 @@ namespace ShinhanNativeTrader {
                     result.Require(capf&&capacity!=null&&capacity.Ratio==100,"현재 종목·가격의 현금100% 가능수량 확인 필요");
                     if(cf){checks.Cash100Orderable=cash.Cash100Orderable;stamps.Add(cashTime.Received);}
                     if(capf){checks.CapacityAmount=capacity.Amount;checks.CapacityQuantity=(int)capacity.Quantity;stamps.Add(capacityTimes[CapacityKey(intent.Code,intent.LimitPrice)].Received);}
-                    checks.OrderableAmountVerified=cf&&capf&&cash.Cash100Orderable>=0&&quantityConflicts.Count==0;
+                    checks.OrderableAmountVerified=cf&&capf&&cash.Cash100Orderable>=0&&quantitySourceVerified&&quantityConflicts.Count==0;
                     decimal reserved=journalValid?journal.Orders.Where(x=>x!=null&&IsWorking(x)&&x.TradeKind==LiveOrderKind.Buy).Sum(x=>(x.Quantity-x.FilledQuantity-x.CancelledQuantity)*x.LimitPrice):0;
                     var amount=intent.Quantity*intent.LimitPrice;
                     result.Require(checks.OrderableAmountVerified&&intent.Quantity<=checks.CapacityQuantity&&amount<=checks.Cash100Orderable&&amount<=checks.CapacityAmount,"실제 주문가능금액·수량 범위 확인 필요");

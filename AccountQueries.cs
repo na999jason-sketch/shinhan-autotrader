@@ -139,13 +139,16 @@ namespace ShinhanNativeTrader {
         public bool HasExecutionIds { get { return false; } }
     }
 
-    // Independently returned optional SABA609Q1 fields. These are observation
-    // data only: no field here replaces MO4 holdings or authorizes an order.
+    // Independent SABA609Q1 observations. Only a recognized, request-bound
+    // expanded profile with exact same-callback valuation corroboration may
+    // use its direct MO32 quantity. No quantity is inferred from money or orders.
     public sealed class BrokerHoldingDetails {
         public decimal? PreviousSellQuantity,TodaySellQuantity,PreviousBuyQuantity,TodayBuyQuantity,SettlementQuantity,EvaluationQuantity;
         public decimal? MarketValue,UnrealizedProfit,ReturnPercent,AveragePrice,CurrentPrice;
         public BrokerHoldingDetails Copy(){return (BrokerHoldingDetails)MemberwiseClone();}
     }
+
+    public enum BrokerHoldingQuantitySource { ReportedMo4,VerifiedEvaluationMo32,UnverifiedExpandedProfile }
 
     public sealed class BrokerHoldingsSnapshot {
         // Quantity basis comes from a successfully bound SI3=1 full request and
@@ -153,7 +156,79 @@ namespace ShinhanNativeTrader {
         // MO2 remains diagnostic metadata: known conflicting bases invalidate
         // the row, while a missing echo never substitutes for request evidence.
         public readonly List<Holding> Holdings=new List<Holding>();
+        public readonly Dictionary<string,decimal> ReportedQuantities=new Dictionary<string,decimal>(StringComparer.Ordinal);
         public readonly Dictionary<string,BrokerHoldingDetails> Details=new Dictionary<string,BrokerHoldingDetails>(StringComparer.Ordinal);
+        public IndiHoldingsSchemaInfo QuantitySchemaInfo {get;private set;}
+        sealed class QuantityEvidence {
+            public readonly decimal Reported,Selected;
+            public readonly int Orderable,Unfilled;
+            public readonly BrokerHoldingDetails Original;
+            public readonly string Hash,Reason;
+            public readonly bool Trade,Ordinary,Validated;
+            public QuantityEvidence(decimal reported,decimal selected,int orderable,int unfilled,BrokerHoldingDetails original,
+                string hash,string reason,bool trade,bool ordinary,bool validated) {
+                Reported=reported;Selected=selected;Orderable=orderable;Unfilled=unfilled;Original=original.Copy();
+                Hash=hash;Reason=reason;Trade=trade;Ordinary=ordinary;Validated=validated;
+            }
+        }
+        readonly Dictionary<string,QuantityEvidence> quantityEvidence=new Dictionary<string,QuantityEvidence>(StringComparer.Ordinal);
+        bool HasExpandedProfile {get{return QuantitySchemaInfo!=null&&QuantitySchemaInfo.Recognized;}}
+        internal void BindQuantitySchema(IndiHoldingsSchemaInfo schema){QuantitySchemaInfo=schema;}
+        static bool ResolveQuantity(BrokerHoldingDetails details,int orderable,out decimal quantity,out string reason) {
+            quantity=0;
+            if(details==null||!details.EvaluationQuantity.HasValue){reason="EvaluationQuantityUnavailable";return false;}
+            quantity=details.EvaluationQuantity.Value;
+            if(quantity<0||quantity!=decimal.Truncate(quantity)||quantity>int.MaxValue){reason="EvaluationQuantityOutOfRange";return false;}
+            if(!details.MarketValue.HasValue||details.MarketValue.Value<0){reason="MarketValueUnavailable";return false;}
+            if(!details.CurrentPrice.HasValue||details.CurrentPrice.Value<0||quantity>0&&details.CurrentPrice.Value<=0){reason="CallbackPriceUnavailable";return false;}
+            decimal value;
+            try {value=quantity*details.CurrentPrice.Value;}catch(OverflowException){reason="ValuationOutOfRange";return false;}
+            if(value!=details.MarketValue.Value){reason="ValuationMismatch";return false;}
+            if(orderable<0||orderable>quantity){reason="OrderableExceedsEvaluationQuantity";return false;}
+            reason="VerifiedEvaluationMo32";return true;
+        }
+        internal decimal SelectQuantity(string code,decimal reported,int orderable,int unfilled,BrokerHoldingDetails details) {
+            if(!HasExpandedProfile)return reported;
+            decimal selected=reported,candidate;string reason="RequestScopeUnverified";
+            bool valid=RequestBasisVerified!=RequestOrdinaryOnlyVerified;
+            if(valid){valid=ResolveQuantity(details,orderable,out candidate,out reason);if(valid)selected=candidate;}
+            quantityEvidence.Add(code,new QuantityEvidence(reported,selected,orderable,unfilled,details,QuantitySchemaInfo.Sha256,
+                reason,RequestBasisVerified,RequestOrdinaryOnlyVerified,valid));
+            return selected;
+        }
+        bool MatchesQuantityEvidence(string code,QuantityEvidence evidence) {
+            if(evidence==null||!evidence.Validated||!HasExpandedProfile||evidence.Hash!=QuantitySchemaInfo.Sha256
+                ||evidence.Trade!=RequestBasisVerified||evidence.Ordinary!=RequestOrdinaryOnlyVerified||evidence.Trade==evidence.Ordinary)return false;
+            decimal reported;int orderable,unfilled;BrokerHoldingDetails details;
+            if(!ReportedQuantities.TryGetValue(code,out reported)||reported!=evidence.Reported
+                ||!SellableQuantities.TryGetValue(code,out orderable)||orderable!=evidence.Orderable
+                ||!UnfilledQuantities.TryGetValue(code,out unfilled)||unfilled!=evidence.Unfilled
+                ||!Details.TryGetValue(code,out details)||details==null
+                ||details.EvaluationQuantity!=evidence.Original.EvaluationQuantity||details.MarketValue!=evidence.Original.MarketValue
+                ||details.CurrentPrice!=evidence.Original.CurrentPrice||details.AveragePrice!=evidence.Original.AveragePrice)return false;
+            var positions=Holdings.Where(x=>x!=null&&x.Code==code).ToList();decimal quantity;string reason;
+            return positions.Count==1&&positions[0].Quantity==evidence.Selected&&positions[0].AvgPrice==evidence.Original.AveragePrice
+                &&ResolveQuantity(details,orderable,out quantity,out reason)&&quantity==evidence.Selected;
+        }
+        public bool IsCurrentQuantityVerified(string code) {
+            QuantityEvidence evidence;
+            return code!=null&&quantityEvidence.TryGetValue(code,out evidence)&&MatchesQuantityEvidence(code,evidence);
+        }
+        public BrokerHoldingQuantitySource QuantitySource(string code) {
+            return !HasExpandedProfile?BrokerHoldingQuantitySource.ReportedMo4:IsCurrentQuantityVerified(code)
+                ?BrokerHoldingQuantitySource.VerifiedEvaluationMo32:BrokerHoldingQuantitySource.UnverifiedExpandedProfile;
+        }
+        public string QuantityValidationDiagnostic(string code) {
+            if(!HasExpandedProfile)return "LegacyReportedMo4";
+            QuantityEvidence evidence;
+            if(code==null||!quantityEvidence.TryGetValue(code,out evidence))return "MissingPrivateQuantityEvidence";
+            return !evidence.Validated?evidence.Reason:MatchesQuantityEvidence(code,evidence)?"VerifiedEvaluationMo32":"QuantityEvidenceChanged";
+        }
+        internal void CopyQuantityEvidenceFrom(BrokerHoldingsSnapshot source) {
+            quantityEvidence.Clear();QuantitySchemaInfo=source==null?null:source.QuantitySchemaInfo;
+            if(source==null||!source.HasExpandedProfile)return;
+            foreach(var pair in source.quantityEvidence)quantityEvidence.Add(pair.Key,pair.Value);
+        }
         public bool BasisVerified,RequestBasisVerified,RequestOrdinaryOnlyVerified;
         public readonly Dictionary<string,bool> BasisValidated=new Dictionary<string,bool>(StringComparer.Ordinal);
         public readonly Dictionary<string,string> BasisDiagnostics=new Dictionary<string,string>(StringComparer.Ordinal);
@@ -165,13 +240,16 @@ namespace ShinhanNativeTrader {
         // This is a consistency indicator, not account/session authorization.
         public bool HasQuantityConflict(string code) {
             if(code==null)return false;
+            if(HasExpandedProfile&&Holdings.Any(holding=>holding!=null&&holding.Code==code)&&!IsCurrentQuantityVerified(code))return true;
             int orderable;
             return SellableQuantities.TryGetValue(code,out orderable)
                 &&Holdings.Any(holding=>holding!=null&&holding.Code==code&&orderable>holding.Quantity);
         }
         public bool QuantityExposureVerified {get{
+            if(HasExpandedProfile&&RequestBasisVerified==RequestOrdinaryOnlyVerified)return false;
             foreach(var holding in Holdings) {
                 int orderable;
+                if(holding!=null&&HasExpandedProfile&&!IsCurrentQuantityVerified(holding.Code))return false;
                 if(holding!=null&&holding.Code!=null&&SellableQuantities.TryGetValue(holding.Code,out orderable)&&orderable>holding.Quantity)return false;
             }
             return true;
@@ -181,7 +259,8 @@ namespace ShinhanNativeTrader {
             foreach(var holding in Holdings) {
                 if(holding==null||holding.Code==null)continue;
                 int orderable;
-                result[holding.Code]=!SellableQuantities.TryGetValue(holding.Code,out orderable)?"Unavailable":orderable>holding.Quantity
+                result[holding.Code]=HasExpandedProfile&&!IsCurrentQuantityVerified(holding.Code)?"EvaluationQuantityUnverified"
+                    :!SellableQuantities.TryGetValue(holding.Code,out orderable)?"Unavailable":orderable>holding.Quantity
                     ?"OrderableExceedsReportedHoldings":"OrderableWithinReportedHoldings";
             }
             return result;
@@ -408,7 +487,7 @@ namespace ShinhanNativeTrader {
         }
         public static string QuantityDiagnosticsSummary(BrokerHoldingsSnapshot snapshot) {
             if(snapshot==null)return "SABA609Q1 quantity relation: SnapshotUnavailable";
-            var categories=new[]{"OrderableWithinReportedHoldings","OrderableExceedsReportedHoldings","Unavailable"};
+            var categories=new[]{"OrderableWithinReportedHoldings","OrderableExceedsReportedHoldings","EvaluationQuantityUnverified","Unavailable"};
             var counts=categories.ToDictionary(x=>x,x=>0,StringComparer.Ordinal);
             foreach(var category in snapshot.QuantityConsistency.Values)counts[category]++;
             var context=snapshot.RequestBasisVerified?(snapshot.RequestOrdinaryOnlyVerified?"Conflicting":"Trade")
@@ -430,10 +509,12 @@ namespace ShinhanNativeTrader {
             if(raw==null)return "Unavailable";if(raw=="")return "Blank";
             return value.HasValue?(value.Value==0?"Zero":"Positive"):"Malformed";
         }
-        public static BrokerHoldingsSnapshot ReadHoldings(IIndiTransport io,DateTime receivedUtc,bool tradeBasisRequested=false,bool ordinaryOnlyRequested=false) {
+        public static BrokerHoldingsSnapshot ReadHoldings(IIndiTransport io,DateTime receivedUtc,bool tradeBasisRequested=false,bool ordinaryOnlyRequested=false,
+            IndiHoldingsSchemaInfo holdingsSchema=null) {
             if(io==null)throw new ArgumentNullException("io");Utc(receivedUtc);
             const string query="SABA609Q1";
             var result=new BrokerHoldingsSnapshot {ReceivedUtc=receivedUtc,BrokerDate="",RequestBasisVerified=tradeBasisRequested,RequestOrdinaryOnlyVerified=ordinaryOnlyRequested};
+            result.BindQuantitySchema(holdingsSchema);
             for(int row=0,count=Rows(io,query);row<count;row++) {
                 var code=Rules.Code(Multi(io,row,0,query));
                 if(code=="")throw new AccountQueryException(query+" invalid stock symbol multi[0].");
@@ -460,16 +541,19 @@ namespace ShinhanNativeTrader {
                     // parsers: the encoded sign is not a negative share price.
                     Price=Math.Abs(Number(Multi(io,row,13,query),query+" current price[13]",true)),
                     CreditQty=CreditKind(kind)||(loan.HasValue&&loan.Value>0)?quantity:0m};
+                var details=HoldingDetails(io,row,query);
+                // Immutable callback prices are the valuation comparison's
+                // source; later live display price changes are unrelated.
+                details.AveragePrice=holding.AvgPrice;details.CurrentPrice=holding.Price;
+                result.ReportedQuantities.Add(code,quantity);
+                holding.Quantity=result.SelectQuantity(code,quantity,(int)sellable,(int)unfilled,details);
+                holding.CreditQty=CreditKind(kind)||(loan.HasValue&&loan.Value>0)?holding.Quantity:0m;
                 result.Holdings.Add(holding);
                 result.BasisValidated.Add(code,basisValidated);
                 result.BasisDiagnostics.Add(code,BasisDiagnostic(basis));
                 result.BasisValueDiagnostics.Add(code,BasisValueDiagnostic(basis));
                 result.SellableQuantities.Add(code,(int)sellable);
                 result.UnfilledQuantities.Add(code,(int)unfilled);
-                var details=HoldingDetails(io,row,query);
-                // Preserve the callback's exact validated prices before live SC
-                // updates can mutate the separate display Holding object.
-                details.AveragePrice=holding.AvgPrice;details.CurrentPrice=holding.Price;
                 result.Details.Add(code,details);
                 result.CashSourceValidated.Add(code,cash);
                 result.CashProfileCompatible.Add(code,!CreditKind(kind)&&(string.IsNullOrEmpty(loanRaw)||loan.HasValue&&loan.Value==0));
@@ -505,11 +589,13 @@ namespace ShinhanNativeTrader {
             Utc(utc);if(maxAgeSeconds<0||maxAgeSeconds>120)throw new ArgumentOutOfRangeException("maxAgeSeconds");
             if(Rules.Code(code)!=code||string.IsNullOrEmpty(code)||!RecentHoldings(trade,utc,maxAgeSeconds)
                 ||!trade.RequestBasisVerified||!trade.BasisVerified)return false;
+            if(trade.QuantitySchemaInfo!=null&&trade.QuantitySchemaInfo.Recognized&&!trade.IsCurrentQuantityVerified(code))return false;
             bool basis;if(!trade.BasisValidated.TryGetValue(code,out basis)||!basis)return false;
             var position=trade.Holdings.SingleOrDefault(x=>x.Code==code);
             if(position==null||position.Quantity<=0||position.AvgPrice<=0||position.CreditQty!=0)return false;
             bool direct;if(trade.CashSourceValidated.TryGetValue(code,out direct)&&direct)return true;
             if(!RecentHoldings(ordinary,utc,maxAgeSeconds)||!ordinary.RequestOrdinaryOnlyVerified)return false;
+            if(ordinary.QuantitySchemaInfo!=null&&ordinary.QuantitySchemaInfo.Recognized&&!ordinary.IsCurrentQuantityVerified(code))return false;
             bool compatible;
             if(!trade.CashProfileCompatible.TryGetValue(code,out compatible)||!compatible
                 ||!ordinary.CashProfileCompatible.TryGetValue(code,out compatible)||!compatible)return false;

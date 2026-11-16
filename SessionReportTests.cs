@@ -13,6 +13,26 @@ namespace ShinhanNativeTrader {
             bool rejected=false;try{action();}catch(ArgumentException){rejected=true;}
             Check(rejected,name);
         }
+        sealed class ExpandedHoldingsResponse : IIndiTransport {
+            public event Action<int> ReceiveData {add{} remove{}}
+            public event Action<int> ReceiveSysMsg {add{} remove{}}
+            public event Action<string> Error {add{} remove{}}
+            readonly Dictionary<int,string> multi=new Dictionary<int,string>{{0,"A005930"},{1,"SYNTHETIC"},{2,"0"},{3,"보통"},
+                {4,"0"},{5,"0"},{6,"0"},{7,"0"},{8,"18"},{9,"18"},{10,"18"},{11,"0"},{12,"8160"},{13,"7870"},
+                {18,"141660"},{19,"-5220"},{20,"-3.5539"},{22,"0"},{32,"18"}};
+            public object Invoke(string method,params object[] arguments) {
+                if(method=="GetMultiRowCount")return 1;
+                if(method=="GetMultiData") {
+                    string value;return multi.TryGetValue((int)arguments[1],out value)?value:"";
+                }
+                if(method=="GetSingleData") {
+                    int field=(int)arguments[0];
+                    return field==15?"146880":field==18?"141660":field==19?"-5220":field==22?"-3.5539":"";
+                }
+                throw new InvalidOperationException("Unexpected synthetic holdings reader method: "+method);
+            }
+            public void Dispose(){}
+        }
         static string ReportFixture(string directory,string name,DateTime modifiedUtc) {
             Directory.CreateDirectory(directory);
             var path=Path.Combine(directory,name);
@@ -112,6 +132,7 @@ namespace ShinhanNativeTrader {
             var balance=new BrokerHoldingsSnapshot{BasisVerified=true,RequestBasisVerified=true,
                 RequestStartedUtc=utc.AddMilliseconds(-10),ReceivedUtc=utc};
             balance.Holdings.Add(holding);balance.SellableQuantities[holding.Code]=2;
+            balance.ReportedQuantities[holding.Code]=0;
             balance.UnfilledQuantities[holding.Code]=2;
             var accepted=new LiveOrderRecord{Code=holding.Code,Kind=LiveOrderKind.Buy,Quantity=2,
                 LimitPrice=10000,BrokerOrderNumber="5522",Status=LiveOrderStatus.Working,UpdatedUtc=utc};
@@ -135,7 +156,7 @@ namespace ShinhanNativeTrader {
             Check(holding.Quantity==0&&balance.SellableQuantities[holding.Code]==2
                 &&accepted.Status==LiveOrderStatus.Working&&accepted.FilledQuantity==0,
                 "reporting disagreement preserves source quantities and durable order evidence");
-            holding.Quantity=2;balance.UnfilledQuantities[holding.Code]=0;
+            holding.Quantity=2;balance.ReportedQuantities[holding.Code]=2;balance.UnfilledQuantities[holding.Code]=0;
             balance.RequestStartedUtc=utc.AddSeconds(1);balance.ReceivedUtc=utc.AddSeconds(2);
             SessionReport.Write(root,day,utc.AddSeconds(2),new[]{holding},balance.ReceivedUtc,null,orders,
                 new[]{accepted},"실주문 운영 시작됨",null,balance);
@@ -155,12 +176,14 @@ namespace ShinhanNativeTrader {
                 RequestStartedUtc=utc.AddSeconds(-2),ReceivedUtc=utc.AddSeconds(-1),BrokerCostBasis=20200,
                 BrokerMarketValue=19800,UnrealizedProfit=-400,BrokerReturnPercent=-1.9802m};
             trade.Holdings.Add(held);trade.SellableQuantities[held.Code]=18;trade.UnfilledQuantities[held.Code]=0;
+            trade.ReportedQuantities[held.Code]=0;
             trade.Details[held.Code]=new BrokerHoldingDetails{PreviousSellQuantity=1,TodaySellQuantity=2,
                 PreviousBuyQuantity=3,TodayBuyQuantity=4,SettlementQuantity=5,EvaluationQuantity=6,
                 MarketValue=19800,UnrealizedProfit=-246.8m,ReturnPercent=-1.234m,AveragePrice=10000,CurrentPrice=9900};
             var ordinary=new BrokerHoldingsSnapshot{RequestOrdinaryOnlyVerified=true,
                 RequestStartedUtc=utc.AddSeconds(-4),ReceivedUtc=utc.AddSeconds(-3)};
             ordinary.Holdings.Add(new Holding{Code=held.Code,Quantity=9,AvgPrice=10000,Price=9900});
+            ordinary.ReportedQuantities[held.Code]=9;
             ordinary.SellableQuantities[held.Code]=8;ordinary.UnfilledQuantities[held.Code]=7;
             ordinary.Details[held.Code]=new BrokerHoldingDetails{PreviousSellQuantity=6,TodaySellQuantity=5,
                 PreviousBuyQuantity=4,TodayBuyQuantity=3,SettlementQuantity=2,EvaluationQuantity=1,
@@ -187,12 +210,12 @@ namespace ShinhanNativeTrader {
             var tradeText=text.Substring(tradeStart,ordinaryStart-tradeStart);
             var ordinaryText=text.Substring(ordinaryStart,ordersStart-ordinaryStart);
             Check(tradeText.Contains("\"조회 기준\",\"매매기준 SI3=1\"")
-                &&tradeText.Contains("\"'005930\",0,1,2,3,4,5,18,0,19800,-246.8,-1.234,6,10000,9900\r\n")
+                &&tradeText.Contains("\"'005930\",0,1,2,3,4,5,18,0,19800,-246.8,-1.234,6,10000,9900,")
                 &&tradeText.Contains("\"요청시각\",\"2026-11-13 06:19:58 UTC\"")
                 &&tradeText.Contains("\"응답시각\",\"2026-11-13 06:19:59 UTC\""),
                 "trade raw fields preserve every independently named quantity and signed valuation from their own request and callback");
             Check(ordinaryText.Contains("\"조회 기준\",\"보통잔고 SI3=5\"")
-                &&ordinaryText.Contains("\"'005930\",9,6,5,4,3,2,8,7,12345,678,9.87,1,\"미확인\",\"미확인\"\r\n")
+                &&ordinaryText.Contains("\"'005930\",9,6,5,4,3,2,8,7,12345,678,9.87,1,\"미확인\",\"미확인\",")
                 &&ordinaryText.Contains("\"요청시각\",\"2026-11-13 06:19:56 UTC\"")
                 &&ordinaryText.Contains("\"응답시각\",\"2026-11-13 06:19:57 UTC\"")
                 &&!ordinaryText.Contains("-246.8")&&!tradeText.Contains("9.87"),
@@ -206,7 +229,7 @@ namespace ShinhanNativeTrader {
                 new[]{accepted},"실주문 운영 시작됨",null,trade,ordinary);
             text=File.ReadAllText(path);
             Check(text.Contains("\"'005930\",0,10000,9800,")
-                &&text.Contains("\"'005930\",0,1,2,3,4,5,18,0,19800,-246.8,-1.234,6,10000,9900\r\n")
+                &&text.Contains("\"'005930\",0,1,2,3,4,5,18,0,19800,-246.8,-1.234,6,10000,9900,")
                 &&trade.Details[held.Code].CurrentPrice==9900,
                 "a later quote updates the displayed holding price while raw MO12 and MO13 remain the original callback values");
             held.Price=9900;
@@ -226,7 +249,7 @@ namespace ShinhanNativeTrader {
             ordinaryStart=text.IndexOf("\"잔고 원본 수량·평가(보통잔고)\"",StringComparison.Ordinal);
             tradeText=text.Substring(tradeStart,ordinaryStart-tradeStart);
             ordinaryText=text.Substring(ordinaryStart);
-            Check(tradeText.Contains("\"'005930\",0,\"미확인\",\"미확인\",\"미확인\",\"미확인\",\"미확인\",18,0,\"미확인\",\"미확인\",\"미확인\",\"미확인\",\"미확인\",\"미확인\"\r\n")
+            Check(tradeText.Contains("\"'005930\",0,\"미확인\",\"미확인\",\"미확인\",\"미확인\",\"미확인\",18,0,\"미확인\",\"미확인\",\"미확인\",\"미확인\",\"미확인\",\"미확인\",")
                 &&text.Contains("\"총 매입금액(증권사 SO15)\",\"미확인\"")
                 &&text.Contains("\"평가수익률(증권사 SO22)\",\"미확인\""),
                 "absent optional raw quantities, valuation and rates remain unknown rather than fabricated zeros");
@@ -240,6 +263,46 @@ namespace ShinhanNativeTrader {
             ordinary.RequestStartedUtc=utc;ordinary.ReceivedUtc=day;
             Reject(()=>SessionReport.Write(Path.GetDirectoryName(path),day,utc,new[]{held},trade.ReceivedUtc,
                 null,null,null,"",null,trade,ordinary),"ordinary raw snapshot response time must explicitly be UTC");
+        }
+        static void TestVerifiedCurrentQuantity(string directory,DateTime day,DateTime utc) {
+            var schema=IndiHoldingsSchema.Inspect(IndiHoldingsSchemaTests.ModernDefinition());
+            var trade=AccountQueries.ReadHoldings(new ExpandedHoldingsResponse(),utc,true,false,schema);
+            var ordinary=AccountQueries.ReadHoldings(new ExpandedHoldingsResponse(),utc.AddSeconds(1),false,true,schema);
+            trade.RequestStartedUtc=utc.AddMilliseconds(-10);ordinary.RequestStartedUtc=utc.AddMilliseconds(10);
+            var path=SessionReport.Write(Path.Combine(directory,"verified-current-quantity"),day,utc.AddSeconds(2),
+                trade.Holdings,trade.ReceivedUtc,null,null,null,"실주문 운영 시작됨",null,trade,ordinary);
+            var text=File.ReadAllText(path);
+            Check(schema.Recognized&&trade.Holdings[0].Quantity==18&&trade.ReportedQuantities["005930"]==0
+                &&trade.QuantitySource("005930")==BrokerHoldingQuantitySource.VerifiedEvaluationMo32
+                &&trade.IsCurrentQuantityVerified("005930"),
+                "a structurally recognized synthetic callback selects direct evaluation quantity while preserving original MO4 zero");
+            Check(text.Contains("\"'005930\",18,8160,7870,146880,141660,-5220,-3.5539,")
+                &&text.Contains("\"총 매입금액\",146880\r\n")&&text.Contains("\"총 평가금액\",141660\r\n"),
+                "report holdings and valuation use verified direct current quantity rather than zero legacy quantity or orderable inference");
+            int tradeStart=text.IndexOf("\"잔고 원본 수량·평가(매매기준)\"",StringComparison.Ordinal);
+            int ordinaryStart=text.IndexOf("\"잔고 원본 수량·평가(보통잔고)\"",StringComparison.Ordinal);
+            int ordersStart=text.IndexOf("\"증권사 주문 조회(누적 체결 스냅샷)\"",StringComparison.Ordinal);
+            var tradeText=text.Substring(tradeStart,ordinaryStart-tradeStart);
+            var ordinaryText=text.Substring(ordinaryStart,ordersStart-ordinaryStart);
+            Check(tradeText.Contains("\"'005930\",0,0,0,0,18,18,18,0,141660,-5220,-3.5539,18,8160,7870,18,")
+                &&tradeText.Contains("\"VerifiedEvaluationMo32\",\"확인\"")
+                &&tradeText.Contains("\"Modern0208\",\""+schema.Sha256+"\""),
+                "raw trade export retains MO4 zero and exact independent fields before appending canonical MO32 quantity and immutable schema evidence");
+            Check(ordinaryText.Contains("\"조회 기준\",\"보통잔고 SI3=5\"")
+                &&ordinaryText.Contains("\"'005930\",0,0,0,0,18,18,18,0,141660,-5220,-3.5539,18,8160,7870,")
+                &&trade.ReportedQuantities["005930"]==0&&ordinary.ReportedQuantities["005930"]==0,
+                "ordinary and trade views preserve their own original MO4 zeros even when their direct evaluation quantity is positive");
+            var unknownSchema=IndiHoldingsSchema.Inspect(new byte[]{0});
+            var unverified=AccountQueries.ReadHoldings(new ExpandedHoldingsResponse(),utc,true,false,unknownSchema);
+            unverified.RequestStartedUtc=utc.AddMilliseconds(-10);
+            SessionReport.Write(Path.GetDirectoryName(path),day,utc,unverified.Holdings,unverified.ReceivedUtc,
+                null,null,null,"실주문 운영 시작됨",null,unverified);
+            text=File.ReadAllText(path);
+            Check(unverified.Holdings[0].Quantity==0&&!unverified.IsCurrentQuantityVerified("005930")
+                &&text.Contains("\"'005930\",0,8160,7870,\"미확인\",\"미확인\",\"미확인\",")
+                &&text.Contains("\"ReportedMo4\",\"미확인\"")
+                &&text.Contains("\"총 매입금액\",\"미확인\"\r\n"),
+                "an unrecognized expanded profile keeps original quantity and unknown derived money instead of certifying positive evaluation or orderable shares");
         }
         public static int Run() {
             checks=0;
@@ -378,6 +441,7 @@ namespace ShinhanNativeTrader {
                 TestWriteFailures(directory,day,utc);
                 TestQuantityRefresh(directory,day,utc);
                 TestRawBrokerHoldings(directory,day,utc);
+                TestVerifiedCurrentQuantity(directory,day,utc);
             }finally{if(Directory.Exists(directory))Directory.Delete(directory,true);}
             return checks;
         }

@@ -168,6 +168,16 @@ namespace ShinhanNativeTrader {
             if(snapshot.RequestBasisVerified&&snapshot.RequestOrdinaryOnlyVerified)return "요청 기준 충돌";
             return snapshot.RequestBasisVerified?"매매기준 SI3=1":snapshot.RequestOrdinaryOnlyVerified?"보통잔고 SI3=5":"요청 기준 미검증";
         }
+        static string CurrentQuantitySource(BrokerHoldingsSnapshot snapshot,string code) {
+            return snapshot==null?Unknown:snapshot.QuantitySource(code).ToString();
+        }
+        static string QuantitySchemaProfile(BrokerHoldingsSnapshot snapshot) {
+            return snapshot!=null&&snapshot.QuantitySchemaInfo!=null&&snapshot.QuantitySchemaInfo.Recognized?"Modern0208":"Unverified";
+        }
+        static string QuantitySchemaHash(BrokerHoldingsSnapshot snapshot) {
+            var hash=snapshot==null||snapshot.QuantitySchemaInfo==null?null:snapshot.QuantitySchemaInfo.Sha256;
+            return BrokerOrderRow.SchemaHashValid(hash)?hash:Unknown;
+        }
         static void RawHoldings(StringBuilder report,string title,BrokerHoldingsSnapshot snapshot) {
             Row(report);
             Row(report,title);
@@ -177,21 +187,24 @@ namespace ShinhanNativeTrader {
             Row(report,"기준값 진단",snapshot==null?Unknown:AccountQueries.BasisDiagnosticsSummary(snapshot));
             Row(report,"코드","잔고수량(MO4)","전일매도수량(MO5)","금일매도수량(MO6)","전일매수수량(MO7)","금일매수수량(MO8)",
                 "결제일수량(MO9)","주문가능수량(MO10)","미체결수량(MO11)","평가금액(MO18)","평가손익(MO19)","수익률(MO20)","평가잔고수량(MO32)",
-                "평균단가(MO12)","현재가(MO13)");
+                "평균단가(MO12)","현재가(MO13)","현재 보유수량","현재 수량 출처","현재 수량 검증","수량 검증 진단","잔고 정의 프로필","잔고 정의 SHA256");
             if(snapshot==null)return;
             foreach(var holding in snapshot.Holdings) {
                 BrokerHoldingDetails detail;
                 snapshot.Details.TryGetValue(holding.Code,out detail);
-                int orderable=0,pending=0;
+                int orderable=0,pending=0;decimal reported;
                 bool hasOrderable=snapshot.SellableQuantities.TryGetValue(holding.Code,out orderable);
                 bool hasPending=snapshot.UnfilledQuantities.TryGetValue(holding.Code,out pending);
-                Row(report,Symbol(holding.Code),holding.Quantity,
+                bool hasReported=snapshot.ReportedQuantities.TryGetValue(holding.Code,out reported);
+                Row(report,Symbol(holding.Code),hasReported?(object)reported:null,
                     detail==null?null:detail.PreviousSellQuantity,detail==null?null:detail.TodaySellQuantity,
                     detail==null?null:detail.PreviousBuyQuantity,detail==null?null:detail.TodayBuyQuantity,
                     detail==null?null:detail.SettlementQuantity,hasOrderable?(object)orderable:null,hasPending?(object)pending:null,
                     detail==null?null:detail.MarketValue,detail==null?null:detail.UnrealizedProfit,
                     detail==null?null:detail.ReturnPercent,detail==null?null:detail.EvaluationQuantity,
-                    detail==null?null:detail.AveragePrice,detail==null?null:detail.CurrentPrice);
+                    detail==null?null:detail.AveragePrice,detail==null?null:detail.CurrentPrice,
+                    holding.Quantity,CurrentQuantitySource(snapshot,holding.Code),snapshot.IsCurrentQuantityVerified(holding.Code)?"확인":"미확인",
+                    snapshot.QuantityValidationDiagnostic(holding.Code),QuantitySchemaProfile(snapshot),QuantitySchemaHash(snapshot));
             }
         }
 
@@ -262,7 +275,8 @@ namespace ShinhanNativeTrader {
             Row(report,"실계좌 보유 종목");
             Row(report,"코드","수량","평균단가","현재가","매입금액","평가금액","평가손익(비용제외)","수익률(%)","가격 조회시각",
                 "주문가능수량(MO10)","미체결수량(MO11)","수량 대조","평가 기준",
-                "평가금액(증권사 MO18)","평가손익(증권사 MO19)","수익률 출처","수익률 요청시각","수익률 응답시각","단가등락률(%)");
+                "평가금액(증권사 MO18)","평가손익(증권사 MO19)","수익률 출처","수익률 요청시각","수익률 응답시각","단가등락률(%)",
+                "보유수량 출처","보유수량 검증","잔고 정의 프로필","잔고 정의 SHA256");
             if(holdingsKnown)foreach(var value in values) {
                 DateTime quoteUtc;
                 var received=priceReceivedUtc!=null&&priceReceivedUtc.TryGetValue(value.Code,out quoteUtc)
@@ -270,7 +284,8 @@ namespace ShinhanNativeTrader {
                 int orderable=0,pending=0;
                 bool hasOrderable=tradeHoldings!=null&&tradeHoldings.SellableQuantities.TryGetValue(value.Code,out orderable);
                 bool hasPending=tradeHoldings!=null&&tradeHoldings.UnfilledQuantities.TryGetValue(value.Code,out pending);
-                bool rowConflict=tradeHoldings!=null&&tradeHoldings.HasQuantityConflict(value.Code);
+                bool rowConflict=tradeHoldings!=null&&(tradeHoldings.HasQuantityConflict(value.Code)
+                    ||tradeHoldings.QuantitySchemaInfo!=null&&tradeHoldings.QuantitySchemaInfo.Recognized&&!tradeHoldings.IsCurrentQuantityVerified(value.Code));
                 BrokerHoldingDetails detail=null;
                 if(tradeHoldings!=null)tradeHoldings.Details.TryGetValue(value.Code,out detail);
                 decimal? brokerReturn=detail==null?null:detail.ReturnPercent;
@@ -284,7 +299,9 @@ namespace ShinhanNativeTrader {
                     detail==null?null:detail.MarketValue,detail==null?null:detail.UnrealizedProfit,
                     brokerReturn.HasValue?"증권사 SABA609Q1 MO20 / "+HoldingsContext(tradeHoldings):holdingReturn.HasValue?"응답 수량·단가 계산(비용 제외)":Unknown,
                     Stamp(brokerReturn.HasValue?tradeRequestUtc:null),
-                    Stamp(brokerReturn.HasValue?(DateTime?)tradeHoldings.ReceivedUtc:holdingReturn.HasValue?received:null),value.PriceReturnPercent);
+                    Stamp(brokerReturn.HasValue?(DateTime?)tradeHoldings.ReceivedUtc:holdingReturn.HasValue?received:null),value.PriceReturnPercent,
+                    CurrentQuantitySource(tradeHoldings,value.Code),tradeHoldings==null?Unknown:tradeHoldings.IsCurrentQuantityVerified(value.Code)?"확인":"미확인",
+                    QuantitySchemaProfile(tradeHoldings),QuantitySchemaHash(tradeHoldings));
             }
             RawHoldings(report,"잔고 원본 수량·평가(매매기준)",tradeHoldings);
             RawHoldings(report,"잔고 원본 수량·평가(보통잔고)",ordinaryHoldings);

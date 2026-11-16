@@ -554,3 +554,14 @@ UI는증권사평가값우선,없으면단가비교를별도표시;출처+조회
 보유수량0/주문가능18의원인·해당종목자동매도·추가매수보류해소는미해결. 실제새응답MO8/32등을대조해야하며새EXE실서버출력은미검증. 실제계좌조회/금전주문도구호출0회.
 Windows x86정확한HEAD실행의빌드·앱·GUI·COM·UIPI/Python결과와EXE는PR의Actions링크참조.
 상세: docs/BROKER_VALUATION_AND_RAW_QUANTITIES_20261116.md
+
+
+2.2.15 — 현재 평가잔고수량 선택·매수 한도·매도 판정 수정 (2026-11-16)
+실제09:51사용자보고서두조회: MO4=0,MO8=18,MO9=18,MO10=18,MO11=0,MO32=18,Avg8160,callbackPrice7870,MO18=141660=18*7870. SO15=146880=18*8160. Broker/LocalFilled18. 원본파일/계좌/주문번호는저장소에포함하지않음.
+IndiHoldingsSchema는0x0208/SI8/SO37/MO39의모든필드·SC/WC연결·EOF를검증. 실제3844bytes SHAe32630bb4232c1166b5a56e9a129c666808fa7c4f8a81492fa8215702eecef67 정적검사PASS. 요청별셋터/쿼리/정상콜백/ID에불변프로필연결,재시도재확인.
+직접MO32정수수량과동일callback원본가격×수량=MO18,가능수량범위를검증하고canonical현재수량으로선택. MO4는별도보존. qty/avg/원본증거변경은privateproof로검출,SC표시가격변경은허용. 검증실패는조회유지+주문보류.
+매매/보통양조회canonical선택. 보통BasisVerified승격없음. invalid현대보통잔고가raw18fallback으로cash대조통과하지못하도록보강. 매수에새보통조회gate추가없음. 운용한도는canonical18*8160=146880,예약금·신용·부분체결·취소·가능수량제한유지.
+Local x86target-warnaserrorcompile0warning/error. App2158/GUI383/reportGUI30/Python17PASS. I386/PE32/CLR32BITREQUIRED확인. Linuxpointer8은Windows실행증거와구분.
+GUIrealformsyntheticcallback:raw0/current18/cost146880/value141660,ordinarycanonical18,SC7600→손절판정,기존체결/ID보존/추가전송0. Readiness207assertions:18매도허용/19차단,remaining53120매수한도,partial10pending8,pendingSellcap8/held18,cancel,credit18,fullsoldcurrent0/raw18,DTOmutation/sourcegap.
+새EXE실제WindowsIndi현재수량반영/자동매도/후속매수는미검증. 도구실계좌조회·금전주문0회. 동일HEAD Windows Actions 빌드·앱·GUI·COM·UIPI·Python과EXE는PR링크에기록.
+상세: docs/CURRENT_EVALUATION_QUANTITY_20261116.md

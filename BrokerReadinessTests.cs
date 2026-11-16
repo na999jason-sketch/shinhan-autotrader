@@ -14,12 +14,13 @@ namespace ShinhanNativeTrader {
             public event Action<int> ReceiveSysMsg {add{} remove{}}
             public event Action<string> Error {add{} remove{}}
             public bool BasisUnavailable;
+            public int RowCount=1;
             public readonly Dictionary<int,object> Fields=new Dictionary<int,object> {
                 {0,"A005930"},{1,"Test holding"},{2,""},{3,"보통"},{4,"2"},
                 {10,"2"},{11,"0"},{12,"70000"},{13,"70000"},{22,"0"}
             };
             public object Invoke(string name,params object[] args) {
-                if(name=="GetMultiRowCount")return 1;
+                if(name=="GetMultiRowCount")return RowCount;
                 if(name=="GetSingleData")return "";
                 if(name!="GetMultiData"||Convert.ToInt32(args[0])!=0)throw new InvalidOperationException("Unexpected offline holdings getter.");
                 var field=Convert.ToInt32(args[1]);
@@ -231,6 +232,7 @@ namespace ShinhanNativeTrader {
             Reject(()=>f.Data.ObserveCash(new AccountCashSnapshot{ReceivedUtc=Now.AddSeconds(-1)},Now),"a response cannot precede its request");
             Reject(()=>f.Data.Invalidate(DateTime.SpecifyKind(Now,DateTimeKind.Local)),"local clock timestamps cannot masquerade as UTC evidence");
             QuantityConflictChecks();
+            CurrentQuantityChecks();
             TerminalCheckpointChecks();
             OrdinarySourceChecks();
             return checks;
@@ -287,6 +289,122 @@ namespace ShinhanNativeTrader {
                 Check(!f.Data.ObserveTradeBalance(balance)&&f.Evaluate().Ready,
                     "an older conflicting response cannot replace the newer consistent quantity evidence");
             }
+        }
+        static BrokerHoldingsSnapshot ExpandedBalance(int quantity=18,int orderable=18,int pending=0,bool ordinary=false,Action<HoldingsResponse> configure=null,IndiHoldingsSchemaInfo profile=null) {
+            var io=new HoldingsResponse();
+            io.Fields[0]="A000880";io.Fields[2]="0";io.Fields[3]="";io.Fields[4]="0";
+            foreach(var field in new[]{5,6,7})io.Fields[field]="0";
+            io.Fields[8]=quantity.ToString();io.Fields[9]=quantity.ToString();io.Fields[10]=orderable.ToString();io.Fields[11]=pending.ToString();
+            io.Fields[12]="8160";io.Fields[13]="7870";io.Fields[18]=(quantity*7870m).ToString();
+            io.Fields[19]=(quantity*(7870m-8160m)).ToString();io.Fields[20]="-3.55";io.Fields[32]=quantity.ToString();io.Fields[22]="0";
+            if(configure!=null)configure(io);
+            var info=profile??IndiHoldingsSchema.Inspect(IndiHoldingsSchemaTests.ModernDefinition());
+            var value=AccountQueries.ReadHoldings(io,Now.AddMilliseconds(ordinary?-90:-100),!ordinary,ordinary,info);
+            value.RequestStartedUtc=Now.AddMilliseconds(ordinary?-190:-200);return value;
+        }
+        static void ConfirmedBuy(Fixture fixture,int filled=18,int total=18) {
+            var order=Working(filled);order.Quantity=total;order.FilledQuantity=filled;order.LimitPrice=8160;
+            order.Status=filled==total?LiveOrderStatus.Filled:LiveOrderStatus.PartiallyFilled;order.RequestId=71;
+            var fields=new[]{"0","11","0","","0","synthetic acceptance","0","0"};
+            order.ResponseEvidence=LiveOrderResponseParser.Read(71,index=>fields[index],new IndiDiagnosticSnapshot{ErrorState=0},OrderResponseLayout.Modern,new string[0]);
+            fixture.Journal.Orders.Add(order);fixture.Journal.LastBrokerChangeUtc=Now.AddSeconds(-6);
+            fixture.Journal.Executions.Add(new LiveExecutionRecord{OrderId=order.Id,BrokerOrderNumber="11",TradingDate="20261112",
+                ExecutionId="synthetic-buy-execution",Quantity=filled,Price=8160,ExecutedUtc=Now.AddSeconds(-6)});
+            var orders=new BrokerOrdersSnapshot{TradingDate="20261112",ReceivedUtc=Now.AddMilliseconds(-100)};
+            orders.Orders.Add(new BrokerOrderRow{OrderNumber="00011",Code="000880",SideCode="2",ProductCode="01",CreditCode="00",
+                Quantity=total,FilledQuantity=filled,OpenQuantity=total-filled,LimitPrice=8160,AverageFillPrice=8160});
+            fixture.Orders=orders;fixture.Data.ObserveOrders(orders,Now.AddMilliseconds(-200));
+        }
+        static BrokerReadinessResult CurrentSell(Fixture fixture,int quantity=18,LiveOrderKind kind=LiveOrderKind.Sell,string original=null) {
+            var intent=new LiveOrderIntent{Kind=kind,Code="000880",Quantity=quantity,LimitPrice=7870,ClientKey="synthetic-current-exit",OriginalBrokerOrderNumber=original};
+            return fixture.Data.Evaluate(intent,new IndiReply{Code=intent.Code,Price=7870,Clock=MarketTime.ToKorea(Now).ToString("HHmmss"),HasTradeClock=true},
+                Now,true,true,fixture.Journal,1000000,Now);
+        }
+        static void CurrentQuantityChecks() {
+            var f=new Fixture();ConfirmedBuy(f);var balance=ExpandedBalance();f.Data.ObserveTradeBalance(balance);
+            Check(balance.Holdings.Single().Quantity==18&&balance.ReportedQuantities["000880"]==0
+                &&AccountValuation.From(balance.Holdings).CostBasis==146880&&balance.QuantityExposureVerified,
+                "recognized direct evaluation quantity establishes eighteen current shares and their cost while retaining raw MO4 zero");
+            Check(f.Evaluate(Buy(5),limit:200000-146880).Ready&&!f.Evaluate(Buy(6),limit:200000-146880).Ready,
+                "current filled-share cost leaves only the actual remaining operating budget despite ample broker cash and capacity");
+            Check(!CurrentSell(f).Ready&&f.Evaluate().Ready,
+                "current quantity supports further buy exposure without requiring an ordinary subset that the buy preflight does not request");
+            var ordinary=ExpandedBalance(ordinary:true);f.Data.ObserveOrdinaryBalance(ordinary);
+            var sale=CurrentSell(f);
+            Check(sale.Ready&&sale.Checks.SellableQuantityVerified&&sale.Checks.SellableQuantity==18&&!CurrentSell(f,19).Ready,
+                "fresh ordinary source corroborates the current eighteen-share cash position while an oversized sale remains blocked");
+            balance.Holdings[0].Quantity=0;balance.ReportedQuantities["000880"]=999;
+            balance.Details["000880"].EvaluationQuantity=999;balance.Details["000880"].MarketValue=1;
+            balance.BindQuantitySchema(IndiHoldingsSchema.Inspect(new byte[0]));
+            ordinary.Holdings[0].Quantity=0;ordinary.Details["000880"].MarketValue=0;
+            Check(CurrentSell(f).Ready&&f.Evaluate(Buy(5),limit:53120).Ready,
+                "later edits to canonical quantity raw MO4 valuation details or ordinary data cannot corrupt privately copied evidence");
+            var quoteChanged=ExpandedBalance();quoteChanged.Holdings[0].Price=7800;
+            f=new Fixture();ConfirmedBuy(f);f.Data.ObserveTradeBalance(quoteChanged);f.Data.ObserveOrdinaryBalance(ExpandedBalance(ordinary:true));
+            Check(CurrentSell(f).Ready&&f.Evaluate().Ready,
+                "an advancing display quote does not replace the original callback price used to corroborate MO32 and MO18");
+            foreach(var configure in new Action<HoldingsResponse>[] {
+                io=>io.Fields[32]="",io=>io.Fields[32]="17.5",io=>io.Fields[32]="-1",io=>io.Fields[32]="2147483648",
+                io=>io.Fields[18]="",io=>io.Fields[18]="141659",io=>io.Fields[18]="broken"
+            }) {
+                f=new Fixture();ConfirmedBuy(f);var bad=ExpandedBalance(configure:configure);
+                Check(f.Data.ObserveTradeBalance(bad)&&!f.Evaluate().Ready&&!f.Evaluate().Checks.OrderableAmountVerified
+                    &&!CurrentSell(f).Checks.SellableQuantityVerified,
+                    "missing malformed or inconsistent expanded quantity valuation remains readable without certifying a buy or sale");
+            }
+            var forged=ExpandedBalance();forged.Holdings[0].Quantity=19;
+            f=new Fixture();ConfirmedBuy(f);f.Data.ObserveTradeBalance(forged);
+            Check(!f.Evaluate().Ready&&!CurrentSell(f).Ready,
+                "a caller cannot certify a canonical quantity that differs from the parser-bound original MO32 evidence");
+            forged=ExpandedBalance();forged.Holdings[0].AvgPrice=1;
+            f=new Fixture();ConfirmedBuy(f);f.Data.ObserveTradeBalance(forged);
+            Check(!f.Evaluate().Ready&&!CurrentSell(f).Ready,
+                "a caller cannot understate current holding cost by changing the canonical average away from its bound callback value");
+            forged=ExpandedBalance();forged.Details["000880"].MarketValue=141661;
+            f=new Fixture();ConfirmedBuy(f);f.Data.ObserveTradeBalance(forged);
+            Check(!f.Evaluate().Ready&&!CurrentSell(f).Ready,
+                "a caller cannot replace bound original valuation evidence before readiness copies it");
+            f=new Fixture();ConfirmedBuy(f);f.Data.ObserveTradeBalance(ExpandedBalance(profile:IndiHoldingsSchema.Inspect(new byte[0])));
+            Check(!f.Evaluate().Ready&&!CurrentSell(f).Ready,
+                "an unrecognized expanded quantity profile never promotes raw MO32 into current trading evidence");
+            f=new Fixture();ConfirmedBuy(f,10,18);var partial=ExpandedBalance(10,10,8);f.Data.ObserveTradeBalance(partial);
+            Check(partial.Holdings[0].Quantity==10&&partial.UnfilledQuantities["000880"]==8
+                &&f.Evaluate(Buy(5),limit:200000-10*8160).Ready&&!f.Evaluate(Buy(6),limit:200000-10*8160).Ready,
+                "partial-buy inventory uses direct filled position quantity while the remaining buy order retains its separate budget reservation");
+            f=new Fixture();ConfirmedBuy(f);var sell=new LiveOrderRecord{Id="synthetic-pending-sell",ClientKey="prior-exit",Code="000880",BrokerOrderNumber="12",
+                TradingDate="20261112",Kind=LiveOrderKind.Sell,TradeKind=LiveOrderKind.Sell,Status=LiveOrderStatus.Working,Quantity=10,LimitPrice=7870,
+                CreatedUtc=Now.AddSeconds(-7),UpdatedUtc=Now.AddSeconds(-6)};
+            f.Journal.Orders.Add(sell);f.Orders.Orders.Add(new BrokerOrderRow{OrderNumber="12",Code="000880",SideCode="1",ProductCode="01",CreditCode="00",
+                Quantity=10,OpenQuantity=10,LimitPrice=7870});
+            f.Orders.ReceivedUtc=Now.AddMilliseconds(-50);f.Data.ObserveOrders(f.Orders,Now.AddMilliseconds(-150));
+            f.Data.ObserveTradeBalance(ExpandedBalance(18,8,10));f.Data.ObserveOrdinaryBalance(ExpandedBalance(18,8,10,true));
+            sale=CurrentSell(f,8);
+            Check(sale.Checks.SellableQuantityVerified&&sale.Checks.SellableQuantity==8&&!sale.Ready
+                &&f.Evaluate(Buy(5),limit:53120).Ready&&CurrentSell(f,10,LiveOrderKind.Cancel,"12").Ready,
+                "pending sells reserve availability without reducing current held cost or preventing independently verified cancellation");
+            foreach(var configure in new Action<HoldingsResponse>[] {io=>io.Fields[3]="유통융자",io=>io.Fields[22]="1"}) {
+                f=new Fixture();ConfirmedBuy(f);var credit=ExpandedBalance(configure:configure);
+                f.Data.ObserveTradeBalance(credit);f.Data.ObserveOrdinaryBalance(ExpandedBalance(ordinary:true,configure:configure));
+                Check(credit.Holdings[0].Quantity==18&&credit.Holdings[0].CreditQty==18&&!CurrentSell(f).Ready,
+                    "current credit quantity follows the selected MO32 position and cannot masquerade as an ordinary cash sale from raw MO4 zero");
+            }
+            f=new Fixture();ConfirmedBuy(f);
+            var completedSell=new LiveOrderRecord{Id="synthetic-completed-sell",ClientKey="completed-exit",Code="000880",BrokerOrderNumber="12",
+                TradingDate="20261112",Kind=LiveOrderKind.Sell,TradeKind=LiveOrderKind.Sell,Status=LiveOrderStatus.Filled,Quantity=18,FilledQuantity=18,LimitPrice=7870,
+                CreatedUtc=Now.AddSeconds(-7),UpdatedUtc=Now.AddSeconds(-6)};
+            f.Journal.Orders.Add(completedSell);f.Journal.Executions.Add(new LiveExecutionRecord{OrderId=completedSell.Id,BrokerOrderNumber="12",
+                TradingDate="20261112",ExecutionId="synthetic-sell-execution",Quantity=18,Price=7870,ExecutedUtc=Now.AddSeconds(-6)});
+            f.Orders.Orders.Add(new BrokerOrderRow{OrderNumber="12",Code="000880",SideCode="1",ProductCode="01",CreditCode="00",
+                Quantity=18,FilledQuantity=18,OpenQuantity=0,LimitPrice=7870,AverageFillPrice=7870});
+            f.Orders.ReceivedUtc=Now.AddMilliseconds(-50);f.Data.ObserveOrders(f.Orders,Now.AddMilliseconds(-150));
+            var closed=ExpandedBalance(0,0,0,configure:io=>{io.Fields[4]="18";io.Fields[6]="18";});
+            f.Data.ObserveTradeBalance(closed);
+            Check(closed.Holdings[0].Quantity==0&&closed.ReportedQuantities["000880"]==18&&closed.QuantityExposureVerified
+                &&AccountValuation.From(closed.Holdings).CostBasis==0&&f.Evaluate(Buy(20),limit:200000).Ready&&!CurrentSell(f,1).Ready,
+                "verified zero current evaluation quantity after a full sale never resurrects the independent positive raw MO4 into exposure or saleable stock");
+            f=new Fixture();var empty=ExpandedBalance(configure:io=>io.RowCount=0);f.Data.ObserveTradeBalance(empty);
+            Check(empty.QuantityExposureVerified&&f.Evaluate().Ready,
+                "a recognized bound empty expanded balance permits the first buy without a prior AA AD event or ordinary-only refresh");
         }
         static void TerminalCheckpointChecks() {
             var f=new Fixture();string key;

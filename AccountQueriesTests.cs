@@ -445,7 +445,113 @@ namespace ShinhanNativeTrader {
             foreach(var type in new[]{typeof(AccountCashSnapshot),typeof(AccountOrderCapacity),typeof(BrokerOrderRow),typeof(BrokerOrdersSnapshot),typeof(BrokerHoldingsSnapshot),typeof(BrokerHoldingDetails)})
                 Check(!type.GetFields().Any(f=>f.Name.IndexOf("account",StringComparison.OrdinalIgnoreCase)>=0||f.Name.IndexOf("password",StringComparison.OrdinalIgnoreCase)>=0),"broker DTO has no credential fields: "+type.Name);
             OrdinaryCashProof(utc);
+            CurrentQuantityProof(utc);
             return checks;
+        }
+        static Response CurrentQuantityResponse() {
+            var io=new Response();io.Holding(0);io.SetRow(0,4,"0");io.SetRow(0,8,"18");io.SetRow(0,9,"18");
+            io.SetRow(0,10,"18");io.SetRow(0,11,"0");io.SetRow(0,12,"8160");io.SetRow(0,13,"7870");
+            io.SetRow(0,32,"18");io.SetRow(0,18,"141660");return io;
+        }
+        static void CurrentQuantityProof(DateTime utc) {
+            var schema=IndiHoldingsSchema.Inspect(IndiHoldingsSchemaTests.ModernDefinition());
+            Check(schema.Recognized,"current quantity fixture has a structurally verified expanded installed definition");
+            var io=CurrentQuantityResponse();var frame=AccountQueries.ReadHoldings(io,utc,true,false,schema);
+            Check(frame.Holdings[0].Quantity==18&&frame.ReportedQuantities["005930"]==0&&frame.Details["005930"].EvaluationQuantity==18
+                &&frame.SellableQuantities["005930"]==18,"canonical quantity uses direct corroborated MO32 while raw MO4 and MO10 remain separate");
+            Check(frame.QuantityExposureVerified&&frame.IsCurrentQuantityVerified("005930")&&!frame.HasQuantityConflict("005930")
+                &&frame.QuantitySource("005930")==BrokerHoldingQuantitySource.VerifiedEvaluationMo32
+                &&frame.QuantitySchemaInfo.Sha256==schema.Sha256,"private request-bound profile and same-callback valuation evidence verify the current quantity source");
+            Check(frame.QuantityValidationDiagnostic("005930")=="VerifiedEvaluationMo32"&&frame.Holdings[0].AvgPrice==8160,
+                "a recognized current quantity does not change average cost or invent an execution");
+            frame.Holdings[0].Price=7600;
+            Check(frame.IsCurrentQuantityVerified("005930")&&frame.Details["005930"].CurrentPrice==7870,
+                "live SC price updates do not invalidate the separately captured callback valuation proof");
+            var copied=new BrokerHoldingsSnapshot{RequestBasisVerified=true};
+            copied.Holdings.Add(new Holding{Code="005930",Quantity=18,AvgPrice=8160,Price=7600});
+            copied.ReportedQuantities.Add("005930",0);copied.SellableQuantities.Add("005930",18);copied.UnfilledQuantities.Add("005930",0);
+            copied.Details.Add("005930",frame.Details["005930"].Copy());copied.CopyQuantityEvidenceFrom(frame);
+            Check(copied.IsCurrentQuantityVerified("005930")&&copied.QuantityExposureVerified,
+                "private financial evidence survives an exact independent snapshot copy");
+            copied.Holdings[0].AvgPrice=1;
+            Check(!copied.IsCurrentQuantityVerified("005930")&&!copied.QuantityExposureVerified&&copied.HasQuantityConflict("005930"),
+                "changing canonical average cost cannot understate exposure while retaining current quantity proof");
+            Check(frame.IsCurrentQuantityVerified("005930"),"mutating a copied snapshot never mutates the source evidence");
+            frame.Holdings[0].Quantity=19;
+            Check(!frame.IsCurrentQuantityVerified("005930")&&frame.QuantityConsistency["005930"]=="EvaluationQuantityUnverified",
+                "canonical quantity mutation invalidates the privately captured source and row diagnostic");
+            io=CurrentQuantityResponse();io.SetRow(0,2,"5");var ordinary=AccountQueries.ReadHoldings(io,utc,false,true,schema);
+            Check(ordinary.Holdings[0].Quantity==18&&ordinary.ReportedQuantities["005930"]==0&&ordinary.IsCurrentQuantityVerified("005930")
+                &&!ordinary.BasisVerified&&ordinary.RequestOrdinaryOnlyVerified,"ordinary-only response uses the same direct quantity profile without acquiring trade-basis authority");
+            io=CurrentQuantityResponse();var legacy=AccountQueries.ReadHoldings(io,utc,true);
+            Check(legacy.Holdings[0].Quantity==0&&legacy.ReportedQuantities["005930"]==0&&!legacy.QuantityExposureVerified
+                &&legacy.QuantitySource("005930")==BrokerHoldingQuantitySource.ReportedMo4,"missing profile retains raw legacy quantity without promoting an optional evaluation field");
+            var unknown=IndiHoldingsSchema.Inspect(new byte[]{0});legacy=AccountQueries.ReadHoldings(io,utc,true,false,unknown);
+            Check(legacy.Holdings[0].Quantity==0&&!legacy.IsCurrentQuantityVerified("005930"),"unrecognized definitions cannot promote MO32 to current positions");
+            var unbound=AccountQueries.ReadHoldings(io,utc,false,false,schema);
+            Check(unbound.Holdings[0].Quantity==0&&!unbound.QuantityExposureVerified
+                &&unbound.QuantityValidationDiagnostic("005930")=="RequestScopeUnverified","a recognized static definition cannot substitute for a bound broker request");
+            var forged=new BrokerHoldingsSnapshot{RequestBasisVerified=true};forged.BindQuantitySchema(schema);
+            forged.Holdings.Add(new Holding{Code="005930",Quantity=18,AvgPrice=8160,Price=7870});forged.ReportedQuantities.Add("005930",0);
+            forged.SellableQuantities.Add("005930",18);forged.UnfilledQuantities.Add("005930",0);
+            forged.Details.Add("005930",new BrokerHoldingDetails{EvaluationQuantity=18,MarketValue=141660,AveragePrice=8160,CurrentPrice=7870});
+            Check(!forged.IsCurrentQuantityVerified("005930")&&!forged.QuantityExposureVerified
+                &&forged.QuantityValidationDiagnostic("005930")=="MissingPrivateQuantityEvidence","public values and profile flags alone cannot fabricate a received quantity proof");
+            io=CurrentQuantityResponse();io.SetRow(0,32,"10");io.SetRow(0,18,"78700");io.SetRow(0,10,"10");io.SetRow(0,11,"8");
+            frame=AccountQueries.ReadHoldings(io,utc,true,false,schema);
+            Check(frame.Holdings[0].Quantity==10&&frame.UnfilledQuantities["005930"]==8&&frame.QuantityExposureVerified,
+                "a partially bought position excludes the still-unfilled eight shares instead of adding them to current holdings");
+            io=CurrentQuantityResponse();io.SetRow(0,10,"8");io.SetRow(0,11,"10");frame=AccountQueries.ReadHoldings(io,utc,true,false,schema);
+            Check(frame.Holdings[0].Quantity==18&&frame.SellableQuantities["005930"]==8&&frame.UnfilledQuantities["005930"]==10
+                &&frame.QuantityExposureVerified,"pending sales retain all eighteen current shares while eight remain available");
+            io=CurrentQuantityResponse();io.SetRow(0,4,"18");io.SetRow(0,32,"0");io.SetRow(0,18,"0");io.SetRow(0,10,"0");io.SetRow(0,13,"0");
+            frame=AccountQueries.ReadHoldings(io,utc,true,false,schema);
+            Check(frame.Holdings[0].Quantity==0&&frame.ReportedQuantities["005930"]==18&&frame.IsCurrentQuantityVerified("005930"),
+                "a broker-valued zero position after a full sale does not retain stale raw shares or require a fabricated positive quote");
+            foreach(var mutation in new Action<Response>[] {
+                value=>value.SetRow(0,32,""),value=>value.SetRow(0,32,"-1"),value=>value.SetRow(0,32,"1.5"),
+                value=>value.SetRow(0,32,"2147483648"),value=>value.SetRow(0,18,""),value=>value.SetRow(0,18,"141661"),
+                value=>value.SetRow(0,18,"-1"),value=>value.SetRow(0,13,"0"),value=>value.SetRow(0,10,"19")
+            }) {
+                io=CurrentQuantityResponse();io.SetRow(0,4,"25");mutation(io);frame=AccountQueries.ReadHoldings(io,utc,true,false,schema);
+                Check(frame.Holdings.Count==1&&frame.Holdings[0].Quantity==25&&frame.ReportedQuantities["005930"]==25
+                    &&!frame.IsCurrentQuantityVerified("005930")&&!frame.QuantityExposureVerified&&frame.HasQuantityConflict("005930")
+                    &&frame.QuantityConsistency["005930"]=="EvaluationQuantityUnverified",
+                    "missing or contradictory modern quantities and valuation retain raw observations but never silently approve current exposure");
+            }
+            io=CurrentQuantityResponse();io.SetRow(0,9,"4");io.SetRow(0,8,"7");frame=AccountQueries.ReadHoldings(io,utc,true,false,schema);
+            Check(frame.Holdings[0].Quantity==18&&frame.Details["005930"].SettlementQuantity==4&&frame.Details["005930"].TodayBuyQuantity==7
+                &&frame.QuantityExposureVerified,"settlement and today's buys remain independent diagnostics rather than a compulsory equality or quantity formula");
+            io=CurrentQuantityResponse();io.SetRow(0,3,"유통융자");io.SetRow(0,22,"1000");frame=AccountQueries.ReadHoldings(io,utc,true,false,schema);
+            Check(frame.Holdings[0].Quantity==18&&frame.Holdings[0].CreditQty==18&&!frame.CashSourceValidated["005930"],
+                "credit shares follow selected current quantity without becoming a cash position");
+            foreach(var mutation in new Action<BrokerHoldingsSnapshot>[] {
+                value=>value.ReportedQuantities["005930"]=1,value=>value.Details["005930"].EvaluationQuantity=19,
+                value=>value.Details["005930"].MarketValue=141661,value=>value.Details["005930"].CurrentPrice=7871,
+                value=>value.Details["005930"].AveragePrice=1,value=>value.SellableQuantities["005930"]=17,
+                value=>value.UnfilledQuantities["005930"]=1,value=>value.RequestBasisVerified=false
+            }) {
+                frame=AccountQueries.ReadHoldings(CurrentQuantityResponse(),utc,true,false,schema);mutation(frame);
+                Check(!frame.IsCurrentQuantityVerified("005930")&&!frame.QuantityExposureVerified,
+                    "mutation of originally captured quantity-source inputs invalidates private financial evidence");
+            }
+            var direct=AccountQueries.ReadHoldings(CurrentQuantityResponse(),utc,true,false,schema);direct.RequestStartedUtc=utc.AddMilliseconds(-100);
+            Check(AccountQueries.IsOrdinaryCashSource(direct,null,"005930",utc),
+                "a directly validated modern ordinary cash position does not acquire an unnecessary second-query requirement");
+            io=CurrentQuantityResponse();io.SetRow(0,4,"18");io.SetRow(0,32,"");
+            var invalidDirect=AccountQueries.ReadHoldings(io,utc,true,false,schema);invalidDirect.RequestStartedUtc=utc.AddMilliseconds(-100);
+            Check(invalidDirect.CashSourceValidated["005930"]&&!invalidDirect.IsCurrentQuantityVerified("005930")
+                &&!AccountQueries.IsOrdinaryCashSource(invalidDirect,null,"005930",utc),
+                "cash metadata cannot bypass missing modern current-quantity evidence through the direct-source path");
+            io=CurrentQuantityResponse();io.SetRow(0,3,"0");io.SetRow(0,22,"");
+            var trade=AccountQueries.ReadHoldings(io,utc,true,false,schema);trade.RequestStartedUtc=utc.AddMilliseconds(-100);
+            io.SetRow(0,2,"5");var subset=AccountQueries.ReadHoldings(io,utc,false,true,schema);subset.RequestStartedUtc=utc.AddMilliseconds(-100);
+            Check(AccountQueries.IsOrdinaryCashSource(trade,subset,"005930",utc),
+                "a matching verified modern ordinary subset can establish cash kind without guessing numeric metadata");
+            io.SetRow(0,4,"18");io.SetRow(0,32,"");subset=AccountQueries.ReadHoldings(io,utc,false,true,schema);subset.RequestStartedUtc=utc.AddMilliseconds(-100);
+            Check(trade.Holdings[0].Quantity==subset.Holdings[0].Quantity&&!subset.IsCurrentQuantityVerified("005930")
+                &&!AccountQueries.IsOrdinaryCashSource(trade,subset,"005930",utc),
+                "equal fallback raw shares cannot make an invalid expanded ordinary subset corroborate a verified trade position");
         }
         static BrokerHoldingsSnapshot Proof(Response io,DateTime utc,bool ordinary,bool bound=true) {
             var snapshot=AccountQueries.ReadHoldings(io,utc,!ordinary&&bound,ordinary&&bound);
