@@ -156,10 +156,50 @@ namespace ShinhanNativeTrader {
             catch(System.Security.SecurityException){return null;}
         }
 
+        static DateTime? HoldingsRequestUtc(BrokerHoldingsSnapshot snapshot) {
+            if(snapshot==null)return null;
+            RequireUtc(snapshot.ReceivedUtc);
+            if(snapshot.RequestStartedUtc==default(DateTime))return null;
+            RequireUtc(snapshot.RequestStartedUtc);
+            return snapshot.RequestStartedUtc;
+        }
+        static string HoldingsContext(BrokerHoldingsSnapshot snapshot) {
+            if(snapshot==null)return Unknown;
+            if(snapshot.RequestBasisVerified&&snapshot.RequestOrdinaryOnlyVerified)return "요청 기준 충돌";
+            return snapshot.RequestBasisVerified?"매매기준 SI3=1":snapshot.RequestOrdinaryOnlyVerified?"보통잔고 SI3=5":"요청 기준 미검증";
+        }
+        static void RawHoldings(StringBuilder report,string title,BrokerHoldingsSnapshot snapshot) {
+            Row(report);
+            Row(report,title);
+            Row(report,"조회 기준",HoldingsContext(snapshot));
+            Row(report,"요청시각",Stamp(snapshot==null||snapshot.RequestStartedUtc==default(DateTime)?null:(DateTime?)snapshot.RequestStartedUtc));
+            Row(report,"응답시각",Stamp(snapshot==null?null:(DateTime?)snapshot.ReceivedUtc));
+            Row(report,"기준값 진단",snapshot==null?Unknown:AccountQueries.BasisDiagnosticsSummary(snapshot));
+            Row(report,"코드","잔고수량(MO4)","전일매도수량(MO5)","금일매도수량(MO6)","전일매수수량(MO7)","금일매수수량(MO8)",
+                "결제일수량(MO9)","주문가능수량(MO10)","미체결수량(MO11)","평가금액(MO18)","평가손익(MO19)","수익률(MO20)","평가잔고수량(MO32)",
+                "평균단가(MO12)","현재가(MO13)");
+            if(snapshot==null)return;
+            foreach(var holding in snapshot.Holdings) {
+                BrokerHoldingDetails detail;
+                snapshot.Details.TryGetValue(holding.Code,out detail);
+                int orderable=0,pending=0;
+                bool hasOrderable=snapshot.SellableQuantities.TryGetValue(holding.Code,out orderable);
+                bool hasPending=snapshot.UnfilledQuantities.TryGetValue(holding.Code,out pending);
+                Row(report,Symbol(holding.Code),holding.Quantity,
+                    detail==null?null:detail.PreviousSellQuantity,detail==null?null:detail.TodaySellQuantity,
+                    detail==null?null:detail.PreviousBuyQuantity,detail==null?null:detail.TodayBuyQuantity,
+                    detail==null?null:detail.SettlementQuantity,hasOrderable?(object)orderable:null,hasPending?(object)pending:null,
+                    detail==null?null:detail.MarketValue,detail==null?null:detail.UnrealizedProfit,
+                    detail==null?null:detail.ReturnPercent,detail==null?null:detail.EvaluationQuantity,
+                    detail==null?null:detail.AveragePrice,detail==null?null:detail.CurrentPrice);
+            }
+        }
+
         public static string Write(string directory,DateTime koreaDate,DateTime writtenUtc,
             IEnumerable<Holding> holdings,DateTime? holdingsReceivedUtc,AccountCashSnapshot cash,
             BrokerOrdersSnapshot orders,IEnumerable<LiveOrderRecord> journalOrders,string orderGateStatus,
-            IDictionary<string,DateTime> priceReceivedUtc=null,BrokerHoldingsSnapshot tradeHoldings=null) {
+            IDictionary<string,DateTime> priceReceivedUtc=null,BrokerHoldingsSnapshot tradeHoldings=null,
+            BrokerHoldingsSnapshot ordinaryHoldings=null) {
             if(string.IsNullOrWhiteSpace(directory))throw new ArgumentException("A report directory is required.");
             if(koreaDate.Kind!=DateTimeKind.Unspecified||koreaDate.TimeOfDay!=TimeSpan.Zero)
                 throw new ArgumentException("An unspecified KST calendar date is required.");
@@ -167,13 +207,8 @@ namespace ShinhanNativeTrader {
             if(holdingsReceivedUtc.HasValue)RequireUtc(holdingsReceivedUtc.Value);
             if(cash!=null)RequireUtc(cash.ReceivedUtc);
             if(orders!=null)RequireUtc(orders.ReceivedUtc);
-            DateTime? tradeRequestUtc=null;
-            if(tradeHoldings!=null) {
-                RequireUtc(tradeHoldings.ReceivedUtc);
-                if(tradeHoldings.RequestStartedUtc!=default(DateTime)) {
-                    RequireUtc(tradeHoldings.RequestStartedUtc);tradeRequestUtc=tradeHoldings.RequestStartedUtc;
-                }
-            }
+            DateTime? tradeRequestUtc=HoldingsRequestUtc(tradeHoldings);
+            HoldingsRequestUtc(ordinaryHoldings);
 
             // Materialize and validate before opening any output file. A failed
             // valuation must leave the preceding complete report untouched.
@@ -198,7 +233,7 @@ namespace ShinhanNativeTrader {
             Row(report,"실현손익 조회 응답시각",tradeHoldings==null?Unknown:Stamp(tradeHoldings.ReceivedUtc));
             Row(report,"실현손익 기준일(증권사)",tradeHoldings!=null&&tradeHoldings.BrokerDateValidated?TradingDate(tradeHoldings.BrokerDate):Unknown);
             Row(report,"실주문 상태",GateStatus(orderGateStatus));
-            Row(report,"평가 기준","평가손익·수익률은 수수료·세금 제외. 실현손익을 추정하지 않음.");
+            Row(report,"평가 기준","수량·단가 계산값은 수수료·세금 제외. 증권사 평가값은 응답 원본을 별도 기록. 실현손익을 추정하지 않음.");
             Row(report,"실현손익 기준","증권사 응답값을 기록하며 날짜 미검증·불일치는 미확인으로 표시.");
             Row(report,"잔고 조회상태",holdingsKnown?"응답 수신":Unknown);
             Row(report,"주문 잔고기준 검증",tradeHoldings==null?Unknown:tradeHoldings.BasisVerified?"매매기준 확인":"미확인: 주문 근거로 사용하지 않음");
@@ -207,12 +242,17 @@ namespace ShinhanNativeTrader {
             Row(report,"잔고 수량 대조",tradeHoldings==null?Unknown:quantityConflict?
                 "불일치: 추가 매수 보류 / 계좌 조회·감시 계속":"관측 수량 불일치 없음 / 주문 직전 별도 검증");
             Row(report,"평가 확정상태",!holdingsKnown?Unknown:quantityConflict?
-                "잠정: 잔고수량·주문가능수량 대사 중 / 아래 합계는 응답 잔고수량 기준":"응답 잔고수량 기준(비용 제외)");
+                "수량 대사 중: 수량·단가 계산금액 미확인 / 증권사 평가 원본 별도 기록":"응답 잔고수량 기준(비용 제외)");
             Row(report,"보유 종목 수",holdingsKnown?(object)values.Count:null);
-            Row(report,"총 매입금액",total==null?null:(object)total.CostBasis);
-            Row(report,"총 평가금액",total==null?null:(object)total.MarketValue);
-            Row(report,"평가손익(비용제외)",total==null?null:(object)total.UnrealizedProfit);
-            Row(report,"평가수익률(%)",total==null?null:(object)total.ReturnPercent);
+            Row(report,"총 매입금액",total==null||quantityConflict?null:(object)total.CostBasis);
+            Row(report,"총 평가금액",total==null||quantityConflict?null:(object)total.MarketValue);
+            Row(report,"평가손익(비용제외)",total==null||quantityConflict?null:(object)total.UnrealizedProfit);
+            Row(report,"평가수익률(%)",total==null||quantityConflict?null:(object)total.ReturnPercent);
+            Row(report,"증권사 평가 조회기준",HoldingsContext(tradeHoldings));
+            Row(report,"총 매입금액(증권사 SO15)",tradeHoldings==null?null:tradeHoldings.BrokerCostBasis);
+            Row(report,"총 평가금액(증권사 SO18)",tradeHoldings==null?null:tradeHoldings.BrokerMarketValue);
+            Row(report,"평가손익(증권사 SO19)",tradeHoldings==null?null:tradeHoldings.UnrealizedProfit);
+            Row(report,"평가수익률(증권사 SO22)",tradeHoldings==null?null:tradeHoldings.BrokerReturnPercent);
             Row(report,"실현손익(증권사 조회)",realized);
             Row(report,"예수금",cash==null?null:(object)cash.DepositCash);
             Row(report,"주문가능현금",cash==null?null:(object)cash.CashOrderable);
@@ -221,7 +261,8 @@ namespace ShinhanNativeTrader {
             Row(report);
             Row(report,"실계좌 보유 종목");
             Row(report,"코드","수량","평균단가","현재가","매입금액","평가금액","평가손익(비용제외)","수익률(%)","가격 조회시각",
-                "주문가능수량(MO10)","미체결수량(MO11)","수량 대조","평가 기준");
+                "주문가능수량(MO10)","미체결수량(MO11)","수량 대조","평가 기준",
+                "평가금액(증권사 MO18)","평가손익(증권사 MO19)","수익률 출처","수익률 요청시각","수익률 응답시각","단가등락률(%)");
             if(holdingsKnown)foreach(var value in values) {
                 DateTime quoteUtc;
                 var received=priceReceivedUtc!=null&&priceReceivedUtc.TryGetValue(value.Code,out quoteUtc)
@@ -230,13 +271,23 @@ namespace ShinhanNativeTrader {
                 bool hasOrderable=tradeHoldings!=null&&tradeHoldings.SellableQuantities.TryGetValue(value.Code,out orderable);
                 bool hasPending=tradeHoldings!=null&&tradeHoldings.UnfilledQuantities.TryGetValue(value.Code,out pending);
                 bool rowConflict=tradeHoldings!=null&&tradeHoldings.HasQuantityConflict(value.Code);
+                BrokerHoldingDetails detail=null;
+                if(tradeHoldings!=null)tradeHoldings.Details.TryGetValue(value.Code,out detail);
+                decimal? brokerReturn=detail==null?null:detail.ReturnPercent;
+                decimal? holdingReturn=brokerReturn??(rowConflict?null:value.ReturnPercent);
                 Row(report,Symbol(value.Code),value.Quantity,value.AveragePrice>0?(object)value.AveragePrice:null,
-                    value.CurrentPrice>0?(object)value.CurrentPrice:null,value.CostBasis,value.MarketValue,
-                    value.UnrealizedProfit,value.ReturnPercent,Stamp(received),hasOrderable?(object)orderable:null,
+                    value.CurrentPrice>0?(object)value.CurrentPrice:null,rowConflict?null:value.CostBasis,rowConflict?null:value.MarketValue,
+                    rowConflict?null:value.UnrealizedProfit,holdingReturn,Stamp(received),hasOrderable?(object)orderable:null,
                     hasPending?(object)pending:null,!hasOrderable?Unknown:rowConflict?
                         "주문가능수량이 잔고수량보다 큼":"관측 수량 불일치 없음",
-                    rowConflict?"잠정: 수량 대사 중 / 체결 추정 없음":"응답 잔고수량 기준(비용 제외)");
+                    rowConflict?"잠정: 수량 대사 중 / 체결 추정 없음":"응답 잔고수량 기준(비용 제외)",
+                    detail==null?null:detail.MarketValue,detail==null?null:detail.UnrealizedProfit,
+                    brokerReturn.HasValue?"증권사 SABA609Q1 MO20 / "+HoldingsContext(tradeHoldings):holdingReturn.HasValue?"응답 수량·단가 계산(비용 제외)":Unknown,
+                    Stamp(brokerReturn.HasValue?tradeRequestUtc:null),
+                    Stamp(brokerReturn.HasValue?(DateTime?)tradeHoldings.ReceivedUtc:holdingReturn.HasValue?received:null),value.PriceReturnPercent);
             }
+            RawHoldings(report,"잔고 원본 수량·평가(매매기준)",tradeHoldings);
+            RawHoldings(report,"잔고 원본 수량·평가(보통잔고)",ordinaryHoldings);
             Row(report);
             Row(report,"증권사 주문 조회(누적 체결 스냅샷)");
             Row(report,"거래일",orders==null?Unknown:TradingDate(orders.TradingDate));

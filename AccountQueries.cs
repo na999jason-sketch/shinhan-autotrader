@@ -139,12 +139,21 @@ namespace ShinhanNativeTrader {
         public bool HasExecutionIds { get { return false; } }
     }
 
+    // Independently returned optional SABA609Q1 fields. These are observation
+    // data only: no field here replaces MO4 holdings or authorizes an order.
+    public sealed class BrokerHoldingDetails {
+        public decimal? PreviousSellQuantity,TodaySellQuantity,PreviousBuyQuantity,TodayBuyQuantity,SettlementQuantity,EvaluationQuantity;
+        public decimal? MarketValue,UnrealizedProfit,ReturnPercent,AveragePrice,CurrentPrice;
+        public BrokerHoldingDetails Copy(){return (BrokerHoldingDetails)MemberwiseClone();}
+    }
+
     public sealed class BrokerHoldingsSnapshot {
         // Quantity basis comes from a successfully bound SI3=1 full request and
         // its correlated successful callback, as verified by the coordinator.
         // MO2 remains diagnostic metadata: known conflicting bases invalidate
         // the row, while a missing echo never substitutes for request evidence.
         public readonly List<Holding> Holdings=new List<Holding>();
+        public readonly Dictionary<string,BrokerHoldingDetails> Details=new Dictionary<string,BrokerHoldingDetails>(StringComparer.Ordinal);
         public bool BasisVerified,RequestBasisVerified,RequestOrdinaryOnlyVerified;
         public readonly Dictionary<string,bool> BasisValidated=new Dictionary<string,bool>(StringComparer.Ordinal);
         public readonly Dictionary<string,string> BasisDiagnostics=new Dictionary<string,string>(StringComparer.Ordinal);
@@ -187,6 +196,7 @@ namespace ShinhanNativeTrader {
         public string BrokerDate;
         public bool BrokerDateValidated;
         public decimal? RealizedProfit,UnrealizedProfit;
+        public decimal? BrokerCostBasis,BrokerMarketValue,BrokerReturnPercent;
     }
 
     public sealed class HoldingValuation {
@@ -195,6 +205,13 @@ namespace ShinhanNativeTrader {
         public decimal? CostBasis,MarketValue,UnrealizedProfit,ReturnPercent;
         public bool ExcludesFeesAndTax { get { return true; } }
         public bool IsComplete { get { return CostBasis.HasValue&&MarketValue.HasValue; } }
+        // A price comparison is meaningful even while share quantity is
+        // unverified. It is separate from portfolio/execution evidence.
+        public decimal? PriceReturnPercent {get{
+            if(AveragePrice<=0||CurrentPrice<=0)return null;
+            try{return (CurrentPrice-AveragePrice)/AveragePrice*100m;}
+            catch(OverflowException){return null;}
+        }}
 
         public static HoldingValuation From(Holding holding) {
             if(holding==null)throw new ArgumentNullException("holding");
@@ -301,6 +318,26 @@ namespace ShinhanNativeTrader {
             if(string.IsNullOrEmpty(value))return null;
             try {return Number(value,field);}catch(InvalidOperationException){return null;}
         }
+        static decimal? OptionalHoldingQuantity(IIndiTransport io,int row,int field,string query) {
+            string value=OptionalProofMulti(io,row,field,query);
+            if(string.IsNullOrEmpty(value))return null;
+            try {return Quantity(value,query+" optional quantity["+field+"]");}
+            catch(InvalidOperationException){return null;}
+        }
+        static decimal? OptionalHoldingNumber(IIndiTransport io,int row,int field,string query,bool signed) {
+            string value=OptionalProofMulti(io,row,field,query);
+            if(string.IsNullOrEmpty(value))return null;
+            try {return Number(value,query+" optional number["+field+"]",signed);}
+            catch(InvalidOperationException){return null;}
+        }
+        static BrokerHoldingDetails HoldingDetails(IIndiTransport io,int row,string query) {
+            return new BrokerHoldingDetails {
+                PreviousSellQuantity=OptionalHoldingQuantity(io,row,5,query),TodaySellQuantity=OptionalHoldingQuantity(io,row,6,query),
+                PreviousBuyQuantity=OptionalHoldingQuantity(io,row,7,query),TodayBuyQuantity=OptionalHoldingQuantity(io,row,8,query),
+                SettlementQuantity=OptionalHoldingQuantity(io,row,9,query),EvaluationQuantity=OptionalHoldingQuantity(io,row,32,query),
+                MarketValue=OptionalHoldingNumber(io,row,18,query,false),UnrealizedProfit=OptionalHoldingNumber(io,row,19,query,true),
+                ReturnPercent=OptionalHoldingNumber(io,row,20,query,true)};
+        }
         static decimal Number(string value,string field,bool signed=false,bool optional=false) {
             return IndiResponseParser.RequiredNumber(value,field,signed,optional);
         }
@@ -327,14 +364,14 @@ namespace ShinhanNativeTrader {
             // arbitrary log records. Neither account nor password is read here.
             return new string(value.Where(c=>!char.IsControl(c)&&char.GetUnicodeCategory(c)!=UnicodeCategory.Format).Take(120).ToArray());
         }
-        static decimal? OptionalSingleNumber(IIndiTransport io,int field,string query) {
+        static decimal? OptionalSingleNumber(IIndiTransport io,int field,string query,bool signed=true) {
             string value;
             // Some installed server versions omit aggregate output. This must
             // remain unknown, rather than inventing a zero profit or rejecting
             // independently readable positions. Provider text is never kept.
             try {value=Single(io,field,query);}catch(AccountQueryException){return null;}
             if(value=="")return null;
-            try {return Number(value,query+" single["+field+"]",true);}
+            try {return Number(value,query+" single["+field+"]",signed);}
             catch(InvalidOperationException){return null;}
         }
         static string BasisDiagnostic(string basis) {
@@ -417,17 +454,23 @@ namespace ShinhanNativeTrader {
                 // The official description documents the literal '보통'. No
                 // undocumented numeric alias is assumed to mean cash stock.
                 var cash=basisValidated&&kind=="보통"&&loan.HasValue&&loan.Value==0;
-                result.Holdings.Add(new Holding {Code=code,Name=Text(Multi(io,row,1,query)),Quantity=quantity,
+                var holding=new Holding {Code=code,Name=Text(Multi(io,row,1,query)),Quantity=quantity,
                     AvgPrice=Number(Multi(io,row,12,query),query+" average price[12]"),
                     // XTR binds this field to TRDPRC_1, like the other quote
                     // parsers: the encoded sign is not a negative share price.
                     Price=Math.Abs(Number(Multi(io,row,13,query),query+" current price[13]",true)),
-                    CreditQty=CreditKind(kind)||(loan.HasValue&&loan.Value>0)?quantity:0m});
+                    CreditQty=CreditKind(kind)||(loan.HasValue&&loan.Value>0)?quantity:0m};
+                result.Holdings.Add(holding);
                 result.BasisValidated.Add(code,basisValidated);
                 result.BasisDiagnostics.Add(code,BasisDiagnostic(basis));
                 result.BasisValueDiagnostics.Add(code,BasisValueDiagnostic(basis));
                 result.SellableQuantities.Add(code,(int)sellable);
                 result.UnfilledQuantities.Add(code,(int)unfilled);
+                var details=HoldingDetails(io,row,query);
+                // Preserve the callback's exact validated prices before live SC
+                // updates can mutate the separate display Holding object.
+                details.AveragePrice=holding.AvgPrice;details.CurrentPrice=holding.Price;
+                result.Details.Add(code,details);
                 result.CashSourceValidated.Add(code,cash);
                 result.CashProfileCompatible.Add(code,!CreditKind(kind)&&(string.IsNullOrEmpty(loanRaw)||loan.HasValue&&loan.Value==0));
                 result.CashProfileDiagnostics.Add(code,"Kind="+CashKindDiagnostic(kind)+";Loan="+LoanDiagnostic(loanRaw,loan));
@@ -445,6 +488,9 @@ namespace ShinhanNativeTrader {
             }
             result.RealizedProfit=OptionalSingleNumber(io,16,query);
             result.UnrealizedProfit=OptionalSingleNumber(io,19,query);
+            result.BrokerCostBasis=OptionalSingleNumber(io,15,query,false);
+            result.BrokerMarketValue=OptionalSingleNumber(io,18,query,false);
+            result.BrokerReturnPercent=OptionalSingleNumber(io,22,query);
             return result;
         }
         static bool RecentHoldings(BrokerHoldingsSnapshot value,DateTime utc,int maxAgeSeconds) {

@@ -543,3 +543,14 @@ Linux Mono 경고 오류 처리 x86 대상 컴파일 성공. 앱1905/실제폼GU
 Windows x86 빌드·GUI·합성COM·UIPI는 동일 커밋의 GitHub Actions에서 확인. validation-reports와 ShinhanNativeTrader-Win32 아티팩트 제공.
 새 EXE의 실제 Windows Indi 불일치 응답 처리, 수량 해소와 후속 자동매매는 미검증. 도구로 실제 계좌 조회·주문을 실행하지 않음.
 상세: docs/HOLDINGS_QUANTITY_REFRESH_20261116.md
+
+
+2.2.14 — 증권사 평가값·수익률 표시와 수량 원본 보존 (2026-11-16)
+사용자11월16일09:31CSV:241520 매수18·누적체결18·평균체결가8160·미체결0, 프로그램Filled18. 같은잔고MO4=0/MO10=18/MO11=0. 현재가8100의단가비교는약-0.74%, 실제계좌수익률증거와별도.
+선택적MO5~9/18~20/32와SO15/18/22를typednullable로보존;누락/비정상값unknown,명시적0과구분. 기존필수수량검사/원본MO4/주문판정미변경. 같은callbackMO12/13가격을따로복사해후속SC변경과분리.
+UI는증권사평가값우선,없으면단가비교를별도표시;출처+조회UTC설명. 수량대사중근거없는계산금액은unknown. CSV는매매기준·보통잔고원본수량/평가값을별도표시. 보유수량을MO10/MO32/체결수량으로대체하지않음.
+계좌조회/평가/보고서등앱합성1976개PASS; 실제폼GUI372/보고서GUI30/Python17PASS. x86target warnaserror compile0warning/error, I386/PE32/CLR32BITREQUIRED확인. Linuxpointer8은Windowsx86실행증거아님.
+수익률표시GUI회귀는2.2.13에서실패했고2.2.14에서통과. zeroqty/negativebrokerreturn/optionalgetterfailure/SCquotechange/원본가격보존/수량게이트유지검증.
+보유수량0/주문가능18의원인·해당종목자동매도·추가매수보류해소는미해결. 실제새응답MO8/32등을대조해야하며새EXE실서버출력은미검증. 실제계좌조회/금전주문도구호출0회.
+Windows x86정확한HEAD실행의빌드·앱·GUI·COM·UIPI/Python결과와EXE는PR의Actions링크참조.
+상세: docs/BROKER_VALUATION_AND_RAW_QUANTITIES_20261116.md

@@ -22,6 +22,9 @@ static class QuantityRefreshUiCases {
     }
     sealed class HoldingsWire : IIndiTransport,IIndiDiagnostics {
         public int Quantity,Orderable=2,Requests,Setters;
+        public decimal AveragePrice=10000,CurrentPrice=10000;
+        public decimal? BrokerReturn;
+        public bool ReturnGetterUnavailable;
         public readonly List<string> Queries=new List<string>();
         public event Action<int> ReceiveData;
         public event Action<int> ReceiveSysMsg {add{} remove{}}
@@ -43,10 +46,13 @@ static class QuantityRefreshUiCases {
             }
             if(method=="GetMultiData") {
                 if((int)values[0]!=0)throw new InvalidOperationException("Unexpected synthetic holdings row.");
+                if((int)values[1]==20&&ReturnGetterUnavailable)throw new InvalidOperationException("Synthetic optional return getter unavailable.");
                 switch((int)values[1]) {
                     case 0:return "A"+Symbol;case 1:return "SYNTHETIC QUANTITY UPDATE";case 2:return "1";case 3:return "보통";
                     case 4:return Quantity.ToString(CultureInfo.InvariantCulture);case 10:return Orderable.ToString(CultureInfo.InvariantCulture);
-                    case 11:case 22:return "0";case 12:case 13:return "10000";
+                    case 11:case 22:return "0";
+                    case 12:return AveragePrice.ToString(CultureInfo.InvariantCulture);case 13:return CurrentPrice.ToString(CultureInfo.InvariantCulture);
+                    case 20:return BrokerReturn.HasValue?BrokerReturn.Value.ToString(CultureInfo.InvariantCulture):"";
                     default:return "0";
                 }
             }
@@ -74,6 +80,8 @@ static class QuantityRefreshUiCases {
         public readonly string Key,OrderId;
         public int Fatals;
         readonly object credentials;
+        readonly Dictionary<int,object> quoteFields=new Dictionary<int,object>();
+        int quoteVolume=1000;
         public Fixture(string data) {
             Form=new MainForm();Get<Timer>(Form,"scheduler").Stop();Form.ShowInTaskbar=false;Form.Show();Application.DoEvents();Get<Timer>(Form,"scheduler").Stop();
             Get<NumericUpDown>(Form,"budget").Value=1000000;Call(Form,"SaveSettings");
@@ -99,7 +107,8 @@ static class QuantityRefreshUiCases {
             Requests.Fatal+=message=>{Fatals++;Call(Form,"Halt");};
             Requests.Done+=reply=>{Get<Timer>(api,"timeout").Stop();Call(Form,"Safe",(Action)(()=>Call(Form,"Reply",reply)));};
             Set(api,"requests",Requests);Set(api,"hasReceivedData",true);Set(Form,"api",api);
-            Processor=new RealtimeEventProcessor(index=>{throw new InvalidOperationException("No realtime getter is expected.");});Processor.BindAccount(Account);Processor.Track(Symbol);
+            Processor=new RealtimeEventProcessor(index=>quoteFields[index]);Processor.BindAccount(Account);Processor.Track(Symbol);
+            Processor.QuoteReceived+=(Action<RealtimeQuote>)Delegate.CreateDelegate(typeof(Action<RealtimeQuote>),Form,typeof(MainForm).GetMethod("OnRealtimeQuote",Fields));
             var realtime=(RealtimeIndi)FormatterServices.GetUninitializedObject(typeof(RealtimeIndi));
             Set(realtime,"processor",Processor);Set(realtime,"watch",new HashSet<string>(StringComparer.Ordinal){Symbol});
             Set(realtime,"ownerThread",System.Threading.Thread.CurrentThread.ManagedThreadId);Set(realtime,"native",new object());
@@ -110,6 +119,13 @@ static class QuantityRefreshUiCases {
             if(!Requests.Begin("TRADEHOLDINGS","SABA609Q1",AccountQueries.HoldingsInputs(Account,"1111"),null))throw new InvalidOperationException("Synthetic holdings read did not start.");
             Reads.Complete();
         }
+        public void Quote(decimal price) {
+            var now=DateTime.UtcNow;
+            quoteFields[1]=Symbol;quoteFields[3]=price.ToString(CultureInfo.InvariantCulture);quoteFields[17]="1";
+            quoteFields[2]=MarketTime.ToKorea(now.AddSeconds(-1)).ToString("HHmmss",CultureInfo.InvariantCulture);quoteFields[7]=quoteVolume++;Processor.Process("SC",now.AddSeconds(-1));
+            quoteFields[2]=MarketTime.ToKorea(now).ToString("HHmmss",CultureInfo.InvariantCulture);quoteFields[7]=quoteVolume++;Processor.Process("SC",now);
+            Call(Form,"RefreshAccount");
+        }
         public bool SessionRetained {get{return ReferenceEquals(Get<object>(Form,"credentials"),credentials)&&Get<bool>(Form,"monitoring")
             &&Get<LiveTradingSession>(Form,"authorization").Active&&Get<UnattendedSession>(Form,"session").Armed;}}
         public LiveOrderRecord Order {get{return Journal.Snapshot.Orders.Single(value=>value.Id==OrderId);}}
@@ -118,6 +134,7 @@ static class QuantityRefreshUiCases {
     }
     public static void Run(string data,Action<bool,string> check) {
         using(var fixture=new Fixture(data)) {
+            fixture.Reads.CurrentPrice=10200;
             fixture.Read(0,2);
             check(fixture.Fatals==0&&fixture.SessionRetained,"normal holdings callback with orderable above balance keeps armed account monitoring and credentials alive");
             var balance=Get<BrokerHoldingsSnapshot>(fixture.Form,"tradeHoldings");
@@ -131,6 +148,9 @@ static class QuantityRefreshUiCases {
                 "quantity wait explains the numeric discrepancy instead of reporting a transport failure");
             check(Get<Label>(fixture.Form,"portfolio").Text.Contains("수량 대사 중")&&Get<Label>(fixture.Form,"portfolio").Text.Contains("잠정값"),
                 "portfolio amounts are visibly provisional while quantity exposure is unverified");
+            check(Convert.ToString(fixture.Row.Cells[8].Value,CultureInfo.InvariantCulture).Contains("2.00")
+                &&fixture.Row.Cells[8].ToolTipText.Contains("단가 기준"),
+                "zero reported quantity still shows the concrete 10000-to-10200 price return with its unit-price basis rather than hiding it as unknown");
             check(Get<HashSet<string>>(fixture.Form,"trackedQuotes").Contains(Symbol),
                 "a positive-orderable row remains tracked for quotes even before its raw balance quantity catches up");
             check(Get<AccountAppSettingsStore>(fixture.Form,"settingsStore").High(fixture.Key,Symbol,10000)==11000,
@@ -149,6 +169,33 @@ static class QuantityRefreshUiCases {
                 &&fixture.Order.Status==LiveOrderStatus.Working&&fixture.Order.BrokerOrderNumber=="009021"
                 &&fixture.Reads.Requests==2&&fixture.Reads.Setters==16&&fixture.Orders.Sends==0&&fixture.Orders.Preparations==0,
                 "consistent refresh preserves the risk high and original accepted order while using only two bound read requests");
+
+            fixture.Reads.AveragePrice=8160;fixture.Reads.CurrentPrice=8100;fixture.Reads.BrokerReturn=-2.25m;fixture.Read(0,18);
+            balance=Get<BrokerHoldingsSnapshot>(fixture.Form,"tradeHoldings");
+            string brokerTooltip=fixture.Row.Cells[8].ToolTipText;
+            check(Convert.ToString(fixture.Row.Cells[8].Value,CultureInfo.InvariantCulture).Contains("-2.25")
+                &&brokerTooltip.Contains("증권사")&&brokerTooltip.Contains("UTC")
+                &&brokerTooltip.Contains(balance.ReceivedUtc.ToString("yyyy-MM-dd HH:mm:ss",CultureInfo.InvariantCulture)),
+                "explicit broker return takes priority over the different current-price return and identifies the actual broker snapshot receipt time");
+            fixture.Quote(8500);
+            check(Convert.ToString(fixture.Row.Cells[8].Value,CultureInfo.InvariantCulture).Contains("-2.25")
+                &&Convert.ToDecimal(Get<List<Holding>>(fixture.Form,"holdings").Single().Price,CultureInfo.InvariantCulture)==8500
+                &&fixture.Row.Cells[8].ToolTipText==brokerTooltip,
+                "a newer real SC callback updates current price while keeping the supplied broker percentage tied to its own snapshot");
+            check(Get<List<Holding>>(fixture.Form,"holdings").Single().Quantity==0&&balance.SellableQuantities[Symbol]==18
+                &&!balance.QuantityExposureVerified&&fixture.SessionRetained&&fixture.Orders.Sends==0&&fixture.Orders.Preparations==0,
+                "displaying a broker percentage never turns orderable18 into owned shares or clears the quantity-exposure restriction");
+            foreach(bool unavailable in new[]{false,true}) {
+                fixture.Reads.BrokerReturn=null;fixture.Reads.ReturnGetterUnavailable=unavailable;fixture.Read(0,18);
+                balance=Get<BrokerHoldingsSnapshot>(fixture.Form,"tradeHoldings");
+                check(Convert.ToString(fixture.Row.Cells[8].Value,CultureInfo.InvariantCulture).Contains("-0.74")
+                    &&fixture.Row.Cells[8].ToolTipText.Contains("단가 기준"),
+                    (unavailable?"unavailable":"blank")+" optional broker return falls back to the observable 8160-to-8100 unit-price change");
+                check(fixture.Fatals==0&&fixture.SessionRetained&&balance.Holdings.Single().Quantity==0&&balance.SellableQuantities[Symbol]==18
+                    &&!balance.QuantityExposureVerified&&fixture.Journal.Snapshot.Orders.Count==1&&fixture.Order.Status==LiveOrderStatus.Working
+                    &&fixture.Journal.Snapshot.Executions.Count==0&&fixture.Orders.Sends==0&&fixture.Orders.Preparations==0,
+                    (unavailable?"unavailable":"blank")+" optional return data preserves original quantities, accepted order and monitoring without synthesizing a fill or sending another order");
+            }
         }
     }
 }

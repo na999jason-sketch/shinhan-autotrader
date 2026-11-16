@@ -16,7 +16,7 @@ namespace ShinhanNativeTrader {
         public AccountUserActionException(string message):base(message){}
     }
     internal static class Program {
-        internal const string Version="2.2.13";
+        internal const string Version="2.2.14";
         [STAThread]
         static int Main(string[] args) {
             if(args.Contains("--selftest")) {
@@ -177,6 +177,7 @@ namespace ShinhanNativeTrader {
             Text="Shinhan Native Trader "+Program.Version+" | 실계좌 자동매매";
             Size=new Size(1370,860);MinimumSize=new Size(1120,730);Font=new Font("Malgun Gothic",9);
             holdingsGrid.Columns["매도판정"].FillWeight=170;
+            holdingsGrid.Columns["수익률(%)"].FillWeight=150;
             var root=new TableLayoutPanel{Dock=DockStyle.Fill,ColumnCount=1,RowCount=6,Padding=new Padding(10)};
             foreach(int height in new[]{35,100,138,40})root.RowStyles.Add(new RowStyle(SizeType.Absolute,height));
             root.RowStyles.Add(new RowStyle(SizeType.Percent,100));root.RowStyles.Add(new RowStyle(SizeType.Absolute,52));Controls.Add(root);
@@ -1084,15 +1085,40 @@ namespace ShinhanNativeTrader {
             return "현재 매도 조건 감시";
         }
         void RefreshAccount() {RefreshAccountAt(DateTime.UtcNow);}
+        BrokerHoldingDetails HoldingDetails(string symbol) {
+            BrokerHoldingDetails value;
+            return tradeHoldings!=null&&tradeHoldings.Details.TryGetValue(symbol,out value)?value:null;
+        }
+        string HoldingReturnTooltip(HoldingValuation value,BrokerHoldingDetails details) {
+            return details!=null&&details.ReturnPercent.HasValue
+                ?"증권사 SABA609Q1 MO20 손익률 / 잔고 응답 "+tradeHoldings.ReceivedUtc.ToString("yyyy-MM-dd HH:mm:ss",CultureInfo.InvariantCulture)+" UTC / 요청기준 "+(tradeHoldings.RequestBasisVerified?"매매기준 SI3=1":"미확인")
+                :"단가 기준 · 비용 제외: (현재가 - 평균단가) / 평균단가 × 100. 보유수량·체결 확인과 별도이며 계좌 전체 수익률이 아닙니다.";
+        }
         void RefreshAccountAt(DateTime now) {
             holdingsGrid.Rows.Clear();
             var orderSnapshot=journal==null?null:journal.Snapshot;
+            bool quantityPending=tradeHoldings!=null&&!tradeHoldings.QuantityExposureVerified;
             foreach(var held in holdings) {
                 var value=HoldingValuation.From(held);DateTime stamp;
+                var details=HoldingDetails(held.Code);
+                bool rowQuantityPending=tradeHoldings!=null&&tradeHoldings.HasQuantityConflict(held.Code);
+                decimal? rate=details!=null&&details.ReturnPercent.HasValue?details.ReturnPercent:value.PriceReturnPercent;
+                decimal? market=details!=null&&details.MarketValue.HasValue?details.MarketValue:rowQuantityPending?null:value.MarketValue;
+                decimal? profit=details!=null&&details.UnrealizedProfit.HasValue?details.UnrealizedProfit:rowQuantityPending?null:value.UnrealizedProfit;
                 int available;object orderable=tradeHoldings!=null&&tradeHoldings.SellableQuantities.TryGetValue(held.Code,out available)?(object)available:"미조회";
-                holdingsGrid.Rows.Add(value.Code,value.Name,value.Quantity,Amount(value.AveragePrice>0?(decimal?)value.AveragePrice:null),Amount(value.CurrentPrice>0?(decimal?)value.CurrentPrice:null),Amount(value.CostBasis),Amount(value.MarketValue),Amount(value.UnrealizedProfit),value.ReturnPercent.HasValue?value.ReturnPercent.Value.ToString("N2",CultureInfo.CurrentCulture):"미확인",priceReceivedUtc.TryGetValue(held.Code,out stamp)?MarketTime.ToKorea(stamp).ToString("MM-dd HH:mm:ss",CultureInfo.InvariantCulture):"미조회",HoldingDecisionAt(held,now),HoldingOrderStatus(held,orderSnapshot),orderable,HoldingQuantityPending(held)??"원본 수량 표시");
+                string returnText=rate.HasValue?rate.Value.ToString("N2",CultureInfo.CurrentCulture)+(details!=null&&details.ReturnPercent.HasValue?" (증권사)":" (단가)"):"미확인";
+                int row=holdingsGrid.Rows.Add(value.Code,value.Name,value.Quantity,Amount(value.AveragePrice>0?(decimal?)value.AveragePrice:null),Amount(value.CurrentPrice>0?(decimal?)value.CurrentPrice:null),Amount(rowQuantityPending?null:value.CostBasis),Amount(market),Amount(profit),returnText,priceReceivedUtc.TryGetValue(held.Code,out stamp)?MarketTime.ToKorea(stamp).ToString("MM-dd HH:mm:ss",CultureInfo.InvariantCulture):"미조회",HoldingDecisionAt(held,now),HoldingOrderStatus(held,orderSnapshot),orderable,HoldingQuantityPending(held)??"원본 수량 표시");
+                holdingsGrid.Rows[row].Cells[8].ToolTipText=HoldingReturnTooltip(value,details);
+                holdingsGrid.Rows[row].Cells[6].ToolTipText=details!=null&&details.MarketValue.HasValue?"증권사 SABA609Q1 MO18 평가금액 / 잔고 응답 기준":"잔고수량 × 현재가 / 수량 대사 중에는 미확인";
+                holdingsGrid.Rows[row].Cells[7].ToolTipText=details!=null&&details.UnrealizedProfit.HasValue?"증권사 SABA609Q1 MO19 미실현손익 / 비용 포함 여부는 증권사 산출 기준":"잔고수량 × (현재가 - 평균단가), 비용 제외 / 수량 대사 중에는 미확인";
             }
-            if(holdingsReceivedUtc.HasValue){var total=AccountValuation.From(holdings);portfolio.Text="매입 "+Amount(total.CostBasis)+"원 / 평가 "+Amount(total.MarketValue)+"원 / 평가손익 "+Amount(total.UnrealizedProfit)+"원 (비용 제외)";}
+            if(holdingsReceivedUtc.HasValue){
+                var total=AccountValuation.From(holdings);
+                decimal? cost=tradeHoldings!=null&&tradeHoldings.BrokerCostBasis.HasValue?tradeHoldings.BrokerCostBasis:quantityPending?null:total.CostBasis;
+                decimal? market=tradeHoldings!=null&&tradeHoldings.BrokerMarketValue.HasValue?tradeHoldings.BrokerMarketValue:quantityPending?null:total.MarketValue;
+                decimal? profit=tradeHoldings!=null&&tradeHoldings.UnrealizedProfit.HasValue?tradeHoldings.UnrealizedProfit:quantityPending?null:total.UnrealizedProfit;
+                portfolio.Text="매입 "+Amount(cost)+"원 / 평가 "+Amount(market)+"원 / 평가손익 "+Amount(profit)+"원 (증권사 조회값 우선 / 계산 금액은 비용 제외)";
+            }
             else portfolio.Text="실계좌 잔고·평가손익: 미조회";
             if(tradeHoldings!=null&&!tradeHoldings.QuantityExposureVerified)portfolio.Text+=" / 수량 대사 중 · 표시 금액 잠정값";
             portfolio.Text+=" / 실현손익(증권사 조회) "+Amount(tradeHoldings==null?null:tradeHoldings.RealizedProfit)+"원"
@@ -1212,7 +1238,7 @@ namespace ShinhanNativeTrader {
             try {
                 var writtenUtc=DateTime.UtcNow;
                 var path=SessionReport.Write(ReportDirectory,koreaDate,writtenUtc,holdings,holdingsReceivedUtc,cash,brokerOrders,
-                    journal==null?(IEnumerable<LiveOrderRecord>)new LiveOrderRecord[0]:journal.Snapshot.Orders,authorization.Active?"실주문 운영 시작됨":"실주문 미시작",priceReceivedUtc,tradeHoldings);
+                    journal==null?(IEnumerable<LiveOrderRecord>)new LiveOrderRecord[0]:journal.Snapshot.Orders,authorization.Active?"실주문 운영 시작됨":"실주문 미시작",priceReceivedUtc,tradeHoldings,ordinaryHoldings);
                 lastSavedReportPath=path;lastReportSavedUtc=writtenUtc;nextReportUtc=writtenUtc.AddMinutes(5);
                 initialReportComplete=holdingsReceivedUtc.HasValue&&cash!=null&&brokerOrders!=null;
                 reportStatus.Text="보고서 저장: "+MarketTime.ToKorea(lastReportSavedUtc.Value).ToString("MM-dd HH:mm:ss",CultureInfo.InvariantCulture)+" / "+Path.GetFileName(lastSavedReportPath);

@@ -106,6 +106,71 @@ namespace ShinhanNativeTrader {
             Check(balance.Holdings[0].BuyPending==0&&balance.Holdings[0].SellPending==0,"unsettled bought shares are not mislabeled as open buy orders");
             Check(balance.RealizedProfit==-1250&&balance.UnrealizedProfit==7000,"optional broker profit fields preserve signed actual values");
             Check(balance.BrokerDate=="20261112"&&balance.BrokerDateValidated&&balance.ReceivedUtc==utc&&balance.RequestStartedUtc==default(DateTime),"broker date comes from header while request start must come from the coordinator");
+            io=new Response();io.Holding(0);io.SetRow(0,4,"0");io.SetRow(0,10,"18");
+            io.SetRow(0,5,"1");io.SetRow(0,6,"2");io.SetRow(0,7,"3");io.SetRow(0,8,"18");io.SetRow(0,9,"4");
+            io.SetRow(0,32,"17");io.SetRow(0,18,"145,260");io.SetRow(0,19,"-1,620");io.SetRow(0,20,"-1.10");
+            io.Fields["s:15"]="146,880";io.Fields["s:18"]="145,260";io.Fields["s:19"]="-1,620";io.Fields["s:22"]="-1.10";
+            balance=AccountQueries.ReadHoldings(io,utc,true);var details=balance.Details["005930"];
+            Check(balance.Holdings[0].Quantity==0&&balance.SellableQuantities["005930"]==18&&!balance.QuantityExposureVerified,
+                "optional quantity observations never overwrite the reported zero holdings or orderable eighteen shares");
+            Check(details.PreviousSellQuantity==1&&details.TodaySellQuantity==2&&details.PreviousBuyQuantity==3&&details.TodayBuyQuantity==18
+                &&details.SettlementQuantity==4&&details.EvaluationQuantity==17,
+                "unsettled, settlement and evaluation quantities retain their exact separate broker fields without a derived formula");
+            Check(details.MarketValue==145260&&details.UnrealizedProfit==-1620&&details.ReturnPercent==-1.10m,
+                "broker market value and signed profit and return are captured independently of computed quantity-based valuations");
+            Check(details.AveragePrice==70000&&details.CurrentPrice==71000,
+                "detail prices copy the same callback's already validated MO12 and MO13 core values");
+            balance.Holdings[0].Price=72000;
+            Check(details.CurrentPrice==71000&&details.AveragePrice==70000&&balance.Holdings[0].AvgPrice==70000
+                &&balance.Holdings[0].Quantity==0&&balance.SellableQuantities["005930"]==18,
+                "later live display price updates do not rewrite original callback prices or change average and quantities");
+            Check(balance.BrokerCostBasis==146880&&balance.BrokerMarketValue==145260&&balance.UnrealizedProfit==-1620&&balance.BrokerReturnPercent==-1.10m
+                &&balance.Holdings[0].Quantity==0&&!balance.QuantityExposureVerified,
+                "direct broker account totals remain positive or signed independently from zero reported position quantities without changing exposure proof");
+            var copiedDetails=details.Copy();copiedDetails.EvaluationQuantity=999;
+            Check(details.EvaluationQuantity==17&&copiedDetails.EvaluationQuantity==999,
+                "optional detail copies do not retain a mutable shared reference");
+            balance=AccountQueries.ReadHoldings(io,utc,false,true);
+            Check(balance.RequestOrdinaryOnlyVerified&&!balance.RequestBasisVerified&&balance.Details["005930"].ReturnPercent==-1.10m,
+                "ordinary request context and broker observations remain separate from trade request evidence");
+            foreach(var field in new[]{5,6,7,8,9,32})foreach(var invalid in new[]{"", "-1", "1.5", "2147483648", "bad"}) {
+                io=new Response();io.Holding(0);io.SetRow(0,field,invalid);balance=AccountQueries.ReadHoldings(io,utc,true);details=balance.Details["005930"];
+                var observed=field==5?details.PreviousSellQuantity:field==6?details.TodaySellQuantity:field==7?details.PreviousBuyQuantity:
+                    field==8?details.TodayBuyQuantity:field==9?details.SettlementQuantity:details.EvaluationQuantity;
+                Check(!observed.HasValue&&balance.Holdings[0].Quantity==7&&balance.SellableQuantities["005930"]==7&&balance.QuantityExposureVerified,
+                    "missing or malformed optional quantities remain unknown without discarding or changing required holdings");
+            }
+            foreach(var field in new[]{5,6,7,8,9,18,19,20,32}) {
+                io=new Response();io.Holding(0);io.ThrowField="m:0:"+field;balance=AccountQueries.ReadHoldings(io,utc,true);details=balance.Details["005930"];
+                var missing=field==5?details.PreviousSellQuantity:field==6?details.TodaySellQuantity:field==7?details.PreviousBuyQuantity:
+                    field==8?details.TodayBuyQuantity:field==9?details.SettlementQuantity:field==18?details.MarketValue:
+                    field==19?details.UnrealizedProfit:field==20?details.ReturnPercent:details.EvaluationQuantity;
+                Check(balance.Holdings.Count==1&&balance.Holdings[0].Quantity==7&&!missing.HasValue,
+                    "unavailable optional getters preserve core positions without fabricated money, profit, rate or evaluation quantity");
+            }
+            io=new Response();io.Holding(0);io.SetRow(0,18,"-1");io.SetRow(0,19,"bad");io.SetRow(0,20,"--");
+            balance=AccountQueries.ReadHoldings(io,utc,true);details=balance.Details["005930"];
+            Check(!details.MarketValue.HasValue&&!details.UnrealizedProfit.HasValue&&!details.ReturnPercent.HasValue&&balance.Holdings[0].Quantity==7,
+                "negative market value and malformed optional profit or return remain unknown rather than an account failure");
+            foreach(var field in new[]{5,6,7,8,9,18,19,20,32})io.SetRow(0,field,"0");
+            details=AccountQueries.ReadHoldings(io,utc,true).Details["005930"];
+            Check(details.EvaluationQuantity.HasValue&&details.EvaluationQuantity==0&&details.MarketValue.HasValue&&details.MarketValue==0
+                &&details.UnrealizedProfit.HasValue&&details.UnrealizedProfit==0&&details.ReturnPercent.HasValue&&details.ReturnPercent==0,
+                "explicit broker zero details are distinguishable from absent optional output");
+            foreach(var raw in new[]{"", "bad", "-1"}) {
+                io.Fields["s:15"]=raw;io.Fields["s:18"]=raw;io.Fields["s:22"]="";balance=AccountQueries.ReadHoldings(io,utc,true);
+                Check(!balance.BrokerCostBasis.HasValue&&!balance.BrokerMarketValue.HasValue&&!balance.BrokerReturnPercent.HasValue&&balance.Holdings[0].Quantity==7,
+                    "absent or malformed nonnegative account valuation totals remain unknown without discarding independently readable positions");
+            }
+            foreach(var field in new[]{15,18,22})io.Fields["s:"+field]="0";
+            balance=AccountQueries.ReadHoldings(io,utc,true);
+            Check(balance.BrokerCostBasis.HasValue&&balance.BrokerCostBasis==0&&balance.BrokerMarketValue.HasValue&&balance.BrokerMarketValue==0
+                &&balance.BrokerReturnPercent.HasValue&&balance.BrokerReturnPercent==0,
+                "explicit broker zero account totals are not confused with missing aggregate output");
+            io.ThrowMethod="GetSingleData";balance=AccountQueries.ReadHoldings(io,utc,true);
+            Check(!balance.BrokerCostBasis.HasValue&&!balance.BrokerMarketValue.HasValue&&!balance.BrokerReturnPercent.HasValue&&balance.Holdings.Count==1,
+                "unavailable account aggregate getters preserve positions without fabricated totals");
+            io=new Response();io.Holding(0);io.Fields["s:16"]="-1,250";io.Fields["s:19"]="7000";
             io.Fields["s:16"]="";io.Fields["s:19"]="";balance=AccountQueries.ReadHoldings(io,utc,true);
             Check(!balance.RealizedProfit.HasValue&&!balance.UnrealizedProfit.HasValue&&balance.Holdings.Count==1,"omitted broker profit aggregates remain unknown without hiding readable holdings");
             io.Fields["s:16"]="0";balance=AccountQueries.ReadHoldings(io,utc,true);
@@ -229,7 +294,8 @@ namespace ShinhanNativeTrader {
             Check(balance.Holdings.Count==2&&balance.BasisVerified&&balance.BasisValidated["005930"]&&balance.BasisValidated["000660"],
                 "an omitted echo in one row does not reject other valid quantities from the same bound trade request");
             io=new Response();io.Holding(0);io.SetRow(0,13,"-71000");balance=AccountQueries.ReadHoldings(io,utc,true);
-            Check(balance.Holdings[0].Price==71000&&balance.CashSourceValidated["005930"],"signed TRDPRC_1 current-price encoding normalizes to an absolute share price");
+            Check(balance.Holdings[0].Price==71000&&balance.Details["005930"].CurrentPrice==71000
+                &&balance.CashSourceValidated["005930"],"signed current-price encoding normalizes identically in the display and immutable callback-price observation");
             io.SetRow(0,13,"broken");Reject(()=>AccountQueries.ReadHoldings(io,utc,true),"an actually malformed core price still rejects without inventing a value");
             io=new Response();io.Holding(0);io.Holding(1,"A005930","유통융자");failure=Capture(()=>AccountQueries.ReadHoldings(io,utc,true));
             Check(AccountQueries.FailureContext(failure)!=null&&AccountQueries.FailureContext(failure).Contains("duplicate stock symbol"),"cash and credit rows for one symbol fail closed instead of being dropped or silently merged");
@@ -358,13 +424,25 @@ namespace ShinhanNativeTrader {
             holding.Price=0;value=HoldingValuation.From(holding);Check(!value.IsComplete&&!value.MarketValue.HasValue&&!value.UnrealizedProfit.HasValue,"missing current price is not reported as total loss");
             holding.Price=71000;holding.AvgPrice=0;value=HoldingValuation.From(holding);Check(!value.CostBasis.HasValue&&!value.ReturnPercent.HasValue,"missing cost basis is not fabricated as zero");
             holding.Quantity=0;value=HoldingValuation.From(holding);Check(value.CostBasis==0&&value.MarketValue==0&&value.UnrealizedProfit==0&&!value.ReturnPercent.HasValue,"pending-only empty holdings have no invented return percentage");
+            var priceOnly=HoldingValuation.From(new Holding{Code="005930",Quantity=0,AvgPrice=8160,Price=8100});
+            Check(priceOnly.PriceReturnPercent.HasValue&&Math.Abs(priceOnly.PriceReturnPercent.Value-(-0.7352941176470588m))<0.00000000000001m,
+                "price comparison remains about minus0.735294 percent when reported quantity is zero");
+            Check(priceOnly.Quantity==0&&priceOnly.CostBasis==0&&priceOnly.MarketValue==0&&!priceOnly.ReturnPercent.HasValue,
+                "a unit-price comparison never invents a held quantity or changes unknown portfolio return");
+            Check(!HoldingValuation.From(new Holding{Code="005930",Quantity=0,AvgPrice=0,Price=8100}).PriceReturnPercent.HasValue
+                &&!HoldingValuation.From(new Holding{Code="005930",Quantity=0,AvgPrice=8160,Price=0}).PriceReturnPercent.HasValue,
+                "missing average or current price leaves price-only return unknown");
+            Check(HoldingValuation.From(new Holding{Code="005930",Quantity=10,AvgPrice=8160,Price=8100}).PriceReturnPercent==priceOnly.PriceReturnPercent,
+                "price-only return is independent of account share quantity and is not fill evidence");
+            Check(!HoldingValuation.From(new Holding{Code="005930",Quantity=0,AvgPrice=0.1m,Price=decimal.MaxValue}).PriceReturnPercent.HasValue,
+                "unrepresentable display-only price return stays unknown rather than failing a valid quantity snapshot");
             holding.Quantity=1.5m;Reject(()=>HoldingValuation.From(holding),"fractional holding quantity rejects");
             var totals=AccountValuation.From(new[]{new Holding{Code="005930",Quantity=10,AvgPrice=70000,Price=71000},new Holding{Code="000660",Quantity=2,AvgPrice=200000,Price=190000}});
             Check(totals.HoldingCount==2&&totals.CostBasis==1100000&&totals.MarketValue==1090000&&totals.UnrealizedProfit==-10000,"account total sums signed actual holding valuations");
             totals=AccountValuation.From(new[]{new Holding{Code="005930",Quantity=10,AvgPrice=70000,Price=0}});
             Check(!totals.IsComplete&&!totals.UnrealizedProfit.HasValue,"incomplete price prevents misleading account total profit");
             totals=AccountValuation.From(new Holding[0]);Check(totals.IsComplete&&totals.MarketValue==0&&totals.UnrealizedProfit==0&&!totals.ReturnPercent.HasValue,"empty account portfolio has zero values without division by zero");
-            foreach(var type in new[]{typeof(AccountCashSnapshot),typeof(AccountOrderCapacity),typeof(BrokerOrderRow),typeof(BrokerOrdersSnapshot),typeof(BrokerHoldingsSnapshot)})
+            foreach(var type in new[]{typeof(AccountCashSnapshot),typeof(AccountOrderCapacity),typeof(BrokerOrderRow),typeof(BrokerOrdersSnapshot),typeof(BrokerHoldingsSnapshot),typeof(BrokerHoldingDetails)})
                 Check(!type.GetFields().Any(f=>f.Name.IndexOf("account",StringComparison.OrdinalIgnoreCase)>=0||f.Name.IndexOf("password",StringComparison.OrdinalIgnoreCase)>=0),"broker DTO has no credential fields: "+type.Name);
             OrdinaryCashProof(utc);
             return checks;
