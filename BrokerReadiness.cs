@@ -227,6 +227,70 @@ namespace ShinhanNativeTrader {
         }
         static bool IsTransit(LiveOrderRecord order){return order.Status==LiveOrderStatus.Prepared||order.Status==LiveOrderStatus.Dispatching||order.Status==LiveOrderStatus.AwaitingAcknowledgement||order.Status==LiveOrderStatus.AwaitingConfirmation||order.Status==LiveOrderStatus.Unknown;}
         static bool IsWorking(LiveOrderRecord order){return order.Status==LiveOrderStatus.Working||order.Status==LiveOrderStatus.PartiallyFilled;}
+        static bool AcceptedResponseMatches(LiveOrderRecord order) {
+            var response=order==null?null:order.ResponseEvidence;
+            return order!=null&&LiveOrderProtocol.ValidBrokerNumber(order.BrokerOrderNumber)&&order.RequestId.HasValue&&order.RequestId.Value>0
+                &&response!=null&&response.RequestId==order.RequestId.Value&&response.Disposition==OrderResponseDisposition.Accepted
+                &&!response.ProviderError&&!response.ParseFailed&&LiveOrderProtocol.BrokerNumbersEqual(order.BrokerOrderNumber,response.BrokerOrderNumber)
+                &&(response.Layout==OrderResponseLayout.Legacy||response.Layout==OrderResponseLayout.Modern
+                    &&LiveOrderProtocol.BrokerNumbersEqual(order.BrokerOrderNumber,response.Slot1OrderNumber)
+                    &&!LiveOrderProtocol.ValidBrokerNumber(response.Slot0OrderNumber)&&!LiveOrderProtocol.ValidBrokerNumber(response.Slot2OrderNumber));
+        }
+        static bool ExactOrderRow(LiveOrderRecord order,BrokerOrderRow row,decimal expectedOpen) {
+            return row!=null&&LiveOrderProtocol.BrokerNumbersEqual(row.OrderNumber,order.BrokerOrderNumber)&&row.Code==order.Code
+                &&row.SideCode==(order.TradeKind==LiveOrderKind.Buy?"2":order.TradeKind==LiveOrderKind.Sell?"1":"")
+                &&row.ProductCode=="01"&&row.CreditCode=="00"&&NumberKey(row.OriginalOrderNumber)==NumberKey(order.OriginalBrokerOrderNumber)
+                &&row.Quantity==order.Quantity&&row.FilledQuantity==order.FilledQuantity&&row.OpenQuantity==expectedOpen&&row.LimitPrice==order.LimitPrice;
+        }
+        bool KnownUnfilledBuy(LiveOrderRecord order,LiveOrderJournalState journal) {
+            if(order==null||order.Kind!=LiveOrderKind.Buy||order.TradeKind!=LiveOrderKind.Buy||!IsWorking(order)
+                ||order.FilledQuantity!=0||order.CancelledQuantity!=0||NumberKey(order.OriginalBrokerOrderNumber)!=null
+                ||order.FillCheckpoint!=null||!AcceptedResponseMatches(order)||journal.Executions.Any(x=>x!=null&&x.OrderId==order.Id)
+                ||orders==null||!orders.RequestScopeVerified||!orders.MatchesRequestAccountKey(accountKey)
+                ||orderTime==null||orderTime.Started!=orders.RequestStartedUtc||orderTime.Started<=order.UpdatedUtc)return false;
+            var row=orders.Orders.SingleOrDefault(x=>NumberKey(x.OrderNumber)==NumberKey(order.BrokerOrderNumber));
+            return ExactOrderRow(order,row,order.Quantity)&&row.TerminalConfirmationCompatible&&row.ConfirmedQuantity==0&&row.AutoCancelledQuantity==0;
+        }
+        bool KnownPartiallyFilledBuy(LiveOrderRecord order,LiveOrderJournalState journal,List<LiveOrderRecord> local,DateTime nowUtc) {
+            if(order==null||order.Kind!=LiveOrderKind.Buy||order.TradeKind!=LiveOrderKind.Buy||order.Status!=LiveOrderStatus.PartiallyFilled
+                ||order.FilledQuantity<=0||order.FilledQuantity>=order.Quantity||order.CancelledQuantity!=0||NumberKey(order.OriginalBrokerOrderNumber)!=null
+                ||order.FillCheckpoint!=null||!AcceptedResponseMatches(order)||orders==null||!orders.RequestScopeVerified
+                ||!orders.MatchesRequestAccountKey(accountKey)||orderTime==null||orderTime.Started!=orders.RequestStartedUtc
+                ||orderTime.Started<=order.UpdatedUtc)return false;
+            var row=orders.Orders.SingleOrDefault(x=>NumberKey(x.OrderNumber)==NumberKey(order.BrokerOrderNumber));
+            if(!ExactOrderRow(order,row,order.Quantity-order.FilledQuantity)||!row.TerminalConfirmationCompatible
+                ||row.ConfirmedQuantity!=0||row.AutoCancelledQuantity!=0||row.AverageFillPrice<=0||row.AverageFillPrice>order.LimitPrice)return false;
+            var executions=journal.Executions.Where(x=>x!=null&&x.OrderId==order.Id).ToList();
+            if(executions.Any(x=>string.IsNullOrWhiteSpace(x.ExecutionId)||!LiveOrderProtocol.BrokerNumbersEqual(x.BrokerOrderNumber,order.BrokerOrderNumber)
+                    ||x.TradingDate!=order.TradingDate||x.Quantity<=0||x.Price<=0||x.Price>order.LimitPrice||x.ExecutedUtc.Kind!=DateTimeKind.Utc
+                    ||x.ExecutedUtc<order.CreatedUtc||x.ExecutedUtc>nowUtc)
+                ||executions.Select(x=>x.ExecutionId).Distinct(StringComparer.Ordinal).Count()!=executions.Count
+                ||executions.Sum(x=>(long)x.Quantity)!=order.FilledQuantity
+                ||executions.Sum(x=>x.Quantity*x.Price)!=order.FilledQuantity*row.AverageFillPrice)return false;
+            var position=holdings==null?null:holdings.SingleOrDefault(x=>x.Code==order.Code);
+            decimal filledBuys=local.Where(x=>x.Code==order.Code&&x.TradeKind==LiveOrderKind.Buy).Sum(x=>(decimal)x.FilledQuantity);
+            decimal filledSells=local.Where(x=>x.Code==order.Code&&x.TradeKind==LiveOrderKind.Sell).Sum(x=>(decimal)x.FilledQuantity);
+            return position!=null&&position.Quantity>0&&position.Quantity>=filledBuys-filledSells
+                &&tradeBalanceEvidence!=null&&QuantityConflict(tradeBalanceEvidence,position)==null;
+        }
+        bool AwaitingBuyCancellationAllowsSale(LiveOrderRecord cancellation,LiveOrderIntent intent,LiveOrderJournalState journal,List<LiveOrderRecord> local,DateTime nowUtc) {
+            // Acceptance of a cancellation is not cancellation confirmation. The
+            // original buy remains reserved; only an unrelated sale may proceed.
+            if(intent.Kind!=LiveOrderKind.Sell||cancellation==null||cancellation.Code==intent.Code
+                ||cancellation.Kind!=LiveOrderKind.Cancel||cancellation.TradeKind!=LiveOrderKind.Buy
+                ||cancellation.Status!=LiveOrderStatus.AwaitingConfirmation||cancellation.FilledQuantity!=0||cancellation.CancelledQuantity!=0
+                ||!AcceptedResponseMatches(cancellation)||orderTime==null||orderTime.Started<=cancellation.UpdatedUtc
+                ||journal.Executions.Any(x=>x!=null&&x.OrderId==cancellation.Id))return false;
+            var originals=local.Where(x=>LiveOrderProtocol.BrokerNumbersEqual(x.BrokerOrderNumber,cancellation.OriginalBrokerOrderNumber)).ToList();
+            if(originals.Count!=1)return false;var original=originals[0];
+            if(!(KnownUnfilledBuy(original,journal)||KnownPartiallyFilledBuy(original,journal,local,nowUtc))
+                ||original.Code!=cancellation.Code||original.LimitPrice!=cancellation.LimitPrice
+                ||cancellation.Quantity>original.Quantity-original.FilledQuantity-original.CancelledQuantity)return false;
+            var row=orders.Orders.SingleOrDefault(x=>NumberKey(x.OrderNumber)==NumberKey(cancellation.BrokerOrderNumber));
+            return ExactOrderRow(cancellation,row,0)&&row.TerminalConfirmationCompatible
+                &&(row.ConfirmationKind==BrokerConfirmationKind.Normal||row.ConfirmationKind==BrokerConfirmationKind.StatusCorroborated)
+                &&row.ConfirmedQuantity==0&&row.AutoCancelledQuantity==0;
+        }
         static bool TerminalCheckpointMatches(LiveOrderRecord order,LiveOrderJournalState journal,BrokerOrderRow row,BrokerOrdersSnapshot snapshot,string currentAccountKey) {
             if(!LiveOrderJournal.HasTerminalFillCheckpoint(order,journal.AccountFingerprint)||row==null||!snapshot.RequestScopeVerified
                 ||!snapshot.MatchesRequestAccountKey(currentAccountKey))return false;
@@ -271,10 +335,12 @@ namespace ShinhanNativeTrader {
                 var stamps=new List<DateTime>();if(hf)stamps.Add(holdingTime.Received);if(of)stamps.Add(orderTime.Received);
                 bool rows=journalValid&&hf&&holdingsTradeBasis&&of&&orders!=null&&orders.TradingDate==day,fillEvidence=rows;
                 var local=journalValid?journal.Orders.Where(x=>x!=null&&x.TradingDate==day).ToList():new List<LiveOrderRecord>();
+                bool blockingTransit=journalValid&&journal.Orders.Any(x=>x==null||IsTransit(x)
+                    &&!(rows&&x.TradingDate==day&&AwaitingBuyCancellationAllowsSale(x,intent,journal,local,nowUtc)));
                 if(local.Where(x=>NumberKey(x.BrokerOrderNumber)!=null).GroupBy(x=>NumberKey(x.BrokerOrderNumber),StringComparer.Ordinal).Any(x=>x.Count()>1)) {
                     rows=false;fillEvidence=false;result.Require(false,"주문번호 표기 중복 확인 필요");
                 }
-                if(journalValid&&journal.Orders.Any(x=>x==null||IsTransit(x))){rows=false;fillEvidence=false;result.Require(false,"미확정 주문의 접수·체결·복구 대사 필요");}
+                if(blockingTransit){rows=false;fillEvidence=false;result.Require(false,"미확정 주문의 접수·체결·복구 대사 필요");}
                 if(journalValid&&journal.Orders.Any(x=>LiveOrderJournal.IsUnresolved(x)&&x.TradingDate!=day)){rows=false;fillEvidence=false;result.Require(false,"이전 거래일 미완료 주문 확인 필요");}
                 if(journalValid&&journal.Orders.Any(x=>x.ClientKey==intent.ClientKey))result.Require(false,"동일 중복방지 키의 주문이 이미 기록됨");
                 if(journalValid&&(intent.Kind==LiveOrderKind.Buy||intent.Kind==LiveOrderKind.Sell)&&journal.Orders.Any(x=>x.Code==intent.Code&&LiveOrderJournal.IsUnresolved(x)))result.Require(false,"동일 종목의 미완료 주문 확인 필요");
@@ -288,9 +354,7 @@ namespace ShinhanNativeTrader {
                             &&!string.IsNullOrWhiteSpace(order.OriginalClientKey)&&!journal.Executions.Any(x=>x!=null&&x.OrderId==order.Id))continue;
                         var match=orders.Orders.SingleOrDefault(x=>NumberKey(x.OrderNumber)==NumberKey(order.BrokerOrderNumber));
                         decimal expectedOpen=IsWorking(order)?order.Quantity-order.FilledQuantity-order.CancelledQuantity:0;
-                        string side=order.TradeKind==LiveOrderKind.Buy?"2":order.TradeKind==LiveOrderKind.Sell?"1":"";
-                        if(match==null||match.Code!=order.Code||match.SideCode!=side||match.ProductCode!="01"||match.CreditCode!="00"
-                            ||NumberKey(match.OriginalOrderNumber)!=NumberKey(order.OriginalBrokerOrderNumber)||match.Quantity!=order.Quantity||match.FilledQuantity!=order.FilledQuantity||match.OpenQuantity!=expectedOpen||match.LimitPrice!=order.LimitPrice)rows=false;
+                        if(!ExactOrderRow(order,match,expectedOpen))rows=false;
                         var executions=journal.Executions.Where(x=>x!=null&&x.OrderId==order.Id).ToList();
                         if(executions.Any(x=>string.IsNullOrWhiteSpace(x.ExecutionId)||NumberKey(x.BrokerOrderNumber)!=NumberKey(order.BrokerOrderNumber)||x.TradingDate!=order.TradingDate||x.Quantity<=0||x.Price<=0||x.ExecutedUtc.Kind!=DateTimeKind.Utc||x.ExecutedUtc>nowUtc)
                             ||executions.Select(x=>x.ExecutionId).Distinct(StringComparer.Ordinal).Count()!=executions.Count
@@ -303,12 +367,28 @@ namespace ShinhanNativeTrader {
                         Sellable source;decimal reported=sellable.TryGetValue(position.Code,out source)?source.Unfilled:position.BuyPending+position.SellPending;
                         if(reported!=expected)rows=false;
                     }
-                    if(pending.Any(x=>!holdings.Any(h=>h.Code==x.Key)))rows=false;
+                    foreach(var partialBuy in local.Where(x=>IsWorking(x)&&x.TradeKind==LiveOrderKind.Buy&&x.FilledQuantity>0)) {
+                        var position=holdings.SingleOrDefault(x=>x.Code==partialBuy.Code);
+                        decimal filledBuys=local.Where(x=>x.Code==partialBuy.Code&&x.TradeKind==LiveOrderKind.Buy).Sum(x=>(decimal)x.FilledQuantity);
+                        decimal filledSells=local.Where(x=>x.Code==partialBuy.Code&&x.TradeKind==LiveOrderKind.Sell).Sum(x=>(decimal)x.FilledQuantity);
+                        // Check the broker's current quantity against confirmed
+                        // net fills; never construct a position from the orders.
+                        if(position==null||position.Quantity<=0||position.Quantity<filledBuys-filledSells
+                            ||QuantityConflict(tradeBalanceEvidence,position)!=null)rows=false;
+                    }
+                    foreach(var missing in pending.Where(x=>!holdings.Any(h=>h.Code==x.Key))) {
+                        var originals=local.Where(x=>x.Code==missing.Key&&IsWorking(x)).ToList();
+                        // A never-filled buy is an order reservation, not a
+                        // holding. SABA609Q1 may correctly omit that symbol.
+                        if(originals.Count==0||originals.Any(x=>!KnownUnfilledBuy(x,journal))
+                            ||local.Any(x=>x.Code==missing.Key&&x.FilledQuantity>0)
+                            ||originals.Sum(x=>(decimal)x.Quantity)!=missing.Value)rows=false;
+                    }
                 }
                 fillEvidence=fillEvidence&&rows;
                 result.Require(rows,"확인된 주문·잔고 수량 대사 필요");
                 result.Require(fillEvidence,"주문별 개별 체결 또는 증권사 전량체결 대사 필요");
-                checks.OrdersReconciled=rows;checks.FillsReconciled=fillEvidence;checks.RecoveryVerified=journalValid&&!journal.Orders.Any(x=>x==null||IsTransit(x))&&rows&&fillEvidence;
+                checks.OrdersReconciled=rows;checks.FillsReconciled=fillEvidence;checks.RecoveryVerified=journalValid&&!blockingTransit&&rows&&fillEvidence;
                 result.ReconciliationScope=rows&&fillEvidence?(local.Any(IsWorking)?"KnownLocalOrdersAndExecutions":"NoLocalUnresolvedBaseline"):"Unverified";
                 var effective=intent.Kind;
                 if(intent.Kind==LiveOrderKind.Amend||intent.Kind==LiveOrderKind.Cancel) {

@@ -565,3 +565,13 @@ Local x86target-warnaserrorcompile0warning/error. App2158/GUI383/reportGUI30/Pyt
 GUIrealformsyntheticcallback:raw0/current18/cost146880/value141660,ordinarycanonical18,SC7600→손절판정,기존체결/ID보존/추가전송0. Readiness207assertions:18매도허용/19차단,remaining53120매수한도,partial10pending8,pendingSellcap8/held18,cancel,credit18,fullsoldcurrent0/raw18,DTOmutation/sourcegap.
 새EXE실제WindowsIndi현재수량반영/자동매도/후속매수는미검증. 도구실계좌조회·금전주문0회. 동일HEAD Windows Actions 빌드·앱·GUI·COM·UIPI·Python과EXE는PR링크에기록.
 상세: docs/CURRENT_EVALUATION_QUANTITY_20261116.md
+
+
+2.2.16 — 미체결 매수 유한 대기·잔량 취소·독립 손절매도 (2026-11-16)
+사용자보고서: 보유행 없는 정상접수 미체결매수와 다른보유의 손절조건·매도가능수량을확인했으나매도없음. 기존 pending종목이잔고에없으면전계좌rows=false로처리하는차단확인. 원본사용자파일·실제주문번호·계좌는포함하지않음.
+검증된같은계좌/당일/정확한정상접수/무체결BUY에한해무보유미체결을정상예약으로대사. 기존매수예약금과부분체결/외부주문/불명/초과매도차단유지. 부분체결BUY취소접수대기중에도개별체결·실제현재보유·원주문/취소행정확대조후다른종목매도만허용.
+기본120초(설정30~1800), CreatedUtc기준자동매수잔량취소. 새조회·기존사전검증필수, 전송직전부분체결이면취소수량축소/전량체결이면취소미전송. ACK는AwaitingConfirmation이며AA05실제취소확인전예약해제/재매수없음. 무체결전량취소확정후현재전략·시세·한도재검증추가진입당일1회한정. 외부수동주문/매도는타이머대상아님.
+스케줄러미전송매수준비보다보유매도/만료예약관리를우선. 진행중조회·전송은폐기/중복하지않음. 기존주문정상접수근거/정확한새조회로Working·Partial상태복구, CreatedUtc보존, 승인자동복원/체결추정없음. 앞선취소대기가뒤의만료매수조회갱신을가리지않음.
+최종Linux x86target warnaserror컴파일0warning/error. App2389 / 실제폼GUI406 / 보고서GUI30 / Python17 PASS. I386/PE32/CLR32BITREQUIRED PASS. Linuxpointer8은Windows실행증거아님. 동일커밋Windows .NET4.8 x86/COM/UIPI/GUI/EXE는PR Actions결과참조.
+기존15:20종료/로그아웃/수동중단이후취소를새로보내지않으며, 종료직전주문의대기시간이종료를넘는경우타이머취소를보장하지않음. AA05누락/불명주문은조회행누락이나미확인취소enum으로확정하지않으며자동재전송없음. 실제Indi취소/부분체결/재시작종단검증은미실행, 도구의실제금융API호출0회.
+상세: docs/PENDING_BUY_TIMEOUT_20261116.md

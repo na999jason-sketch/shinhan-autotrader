@@ -135,8 +135,11 @@ static class SellDecisionUiCases {
             }
             fixture.Tick(Opening);
             check(fixture.Cell("매도판정").Contains("손절"),mode+": a fresh confirmed quote updates sell risk before scheduler early returns");
-            check(fixture.Orders.Sends==0&&fixture.Orders.Preparations==0&&fixture.Reads.Requests==(mode=="preflight"?0:1),
-                mode+": risk refresh does not create another order or bypass the serialized read queue");
+            bool riskQueued=mode=="queued";
+            var pending=Get<object>(fixture.Form,"entry");
+            check(fixture.Orders.Sends==0&&fixture.Orders.Preparations==(riskQueued?1:0)&&fixture.Reads.Requests==(mode=="busy"?1:0)
+                &&(!riskQueued||pending!=null&&Get<LiveOrderIntent>(pending,"Intent").Kind==LiveOrderKind.Sell),
+                mode+": protective sell priority preserves an in-flight read and starts only fresh sell preparation when idle");
         }
     }
     static void PausedRecoveryPreview(string data,Action<bool,string> check) {

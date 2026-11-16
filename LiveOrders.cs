@@ -531,6 +531,95 @@ namespace ShinhanNativeTrader {
                 BrokerChanged(copy,utc);
             });
         }
+        // Restart recovery is identity recovery, never a new submission. Only
+        // a preserved positive ACK and a fresh, exact, request-scoped broker row
+        // can restore a known open order. Cumulative fills must already have
+        // individual journal evidence; this path never manufactures executions.
+        public bool TryReconcileKnownOpenOrder(string id,BrokerOrdersSnapshot snapshot,string account,DateTime utc,out string reason) {
+            LiveOrderSafety.RequireUtc(utc);reason="KnownOpenOrderUnverified";
+            lock(sync) {
+                CheckUsable();var order=state.Orders.SingleOrDefault(value=>value.Id==id);
+                if(order==null||order.Status!=LiveOrderStatus.Unknown||!KnownAcceptedNewOrder(order))return false;
+                if(!RecoveryScopeMatches(state,order,snapshot,account,utc)) {reason="KnownOpenRequestScopeUnverified";return false;}
+                var rows=snapshot.Orders.Where(value=>value!=null&&LiveOrderProtocol.BrokerNumbersEqual(value.OrderNumber,order.BrokerOrderNumber)).ToArray();
+                if(rows.Length!=1) {reason="KnownOpenIdentityAmbiguous";return false;}
+                var row=rows[0];
+                if(!RecoveryRowMatches(order,row)||!RecoveryFillsMatch(state,order,row)||!AbsentBrokerNumber(row.OriginalOrderNumber)
+                    ||row.OpenQuantity<=0||row.FilledQuantity!=order.FilledQuantity||row.ConfirmedQuantity!=0
+                    ||row.AutoCancelledQuantity!=order.CancelledQuantity||row.OpenQuantity!=Remaining(order)
+                    ||state.Orders.Any(value=>value.Id!=id&&value.TradingDate==order.TradingDate
+                        &&!AbsentBrokerNumber(value.OriginalBrokerOrderNumber)
+                        &&LiveOrderProtocol.BrokerNumbersEqual(value.OriginalBrokerOrderNumber,order.BrokerOrderNumber)&&IsUnresolved(value))) {
+                    reason="KnownOpenOrderFieldsUnverified";return false;
+                }
+                Change(copy=>{var current=Find(copy,id);current.Status=current.FilledQuantity>0?LiveOrderStatus.PartiallyFilled:LiveOrderStatus.Working;
+                    current.UpdatedUtc=utc;BrokerChanged(copy,utc);});
+                reason="KnownOpenOrderReconciled";return true;
+            }
+        }
+        // An accepted cancellation is still awaiting AA05 confirmation. Restore
+        // that state on restart without releasing the original reservation. The
+        // query's amendment/cancellation enum is not established by its metadata.
+        public bool TryRestoreKnownCancellation(string id,BrokerOrdersSnapshot snapshot,string account,DateTime utc,out string reason) {
+            LiveOrderSafety.RequireUtc(utc);reason="KnownCancellationUnverified";
+            lock(sync) {
+                CheckUsable();var child=state.Orders.SingleOrDefault(value=>value.Id==id);
+                if(child==null||child.Kind!=LiveOrderKind.Cancel||!KnownAcceptedOrder(child)
+                    ||child.Status!=LiveOrderStatus.Unknown&&child.Status!=LiveOrderStatus.AwaitingConfirmation)return false;
+                var originals=state.Orders.Where(value=>value.Id!=id&&value.TradingDate==child.TradingDate
+                    &&LiveOrderProtocol.BrokerNumbersEqual(value.BrokerOrderNumber,child.OriginalBrokerOrderNumber)).ToArray();
+                if(originals.Length!=1)return false;var original=originals[0];
+                if(!KnownAcceptedNewOrder(original)||original.Code!=child.Code||original.TradeKind!=child.TradeKind
+                    ||original.Status!=LiveOrderStatus.Unknown&&!IsWorking(original)
+                    ||!RecoveryScopeMatches(state,child,snapshot,account,utc)
+                    ||snapshot.RequestStartedUtc<=original.UpdatedUtc
+                    ||state.Orders.Any(value=>value.Id!=id&&value.Id!=original.Id&&value.TradingDate==child.TradingDate
+                        &&!AbsentBrokerNumber(value.OriginalBrokerOrderNumber)
+                        &&LiveOrderProtocol.BrokerNumbersEqual(value.OriginalBrokerOrderNumber,original.BrokerOrderNumber)&&IsUnresolved(value)))return false;
+                var childRows=snapshot.Orders.Where(value=>value!=null&&LiveOrderProtocol.BrokerNumbersEqual(value.OrderNumber,child.BrokerOrderNumber)).ToArray();
+                var originalRows=snapshot.Orders.Where(value=>value!=null&&LiveOrderProtocol.BrokerNumbersEqual(value.OrderNumber,original.BrokerOrderNumber)).ToArray();
+                if(childRows.Length!=1||originalRows.Length!=1) {reason="KnownCancellationIdentityAmbiguous";return false;}
+                var row=childRows[0];var root=originalRows[0];
+                if(!RecoveryRowMatches(child,row)||!RecoveryRowMatches(original,root)||!RecoveryFillsMatch(state,original,root)
+                    ||!LiveOrderProtocol.BrokerNumbersEqual(row.OriginalOrderNumber,original.BrokerOrderNumber)
+                    ||!AbsentBrokerNumber(root.OriginalOrderNumber)||row.FilledQuantity!=0||row.OpenQuantity!=0||row.AutoCancelledQuantity!=0
+                    ||root.FilledQuantity!=original.FilledQuantity||root.ConfirmedQuantity!=0||row.ConfirmedQuantity!=0
+                    ||root.AutoCancelledQuantity!=original.CancelledQuantity||root.OpenQuantity!=Remaining(original)) {
+                    reason="KnownCancellationFieldsUnverified";return false;
+                }
+                bool restore=child.Status==LiveOrderStatus.Unknown||original.Status==LiveOrderStatus.Unknown;
+                if(!restore) {reason="KnownCancellationAwaitingConfirmation";return false;}
+                Change(copy=>{
+                    var current=Find(copy,id);var parent=Find(copy,original.Id);
+                    if(parent.Status==LiveOrderStatus.Unknown)parent.Status=parent.FilledQuantity>0?LiveOrderStatus.PartiallyFilled:LiveOrderStatus.Working;
+                    if(current.Status==LiveOrderStatus.Unknown)current.Status=LiveOrderStatus.AwaitingConfirmation;
+                    current.UpdatedUtc=utc;parent.UpdatedUtc=utc;BrokerChanged(copy,utc);
+                });
+                reason="KnownCancellationAwaitingConfirmation";return true;
+            }
+        }
+        static bool RecoveryScopeMatches(LiveOrderJournalState value,LiveOrderRecord order,BrokerOrdersSnapshot snapshot,string account,DateTime utc) {
+            if(snapshot==null||!snapshot.RequestScopeVerified||!snapshot.MatchesRequestAccount(account)
+                ||snapshot.TradingDate!=order.TradingDate||snapshot.TradingDate!=TradeDate(utc)
+                ||snapshot.RequestStartedUtc>snapshot.ReceivedUtc||snapshot.ReceivedUtc>utc||utc-snapshot.ReceivedUtc>TimeSpan.FromSeconds(5)
+                ||snapshot.RequestStartedUtc<=order.UpdatedUtc||snapshot.RequestStartedUtc<value.LastBrokerChangeUtc
+                ||string.IsNullOrEmpty(value.AccountFingerprint))return false;
+            using(var hash=SHA256.Create())return value.AccountFingerprint==Convert.ToBase64String(hash.ComputeHash(Encoding.UTF8.GetBytes(value.AccountSalt+":"+account)));
+        }
+        static bool RecoveryRowMatches(LiveOrderRecord order,BrokerOrderRow row) {
+            return row.Code==order.Code&&row.SideCode==(order.TradeKind==LiveOrderKind.Buy?"2":"1")
+                &&row.ProductCode=="01"&&row.CreditCode=="00"&&row.Quantity==order.Quantity&&row.LimitPrice==order.LimitPrice
+                &&!row.HasRejectionConflict&&(row.ConfirmationKind==BrokerConfirmationKind.Normal
+                    ||row.ConfirmationKind==BrokerConfirmationKind.StatusCorroborated)
+                &&(row.QueryProfile==BrokerOrderQueryProfile.Unverified||row.HasRecognizedModernSchema&&row.ModernVenueCompatible);
+        }
+        static bool RecoveryFillsMatch(LiveOrderJournalState value,LiveOrderRecord order,BrokerOrderRow row) {
+            if(order.FillCheckpoint!=null||row.FilledQuantity!=order.FilledQuantity)return false;
+            var fills=value.Executions.Where(execution=>execution.OrderId==order.Id).ToArray();
+            return fills.Sum(execution=>execution.Quantity)==order.FilledQuantity
+                &&(order.FilledQuantity==0?row.AverageFillPrice==0:
+                    row.AverageFillPrice>0&&fills.Sum(execution=>execution.Quantity*execution.Price)==row.FilledQuantity*row.AverageFillPrice);
+        }
         public bool ReconcileKnownTerminalFill(string id,BrokerTerminalFillEvidence evidence,DateTime utc) {
             LiveOrderSafety.RequireUtc(utc);
             if(evidence==null||!evidence.RequestScopeVerified||evidence.MatchingOrderCount!=1||evidence.Row==null
@@ -578,7 +667,10 @@ namespace ShinhanNativeTrader {
         static bool AbsentBrokerNumber(string value){return string.IsNullOrEmpty(value)||value.All(character=>character=='0');}
         static bool KnownAcceptedNewOrder(LiveOrderRecord order) {
             return order!=null&&(order.Kind==LiveOrderKind.Buy||order.Kind==LiveOrderKind.Sell)&&order.Kind==order.TradeKind
-                &&AbsentBrokerNumber(order.OriginalBrokerOrderNumber)&&LiveOrderProtocol.ValidBrokerNumber(order.BrokerOrderNumber)
+                &&AbsentBrokerNumber(order.OriginalBrokerOrderNumber)&&KnownAcceptedOrder(order);
+        }
+        static bool KnownAcceptedOrder(LiveOrderRecord order) {
+            return order!=null&&LiveOrderProtocol.ValidBrokerNumber(order.BrokerOrderNumber)
                 &&order.RequestId.HasValue&&order.RequestId.Value>0&&order.ResponseEvidence!=null
                 &&order.ResponseEvidence.Disposition==OrderResponseDisposition.Accepted
                 &&!order.ResponseEvidence.ProviderError&&!order.ResponseEvidence.ParseFailed

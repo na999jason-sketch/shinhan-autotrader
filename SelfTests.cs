@@ -31,7 +31,8 @@ namespace ShinhanNativeTrader {
                 + AccountQueriesTests.Run() + UnattendedSessionTests.Run() + LiveOrdersTests.Run() + SessionReportTests.Run()
                 + AccountAppSettingsTests.Run() + RealtimeIndiTests.Run() + RealtimeDiagnosticsTests.Run() + CashMarketRulesTests.Run()
                 + BrokerReadinessTests.Run() + BrokerAccountEventRouterTests.Run() + PremarketResearchTests.Run()
-                + LiveOrderResponseParserTests.Run() + IndiOrderSchemaTests.Run() + IndiAccountOrderSchemaTests.Run() + IndiHoldingsSchemaTests.Run() + IndiDefinitionExportTests.Run() + AutoOrderRetryTests.Run();
+                + LiveOrderResponseParserTests.Run() + IndiOrderSchemaTests.Run() + IndiAccountOrderSchemaTests.Run() + IndiHoldingsSchemaTests.Run() + IndiDefinitionExportTests.Run() + AutoOrderRetryTests.Run()
+                + PendingBuyPolicyTests.Run() + PendingOrderRecoveryTests.Run();
         }
     }
 }

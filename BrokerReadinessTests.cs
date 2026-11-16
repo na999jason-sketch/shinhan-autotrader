@@ -45,6 +45,7 @@ namespace ShinhanNativeTrader {
             public AccountCashSnapshot Cash;
             public BrokerOrdersSnapshot Orders;
             public BrokerHoldingsSnapshot Balance;
+            public int ScopedObservation;
             public AccountOrderCapacity Capacity;
             public Fixture(){Data.SetAuthorization(true);Data.SetAccountStream(true,Now.AddSeconds(-10));Refresh(Now);}
             public void Refresh(DateTime at) {
@@ -233,9 +234,178 @@ namespace ShinhanNativeTrader {
             Reject(()=>f.Data.Invalidate(DateTime.SpecifyKind(Now,DateTimeKind.Local)),"local clock timestamps cannot masquerade as UTC evidence");
             QuantityConflictChecks();
             CurrentQuantityChecks();
+            UnfilledBuyWithoutHoldingChecks();
             TerminalCheckpointChecks();
             OrdinarySourceChecks();
             return checks;
+        }
+        static string ScopedAccountKey() {
+            using(var hash=SHA256.Create())return string.Concat(hash.ComputeHash(Encoding.UTF8.GetBytes("ShinhanNativeTrader/real-account/v1/12345678901"))
+                .Select(value=>value.ToString("x2")));
+        }
+        static void AcceptResponse(LiveOrderRecord order,int request=71) {
+            order.RequestId=request;var fields=new[]{"0",order.BrokerOrderNumber,"0","","0","synthetic accepted order","0","0"};
+            order.ResponseEvidence=LiveOrderResponseParser.Read(request,index=>fields[index],new IndiDiagnosticSnapshot{ErrorState=0},OrderResponseLayout.Modern,new string[0]);
+        }
+        static void ObserveScopedOrders(Fixture f) {
+            var received=Now.AddMilliseconds(-100+10*++f.ScopedObservation);
+            f.Orders.BindRequestScope(received.AddMilliseconds(-100),received,true,"12345678901");
+            f.Data.ObserveOrders(f.Orders,f.Orders.RequestStartedUtc);
+        }
+        static Fixture UnfilledBuyWithoutHolding() {
+            var f=new Fixture();f.Data=new BrokerReadiness(ScopedAccountKey(),Fingerprint);
+            f.Data.SetAuthorization(true);f.Data.SetAccountStream(true,Now.AddSeconds(-10));f.Refresh(Now);
+            foreach(var code in new[]{"241520","084695"})f.Data.ObserveTradingDate(code,"20261112",Now.AddSeconds(-8),Now.AddSeconds(-7));
+            var balance=Positions(Now.AddMilliseconds(100));
+            foreach(var code in new[]{"241520","000001","000002","000003","000004"}) {
+                int quantity=code=="241520"?18:1;
+                balance.Holdings.Add(new Holding{Code=code,Quantity=quantity,AvgPrice=8160,Price=7660});
+                balance.SellableQuantities[code]=quantity;balance.UnfilledQuantities[code]=0;
+                balance.CashSourceValidated[code]=true;balance.BasisValidated[code]=true;
+            }
+            f.Balance=balance;f.Data.ObserveTradeBalance(balance);
+            var order=Working();order.Code="084695";order.Quantity=3;order.LimitPrice=13910;AcceptResponse(order);
+            f.Journal.Orders.Add(order);f.Journal.LastBrokerChangeUtc=Now.AddSeconds(-6);
+            f.Orders=new BrokerOrdersSnapshot{TradingDate="20261112"};
+            f.Orders.Orders.Add(new BrokerOrderRow{OrderNumber="11",Code="084695",SideCode="2",ProductCode="01",CreditCode="00",
+                Quantity=3,OpenQuantity=3,LimitPrice=13910,ConfirmationCode="0"});ObserveScopedOrders(f);return f;
+        }
+        static BrokerReadinessResult PendingSale(Fixture f,int quantity=18) {
+            var intent=new LiveOrderIntent{Kind=LiveOrderKind.Sell,Code="241520",Quantity=quantity,LimitPrice=7660,ClientKey="pending-other-exit"};
+            return f.Data.Evaluate(intent,new IndiReply{Code=intent.Code,Price=7660,Clock=MarketTime.ToKorea(Now).ToString("HHmmss"),HasTradeClock=true},
+                Now,true,true,f.Journal,1000000,Now);
+        }
+        static LiveOrderRecord AwaitingBuyCancellation(Fixture f) {
+            var original=f.Journal.Orders[0];int remaining=original.Quantity-original.FilledQuantity-original.CancelledQuantity;
+            var cancellation=new LiveOrderRecord{Id="pending-buy-cancel",ClientKey="pending-buy-timeout",Kind=LiveOrderKind.Cancel,TradeKind=LiveOrderKind.Buy,
+                Code="084695",BrokerOrderNumber="12",OriginalBrokerOrderNumber="11",TradingDate="20261112",Quantity=remaining,LimitPrice=13910,
+                Status=LiveOrderStatus.AwaitingConfirmation,CreatedUtc=Now.AddSeconds(-5),UpdatedUtc=Now.AddSeconds(-4)};
+            AcceptResponse(cancellation,72);f.Journal.Orders.Add(cancellation);f.Journal.LastBrokerChangeUtc=Now.AddSeconds(-4);
+            f.Orders.Orders.Add(new BrokerOrderRow{OrderNumber="12",OriginalOrderNumber="11",Code="084695",SideCode="2",ProductCode="01",CreditCode="00",
+                Quantity=remaining,LimitPrice=13910,ConfirmationCode="0"});ObserveScopedOrders(f);return cancellation;
+        }
+        static Fixture PartialBuyAwaitingCancellation() {
+            var f=UnfilledBuyWithoutHolding();var original=f.Journal.Orders[0];original.FilledQuantity=1;original.Status=LiveOrderStatus.PartiallyFilled;
+            f.Journal.Executions.Add(new LiveExecutionRecord{OrderId=original.Id,BrokerOrderNumber="11",TradingDate="20261112",ExecutionId="confirmed-partial-buy",
+                Quantity=1,Price=13900,ExecutedUtc=Now.AddSeconds(-6)});
+            f.Orders.Orders[0].FilledQuantity=1;f.Orders.Orders[0].OpenQuantity=2;f.Orders.Orders[0].AverageFillPrice=13900;
+            f.Balance.Holdings.Add(new Holding{Code="084695",Quantity=1,AvgPrice=13900,Price=13910});
+            f.Balance.SellableQuantities["084695"]=1;f.Balance.UnfilledQuantities["084695"]=2;
+            f.Balance.CashSourceValidated["084695"]=true;f.Balance.BasisValidated["084695"]=true;
+            f.Balance.ReceivedUtc=Now.AddMilliseconds(-50);f.Data.ObserveTradeBalance(f.Balance);
+            AwaitingBuyCancellation(f);return f;
+        }
+        static void UnfilledBuyWithoutHoldingChecks() {
+            var f=UnfilledBuyWithoutHolding();var sale=PendingSale(f);
+            Check(f.Balance.Holdings.Count==6&&!f.Balance.Holdings.Any(x=>x.Code=="084695")&&sale.Ready
+                &&sale.Checks.OrdersReconciled&&sale.Checks.SellableQuantity==18,
+                "six current holdings plus a separately accepted three-share zero-fill buy permit the independent eighteen-share stop sale");
+            Check(f.Evaluate(Buy(2),limit:61730).Ready&&!f.Evaluate(Buy(3),limit:61730).Ready,
+                "a zero-held three-share buy still reserves all 41730 of operating capital for a subsequent different-symbol buy");
+            var cancel=new LiveOrderIntent{Kind=LiveOrderKind.Cancel,Code="084695",Quantity=3,LimitPrice=13910,OriginalBrokerOrderNumber="11",ClientKey="cancel-never-filled"};
+            Check(f.Evaluate(cancel).Ready&&f.Evaluate(cancel).Checks.OriginalTradeKind==LiveOrderKind.Buy,
+                "the exact timed-out zero-held buy can be cancelled without a fabricated holding or live quote");
+            foreach(var mutate in new Action<Fixture>[] {
+                value=>value.Journal.Orders[0].Status=LiveOrderStatus.Unknown,
+                value=>value.Journal.Orders[0].Status=LiveOrderStatus.AwaitingAcknowledgement,
+                value=>value.Journal.Orders[0].ResponseEvidence=null,
+                value=>value.Journal.Orders[0].ResponseEvidence.ProviderError=true,
+                value=>value.Journal.Orders[0].ResponseEvidence.RequestId=999,
+                value=>value.Orders.Orders[0].OpenQuantity=2,
+                value=>value.Orders.Orders[0].Quantity=4,
+                value=>value.Orders.Orders[0].LimitPrice=13900,
+                value=>value.Orders.Orders[0].ProductCode="70",
+                value=>value.Orders.Orders[0].CreditCode="01",
+                value=>value.Orders.Orders[0].OriginalOrderNumber="77",
+                value=>value.Orders.Orders[0].ConfirmationCode="2"
+            }) {
+                f=UnfilledBuyWithoutHolding();mutate(f);ObserveScopedOrders(f);
+                Check(!PendingSale(f).Ready&&!f.Evaluate(cancel).Ready,
+                    "a missing buy position never exempts unknown acceptance or mismatched broker identity quantity price and route from reconciliation");
+            }
+            f=UnfilledBuyWithoutHolding();f.Orders.BindRequestScope(Now.AddMilliseconds(-80),Now.AddMilliseconds(-40),false,"12345678901");
+            f.Data.ObserveOrders(f.Orders,f.Orders.RequestStartedUtc);Check(!PendingSale(f).Ready,
+                "an unbound open-buy snapshot cannot certify that the omitted holding is a known reservation");
+            f=UnfilledBuyWithoutHolding();f.Orders.BindRequestScope(Now.AddMilliseconds(-80),Now.AddMilliseconds(-40),true,"12345678902");
+            f.Data.ObserveOrders(f.Orders,f.Orders.RequestStartedUtc);Check(!PendingSale(f).Ready,
+                "another account's fresh matching open buy cannot exempt the current account's missing holding");
+            f=UnfilledBuyWithoutHolding();f.Journal.Orders[0].FilledQuantity=1;f.Journal.Orders[0].Status=LiveOrderStatus.PartiallyFilled;
+            f.Journal.Executions.Add(new LiveExecutionRecord{OrderId="known-local",BrokerOrderNumber="11",TradingDate="20261112",ExecutionId="actual-partial-buy",
+                Quantity=1,Price=13910,ExecutedUtc=Now.AddSeconds(-6)});
+            f.Orders.Orders[0].FilledQuantity=1;f.Orders.Orders[0].OpenQuantity=2;ObserveScopedOrders(f);
+            Check(!PendingSale(f).Ready&&!f.Evaluate(cancel).Ready,
+                "a confirmed partial buy requires its current holdings row and cannot use the never-filled exemption");
+            f.Balance.Holdings.Add(new Holding{Code="084695",Quantity=0,AvgPrice=13910,Price=13910});
+            f.Balance.SellableQuantities["084695"]=0;f.Balance.UnfilledQuantities["084695"]=2;
+            f.Balance.CashSourceValidated["084695"]=true;f.Balance.BasisValidated["084695"]=true;
+            f.Balance.ReceivedUtc=Now.AddMilliseconds(-50);f.Data.ObserveTradeBalance(f.Balance);
+            Check(!PendingSale(f).Ready,"a zero-current-quantity row cannot stand in for the missing confirmed partial-buy inventory");
+            f=UnfilledBuyWithoutHolding();var original=f.Journal.Orders[0];original.Kind=LiveOrderKind.Sell;original.TradeKind=LiveOrderKind.Sell;
+            f.Orders.Orders[0].SideCode="1";ObserveScopedOrders(f);Check(!PendingSale(f).Ready,
+                "a missing position behind a pending sell remains an account reconciliation failure");
+
+            f=UnfilledBuyWithoutHolding();var partialSell=new LiveOrderRecord{Id="known-partial-sale",ClientKey="known-partial-sale-key",Code="241520",BrokerOrderNumber="13",
+                TradingDate="20261112",Kind=LiveOrderKind.Sell,TradeKind=LiveOrderKind.Sell,Status=LiveOrderStatus.PartiallyFilled,
+                Quantity=10,FilledQuantity=4,LimitPrice=7660,CreatedUtc=Now.AddSeconds(-7),UpdatedUtc=Now.AddSeconds(-6)};
+            f.Journal.Orders.Add(partialSell);f.Journal.Executions.Add(new LiveExecutionRecord{OrderId=partialSell.Id,BrokerOrderNumber="13",TradingDate="20261112",
+                ExecutionId="actual-partial-sell",Quantity=4,Price=7660,ExecutedUtc=Now.AddSeconds(-6)});
+            f.Orders.Orders.Add(new BrokerOrderRow{OrderNumber="13",Code="241520",SideCode="1",ProductCode="01",CreditCode="00",Quantity=10,
+                FilledQuantity=4,OpenQuantity=6,LimitPrice=7660,AverageFillPrice=7660});ObserveScopedOrders(f);
+            f.Balance.Holdings.Single(x=>x.Code=="241520").Quantity=14;
+            f.Balance.SellableQuantities["241520"]=8;f.Balance.UnfilledQuantities["241520"]=6;
+            f.Balance.ReceivedUtc=Now.AddMilliseconds(-50);f.Data.ObserveTradeBalance(f.Balance);sale=PendingSale(f,9);
+            Check(!sale.Ready&&sale.Checks.SellableQuantityVerified&&sale.Checks.SellableQuantity==8,
+                "the unrelated unfilled-buy exemption never releases six shares reserved by a partially filled sell or authorizes overselling");
+
+            f=UnfilledBuyWithoutHolding();var cancellation=AwaitingBuyCancellation(f);sale=PendingSale(f);
+            Check(sale.Ready&&sale.Checks.RecoveryVerified&&f.Journal.Orders[0].Status==LiveOrderStatus.Working
+                &&f.Journal.Orders[0].CancelledQuantity==0,
+                "an exactly scoped accepted but unconfirmed buy cancellation permits only the independent sale and does not release the original order");
+            Check(!f.Evaluate().Ready&&!f.Evaluate(new LiveOrderIntent{Kind=LiveOrderKind.Buy,Code="084695",Quantity=1,LimitPrice=13910,ClientKey="premature-reentry"}).Ready,
+                "cancellation acceptance cannot authorize another buy or a replacement of its own original order");
+            cancellation.Status=LiveOrderStatus.Unknown;Check(!PendingSale(f).Ready,
+                "an unknown cancellation is still a global unresolved-order barrier");
+            foreach(var mutate in new Action<Fixture>[] {
+                value=>value.Journal.Orders[1].ResponseEvidence=null,
+                value=>value.Journal.Orders[1].OriginalBrokerOrderNumber="77",
+                value=>value.Orders.Orders[1].OriginalOrderNumber="77",
+                value=>value.Orders.Orders[1].Quantity=2,
+                value=>value.Orders.Orders[1].ConfirmationCode="",
+                value=>value.Orders.Orders[1].ConfirmationCode="2",
+                value=>value.Orders.Orders.RemoveAt(1)
+            }) {
+                f=UnfilledBuyWithoutHolding();AwaitingBuyCancellation(f);mutate(f);ObserveScopedOrders(f);
+                Check(!PendingSale(f).Ready,"an unbound missing mismatched or unconfirmed cancellation row cannot bypass the global transit barrier");
+            }
+            f=PartialBuyAwaitingCancellation();sale=PendingSale(f);
+            Check(sale.Ready&&sale.Checks.OrdersReconciled&&sale.Checks.FillsReconciled&&sale.Checks.RecoveryVerified
+                &&f.Journal.Orders[0].FilledQuantity==1&&f.Journal.Orders[0].CancelledQuantity==0
+                &&f.Journal.Orders[1].Status==LiveOrderStatus.AwaitingConfirmation,
+                "an independently confirmed partial buy with exact current inventory and scoped cancellation rows permits an unrelated stop sale while cancellation remains unconfirmed");
+            Check(!f.Evaluate().Ready&&!f.Evaluate(new LiveOrderIntent{Kind=LiveOrderKind.Buy,Code="084695",Quantity=1,LimitPrice=13910,ClientKey="partial-premature-reentry"}).Ready,
+                "a partial-buy cancellation acknowledgement cannot release its remaining reservation or authorize replacement buys");
+            foreach(var mutate in new Action<Fixture>[] {
+                value=>value.Journal.Executions.Clear(),
+                value=>value.Journal.Executions.Add(value.Journal.Executions[0]),
+                value=>value.Journal.Executions[0].Price=13920,
+                value=>value.Journal.Executions[0].BrokerOrderNumber="77",
+                value=>{value.Orders.Orders[0].FilledQuantity=2;value.Orders.Orders[0].OpenQuantity=1;},
+                value=>value.Orders.Orders[0].AverageFillPrice=13890,
+                value=>value.Orders.Orders[0].OpenQuantity=1,
+                value=>value.Orders.Orders[1].Quantity=3
+            }) {
+                f=PartialBuyAwaitingCancellation();mutate(f);ObserveScopedOrders(f);
+                Check(!PendingSale(f).Ready,"partial-buy cancellation cannot exempt missing duplicate invalid-price or mismatched execution and broker quantity or value evidence");
+            }
+            foreach(var missing in new[]{true,false}) {
+                f=PartialBuyAwaitingCancellation();var position=f.Balance.Holdings.Single(x=>x.Code=="084695");
+                if(missing) {
+                    f.Balance.Holdings.Remove(position);f.Balance.SellableQuantities.Remove("084695");f.Balance.UnfilledQuantities.Remove("084695");
+                    f.Balance.CashSourceValidated.Remove("084695");f.Balance.BasisValidated.Remove("084695");
+                } else {position.Quantity=0;f.Balance.SellableQuantities["084695"]=0;}
+                f.Balance.ReceivedUtc=Now.AddMilliseconds(-20);f.Data.ObserveTradeBalance(f.Balance);
+                Check(!PendingSale(f).Ready,"missing or zero current inventory behind a confirmed partial buy still blocks the cancellation sale exception");
+            }
         }
         static BrokerHoldingsSnapshot PostBuyBalance(decimal reportedHolding,DateTime at) {
             var balance=Positions(at);balance.RequestBasisVerified=true;

@@ -12,8 +12,10 @@ namespace ShinhanNativeTrader {
             try {
                 using(var store=new AccountAppSettingsStore(path)) {
                     Check(store.Snapshot.BudgetLimit==0,"new account has no assumed spendable cash or operating budget");
-                    var strategy=store.Snapshot.Strategy;strategy.StopLossPercent=4.5m;store.Update(strategy,2500000m);
+                    Check(store.Snapshot.Strategy.BuyOrderTimeoutSeconds==120,"new account uses a two-minute buy timeout");
+                    var strategy=store.Snapshot.Strategy;strategy.StopLossPercent=4.5m;strategy.BuyOrderTimeoutSeconds=300;store.Update(strategy,2500000m);
                     Check(store.Snapshot.BudgetLimit==2500000m&&store.Snapshot.Strategy.StopLossPercent==4.5m,"strategy and independent operating limit persist");
+                    Check(store.Snapshot.Strategy.BuyOrderTimeoutSeconds==300,"a configured buy timeout is stored with the account strategy");
                     var held=new Holding{Code="005930",Quantity=2,AvgPrice=70000,Price=71000};
                     var quote=new IndiReply{Code="005930",Price=75000,Clock="091530",HasTradeClock=false};
                     Check(!store.ObserveHigh(accountKey,held,quote,utc)&&store.High(accountKey,"005930",70000)==70000,"display-only snapshot cannot change a trailing high");
@@ -25,6 +27,7 @@ namespace ShinhanNativeTrader {
                     var copy=store.Snapshot;copy.BudgetLimit=9;copy.Highs.Clear();Check(store.Snapshot.Highs.Count==1&&store.Snapshot.BudgetLimit==2500000m,"settings snapshots are detached copies");
                 }
                 using(var restored=new AccountAppSettingsStore(path)) {
+                    Check(restored.Snapshot.Strategy.BuyOrderTimeoutSeconds==300,"the configured buy timeout survives an application restart");
                     Check(restored.High(accountKey,"005930",70000)==75000,"risk high survives application restart");
                     restored.RefreshPositions(accountKey,new[]{new Holding{Code="005930",Quantity=2,AvgPrice=72000}});
                     Check(restored.High(accountKey,"005930",72000)==72000,"changed broker average resets incompatible high");
@@ -35,6 +38,13 @@ namespace ShinhanNativeTrader {
                     Check(rejected&&restored.Snapshot.BudgetLimit==2500000m,"invalid limit cannot replace persisted strategy");
                 }
                 string xml=File.ReadAllText(path);Check(!xml.Contains("Password")&&!xml.Contains("Cash")&&!xml.Contains("Fill")&&!xml.Contains("Paper"),"settings contain no credentials, broker cash or generated fills");
+                var oldXml=xml.Replace("<BuyOrderTimeoutSeconds>300</BuyOrderTimeoutSeconds>","");
+                Check(oldXml!=xml,"the compatibility fixture removes only the new timeout field");
+                File.WriteAllText(path,oldXml);
+                using(var legacy=new AccountAppSettingsStore(path)) {
+                    Check(legacy.Snapshot.Strategy.BuyOrderTimeoutSeconds==120&&legacy.Snapshot.BudgetLimit==2500000m,
+                        "old account XML without the timeout retains the initializer and all existing financial settings");
+                }
                 File.WriteAllText(path,"<invalid>");bool corrupt=false;try{using(var unused=new AccountAppSettingsStore(path)){} }catch(InvalidOperationException){corrupt=true;}
                 Check(corrupt&&File.ReadAllText(path)=="<invalid>","corrupt settings are preserved and rejected");
             } finally {Directory.Delete(directory,true);}

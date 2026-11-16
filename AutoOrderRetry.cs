@@ -70,6 +70,10 @@ namespace ShinhanNativeTrader {
             if(root.TradingDate!=day||root.Code!=code||root.Kind!=side||root.TradeKind!=side)
                 return Result(AutoRetryState.Blocked,"당일 전략 주문의 종목·방향 확인 필요");
             var same=journal.Orders.Where(value=>value.TradingDate==day&&value.Code==code&&value.TradeKind==side).ToArray();
+            if(side==LiveOrderKind.Buy) {
+                var reentry=PendingBuyPolicy.EvaluateReentry(journal,strategyKey,code,accountKey,snapshot,utc);
+                if(reentry.State!=AutoRetryState.NotNeeded)return reentry;
+            }
             if(same.Any(value=>value.Status!=LiveOrderStatus.Rejected&&value.Status!=LiveOrderStatus.NotSent))
                 return Result(AutoRetryState.Blocked,"이미 접수·체결된 당일 주문 / 자동 재전송 없음");
             var attempts=same.Where(value=>RetryRecord(value)&&value.Status!=LiveOrderStatus.NotSent).ToArray();
