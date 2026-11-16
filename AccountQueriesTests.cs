@@ -137,9 +137,14 @@ namespace ShinhanNativeTrader {
             Check(balance.UnfilledQuantities["005930"]==2&&balance.Holdings[0].SellPending==0&&balance.Holdings[0].BuyPending==0,"directionless unfilled shares remain explicit for reconciliation instead of invented side totals");
             io.SetRow(0,4,"0");io.SetRow(0,10,"0");balance=AccountQueries.ReadHoldings(io,utc,true);
             Check(balance.Holdings[0].Quantity==0&&balance.UnfilledQuantities["005930"]==2,"pending buys may exceed the current trade position without becoming owned shares");
-            io=new Response();io.Holding(0);io.SetRow(0,10,"8");Reject(()=>AccountQueries.ReadHoldings(io,utc,true),"orderable quantity above trade holding quantity fails closed");
+            io=new Response();io.Holding(0);io.SetRow(0,10,"8");balance=AccountQueries.ReadHoldings(io,utc,true);
+            Check(balance.Holdings[0].Quantity==7&&balance.SellableQuantities["005930"]==8&&!balance.QuantityExposureVerified
+                &&balance.HasQuantityConflict("005930")&&balance.QuantityConsistency["005930"]=="OrderableExceedsReportedHoldings",
+                "independently valid broker quantities survive an undocumented relationship mismatch without clamping or substitution");
             io.SetRow(0,10,"-1");Reject(()=>AccountQueries.ReadHoldings(io,utc,true),"negative sellable quantity rejects");
             io.SetRow(0,10,"1.5");Reject(()=>AccountQueries.ReadHoldings(io,utc,true),"fractional sellable domestic shares reject");
+            io.SetRow(0,10,"2147483648");Reject(()=>AccountQueries.ReadHoldings(io,utc,true),"overflowing orderable shares still reject instead of reaching a relationship diagnostic");
+            io=new Response();io.Holding(0);io.SetRow(0,4,"1.5");Reject(()=>AccountQueries.ReadHoldings(io,utc,true),"fractional reported holding shares remain malformed");
             io=new Response();io.Holding(0);io.SetRow(0,4,"2147483648");Reject(()=>AccountQueries.ReadHoldings(io,utc,true),"trade holdings outside supported share bounds reject");
             io=new Response();io.Holding(0);io.SetRow(0,11,"-1");Reject(()=>AccountQueries.ReadHoldings(io,utc,true),"negative unfilled shares reject");
             io=new Response();io.Holding(0);foreach(var field in new[]{5,6,7,8,9})io.SetRow(0,field,"");balance=AccountQueries.ReadHoldings(io,utc,true);
@@ -191,6 +196,35 @@ namespace ShinhanNativeTrader {
                 "tampered diagnostic labels cannot escape the fixed summary allowlist");
             Check(AccountQueries.BasisDiagnosticsSummary(null)=="SABA609Q1 MO2 enum: SnapshotUnavailable",
                 "missing snapshot has an explicit noncertifying diagnosis");
+            io=new Response();io.Holding(0);io.SetRow(0,4,"0");io.SetRow(0,10,"3");io.Holding(1,"A000660");
+            balance=AccountQueries.ReadHoldings(io,utc,true);
+            Check(balance.Holdings.Count==2&&balance.Holdings[0].Quantity==0&&balance.SellableQuantities["005930"]==3
+                &&balance.Holdings[1].Quantity==7&&balance.SellableQuantities["000660"]==7,
+                "zero reported position with positive orderable quantity preserves every original row and numeric value");
+            Check(!balance.QuantityExposureVerified&&balance.HasQuantityConflict("005930")&&!balance.HasQuantityConflict("000660")
+                &&balance.QuantityConsistency["000660"]=="OrderableWithinReportedHoldings",
+                "quantity conflicts are explicit per row and do not erase unrelated positions");
+            var quantitySummary=AccountQueries.QuantityDiagnosticsSummary(balance);
+            Check(quantitySummary.Contains("context=Trade")&&quantitySummary.Contains("OrderableExceedsReportedHoldings=1")
+                &&quantitySummary.Contains("OrderableWithinReportedHoldings=1")&&quantitySummary.Contains("QuantityExposureVerified=False")
+                &&!quantitySummary.Contains("005930")&&!quantitySummary.Contains("000660")&&!quantitySummary.Contains(account)&&quantitySummary.Length<512,
+                "quantity summary exposes fixed context and relationship counts without account, positions or raw provider text");
+            io.SetRow(0,4,"3");var consistentBalance=AccountQueries.ReadHoldings(io,utc,true);
+            Check(consistentBalance.QuantityExposureVerified&&!consistentBalance.HasQuantityConflict("005930")
+                &&consistentBalance.Holdings[0].Quantity==3&&consistentBalance.SellableQuantities["005930"]==3&&!balance.QuantityExposureVerified,
+                "a later consistent broker response clears its own conflict while leaving the preceding snapshot unchanged");
+            consistentBalance.SellableQuantities["005930"]=4;
+            Check(!consistentBalance.QuantityExposureVerified&&consistentBalance.QuantityConsistency["005930"]=="OrderableExceedsReportedHoldings",
+                "consistency getters recompute from raw values instead of retaining a stale mutable verified flag");
+            consistentBalance.Holdings[0].Quantity=4;
+            Check(consistentBalance.QuantityExposureVerified&&consistentBalance.QuantityConsistency["005930"]=="OrderableWithinReportedHoldings",
+                "updated raw holdings are compared independently from orderable quantity without manufactured maxima");
+            balance=AccountQueries.ReadHoldings(io,utc,false,true);
+            Check(AccountQueries.QuantityDiagnosticsSummary(balance).Contains("context=Ordinary"),"ordinary-only request scope is separate in quantity diagnostics");
+            Check(AccountQueries.QuantityDiagnosticsSummary(new BrokerHoldingsSnapshot()).Contains("context=Unbound")
+                &&new BrokerHoldingsSnapshot().QuantityExposureVerified,"an empty synthetic snapshot remains compatible without claiming broker request proof");
+            Check(AccountQueries.QuantityDiagnosticsSummary(null)=="SABA609Q1 quantity relation: SnapshotUnavailable",
+                "missing quantity evidence has a fixed unavailable diagnostic");
             io=new Response();io.Holding(0);io.Holding(1,"A000660");io.SetRow(1,2,"");balance=AccountQueries.ReadHoldings(io,utc,true);
             Check(balance.Holdings.Count==2&&balance.BasisVerified&&balance.BasisValidated["005930"]&&balance.BasisValidated["000660"],
                 "an omitted echo in one row does not reject other valid quantities from the same bound trade request");

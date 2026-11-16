@@ -151,6 +151,32 @@ namespace ShinhanNativeTrader {
         // Bounded enum/shape classes only, never raw account response strings.
         public readonly Dictionary<string,string> BasisValueDiagnostics=new Dictionary<string,string>(StringComparer.Ordinal);
         public readonly Dictionary<string,int> SellableQuantities=new Dictionary<string,int>(StringComparer.Ordinal);
+        // MO4 and MO10 are independent documented quantities. A relationship
+        // conflict is retained as evidence instead of discarding the callback.
+        // This is a consistency indicator, not account/session authorization.
+        public bool HasQuantityConflict(string code) {
+            if(code==null)return false;
+            int orderable;
+            return SellableQuantities.TryGetValue(code,out orderable)
+                &&Holdings.Any(holding=>holding!=null&&holding.Code==code&&orderable>holding.Quantity);
+        }
+        public bool QuantityExposureVerified {get{
+            foreach(var holding in Holdings) {
+                int orderable;
+                if(holding!=null&&holding.Code!=null&&SellableQuantities.TryGetValue(holding.Code,out orderable)&&orderable>holding.Quantity)return false;
+            }
+            return true;
+        }}
+        public Dictionary<string,string> QuantityConsistency {get{
+            var result=new Dictionary<string,string>(StringComparer.Ordinal);
+            foreach(var holding in Holdings) {
+                if(holding==null||holding.Code==null)continue;
+                int orderable;
+                result[holding.Code]=!SellableQuantities.TryGetValue(holding.Code,out orderable)?"Unavailable":orderable>holding.Quantity
+                    ?"OrderableExceedsReportedHoldings":"OrderableWithinReportedHoldings";
+            }
+            return result;
+        }}
         public readonly Dictionary<string,bool> CashSourceValidated=new Dictionary<string,bool>(StringComparer.Ordinal);
         public readonly Dictionary<string,bool> CashProfileCompatible=new Dictionary<string,bool>(StringComparer.Ordinal);
         public readonly Dictionary<string,string> CashProfileDiagnostics=new Dictionary<string,string>(StringComparer.Ordinal);
@@ -343,6 +369,16 @@ namespace ShinhanNativeTrader {
             }
             return "SABA609Q1 MO2 enum: "+string.Join("; ",categories.Select(x=>x+"="+counts[x].ToString(CultureInfo.InvariantCulture)));
         }
+        public static string QuantityDiagnosticsSummary(BrokerHoldingsSnapshot snapshot) {
+            if(snapshot==null)return "SABA609Q1 quantity relation: SnapshotUnavailable";
+            var categories=new[]{"OrderableWithinReportedHoldings","OrderableExceedsReportedHoldings","Unavailable"};
+            var counts=categories.ToDictionary(x=>x,x=>0,StringComparer.Ordinal);
+            foreach(var category in snapshot.QuantityConsistency.Values)counts[category]++;
+            var context=snapshot.RequestBasisVerified?(snapshot.RequestOrdinaryOnlyVerified?"Conflicting":"Trade")
+                :snapshot.RequestOrdinaryOnlyVerified?"Ordinary":"Unbound";
+            return "SABA609Q1 quantity relation: context="+context+"; "+string.Join("; ",categories.Select(x=>x+"="+counts[x].ToString(CultureInfo.InvariantCulture)))
+                +"; QuantityExposureVerified="+(snapshot.QuantityExposureVerified?"True":"False");
+        }
         static bool CreditKind(string kind) {
             return kind=="유통융자"||kind=="자기융자"||kind=="유통대주"||kind=="자기대주"||
                 kind=="차입매도"||kind=="매입자금"||kind=="예탁담보"||kind=="차입";
@@ -376,8 +412,6 @@ namespace ShinhanNativeTrader {
                 // blank settlement metadata must not discard valid positions.
                 var sellable=Quantity(Multi(io,row,10,query),query+" orderable quantity[10]");
                 var unfilled=Quantity(Multi(io,row,11,query),query+" unfilled quantity[11]");
-                if(sellable>quantity)
-                    throw new AccountQueryException(query+" orderable quantity exceeds trade-basis holdings multi[4/10].");
                 var loanRaw=OptionalProofMulti(io,row,22,query);
                 var loan=OptionalProofNumber(loanRaw,query+" loan amount[22]");
                 // The official description documents the literal '보통'. No

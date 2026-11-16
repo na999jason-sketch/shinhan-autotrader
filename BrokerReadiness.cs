@@ -198,6 +198,17 @@ namespace ShinhanNativeTrader {
         }
 
         static bool Fresh(Stamp stamp,DateTime now,DateTime barrier){return stamp!=null&&stamp.Started>barrier&&stamp.Received<=now&&now-stamp.Received<=TimeSpan.FromSeconds(5);}
+        static string QuantityConflict(BrokerHoldingsSnapshot value,Holding position) {
+            int quantity,unfilled;
+            if(value==null||position==null||!value.SellableQuantities.TryGetValue(position.Code,out quantity)||quantity<=position.Quantity)return null;
+            value.UnfilledQuantities.TryGetValue(position.Code,out unfilled);
+            return "잔고 수량 대조 필요 "+position.Code+" (잔고 "+position.Quantity.ToString(CultureInfo.InvariantCulture)
+                +"주, 주문가능 "+quantity.ToString(CultureInfo.InvariantCulture)+"주, 미체결 "+unfilled.ToString(CultureInfo.InvariantCulture)+"주)";
+        }
+        static List<string> QuantityConflicts(BrokerHoldingsSnapshot value) {
+            return value==null?new List<string>():value.Holdings.OrderBy(position=>position.Code,StringComparer.Ordinal)
+                .Select(position=>QuantityConflict(value,position)).Where(reason=>reason!=null).ToList();
+        }
         static bool IsTransit(LiveOrderRecord order){return order.Status==LiveOrderStatus.Prepared||order.Status==LiveOrderStatus.Dispatching||order.Status==LiveOrderStatus.AwaitingAcknowledgement||order.Status==LiveOrderStatus.AwaitingConfirmation||order.Status==LiveOrderStatus.Unknown;}
         static bool IsWorking(LiveOrderRecord order){return order.Status==LiveOrderStatus.Working||order.Status==LiveOrderStatus.PartiallyFilled;}
         static bool TerminalCheckpointMatches(LiveOrderRecord order,LiveOrderJournalState journal,BrokerOrderRow row,BrokerOrdersSnapshot snapshot,string currentAccountKey) {
@@ -299,6 +310,11 @@ namespace ShinhanNativeTrader {
                 if(intent.Kind!=LiveOrderKind.Cancel){result.Require(checks.QuoteVerified,"종목별 실제 장중 시세 확인 필요");result.Require(checks.PriceRuleVerified,"종목별 가격·호가단위 확인 필요");}
                 checks.OperatingLimit=operatingRemainingLimit;
                 if(effective==LiveOrderKind.Buy) {
+                    // A larger raw orderable quantity cannot establish which
+                    // holding total is complete. Keep the copied values intact
+                    // and withhold new exposure until a fresh query agrees.
+                    var quantityConflicts=QuantityConflicts(tradeBalanceEvidence);
+                    foreach(var reason in quantityConflicts)result.Require(false,reason+" / 보유 원가 확인 전 추가 매수 대기");
                     bool cf=Fresh(cashTime,nowUtc,barrier);AccountOrderCapacity capacity;Stamp ct;
                     bool capacityFound=capacities.TryGetValue(CapacityKey(intent.Code,intent.LimitPrice),out capacity)&&capacityTimes.TryGetValue(CapacityKey(intent.Code,intent.LimitPrice),out ct);
                     bool capf=capacityFound&&Fresh(capacityTimes[CapacityKey(intent.Code,intent.LimitPrice)],nowUtc,barrier);
@@ -306,15 +322,17 @@ namespace ShinhanNativeTrader {
                     result.Require(capf&&capacity!=null&&capacity.Ratio==100,"현재 종목·가격의 현금100% 가능수량 확인 필요");
                     if(cf){checks.Cash100Orderable=cash.Cash100Orderable;stamps.Add(cashTime.Received);}
                     if(capf){checks.CapacityAmount=capacity.Amount;checks.CapacityQuantity=(int)capacity.Quantity;stamps.Add(capacityTimes[CapacityKey(intent.Code,intent.LimitPrice)].Received);}
-                    checks.OrderableAmountVerified=cf&&capf&&cash.Cash100Orderable>=0;
+                    checks.OrderableAmountVerified=cf&&capf&&cash.Cash100Orderable>=0&&quantityConflicts.Count==0;
                     decimal reserved=journalValid?journal.Orders.Where(x=>x!=null&&IsWorking(x)&&x.TradeKind==LiveOrderKind.Buy).Sum(x=>(x.Quantity-x.FilledQuantity-x.CancelledQuantity)*x.LimitPrice):0;
                     var amount=intent.Quantity*intent.LimitPrice;
                     result.Require(checks.OrderableAmountVerified&&intent.Quantity<=checks.CapacityQuantity&&amount<=checks.Cash100Orderable&&amount<=checks.CapacityAmount,"실제 주문가능금액·수량 범위 확인 필요");
                     result.Require(operatingRemainingLimit>0&&amount<=operatingRemainingLimit-reserved,"보유 원가·미체결 예약금을 반영한 운용한도 확인 필요");
                 } else if(effective==LiveOrderKind.Sell) {
-                    Sellable value;var position=holdings==null?null:holdings.SingleOrDefault(x=>x.Code==intent.Code);
+                    Sellable value=null;var position=holdings==null?null:holdings.SingleOrDefault(x=>x.Code==intent.Code);
+                    var quantityConflict=tradeBalanceEvidence==null?null:QuantityConflict(tradeBalanceEvidence,tradeBalanceEvidence.Holdings.SingleOrDefault(x=>x.Code==intent.Code));
+                    if(quantityConflict!=null)result.Require(false,quantityConflict+" / 해당 종목 매도 대기");
                     bool fallback=Fresh(ordinaryTime,nowUtc,barrier)&&AccountQueries.IsOrdinaryCashSource(tradeBalanceEvidence,ordinaryEvidence,intent.Code,nowUtc,5);
-                    bool sf=sellable.TryGetValue(intent.Code,out value)&&Fresh(value.Time,nowUtc,barrier)&&(value.Validated||fallback)&&position!=null&&position.CreditQty==0&&value.Quantity<=position.Quantity
+                    bool sf=quantityConflict==null&&sellable.TryGetValue(intent.Code,out value)&&Fresh(value.Time,nowUtc,barrier)&&(value.Validated||fallback)&&position!=null&&position.CreditQty==0&&value.Quantity<=position.Quantity
                         &&holdingTime!=null&&value.Time.Started==holdingTime.Started&&value.Time.Received==holdingTime.Received;
                     Tuple<int,DateTime> ad;
                     if(sf&&balanceSellable.TryGetValue(intent.Code,out ad)&&ad.Item2<=nowUtc&&nowUtc-ad.Item2<=TimeSpan.FromSeconds(5)&&ad.Item1!=value.Quantity)sf=false;

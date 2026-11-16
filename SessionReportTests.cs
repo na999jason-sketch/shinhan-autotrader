@@ -107,6 +107,48 @@ namespace ShinhanNativeTrader {
                     &&!File.Exists(path+".bak"),"a locked report is never overwritten and its unsuccessful temporary snapshot is removed");
             }
         }
+        static void TestQuantityRefresh(string directory,DateTime day,DateTime utc) {
+            var holding=new Holding{Code="005930",Name="SYNTHETIC",Quantity=0,AvgPrice=10000,Price=10100};
+            var balance=new BrokerHoldingsSnapshot{BasisVerified=true,RequestBasisVerified=true,
+                RequestStartedUtc=utc.AddMilliseconds(-10),ReceivedUtc=utc};
+            balance.Holdings.Add(holding);balance.SellableQuantities[holding.Code]=2;
+            balance.UnfilledQuantities[holding.Code]=2;
+            var accepted=new LiveOrderRecord{Code=holding.Code,Kind=LiveOrderKind.Buy,Quantity=2,
+                LimitPrice=10000,BrokerOrderNumber="5522",Status=LiveOrderStatus.Working,UpdatedUtc=utc};
+            var orders=new BrokerOrdersSnapshot{TradingDate="20261113",ReceivedUtc=utc};
+            orders.Orders.Add(new BrokerOrderRow{OrderNumber="5522",Code=holding.Code,SideCode="2",
+                Quantity=2,LimitPrice=10000,FilledQuantity=0,OpenQuantity=2,ConfirmationCode="0"});
+            var root=Path.Combine(directory,"quantity-refresh");
+            var path=SessionReport.Write(root,day,utc,new[]{holding},utc,null,orders,new[]{accepted},
+                "실주문 운영 시작됨",null,balance);
+            var text=File.ReadAllText(path);
+            Check(text.Contains("\"잔고 수량 대조\",\"불일치: 추가 매수 보류 / 계좌 조회·감시 계속\"")
+                &&text.Contains("\"평가 확정상태\",\"잠정: 잔고수량·주문가능수량 대사 중 / 아래 합계는 응답 잔고수량 기준\""),
+                "quantity disagreement is reported as provisional exposure while monitoring and authorization remain distinct");
+            Check(text.Contains("\"가격 조회시각\",\"주문가능수량(MO10)\",\"미체결수량(MO11)\",\"수량 대조\",\"평가 기준\"")
+                &&text.Contains("\"'005930\",0,10000,10100,0,0,0,\"미확인\",\"2026-11-13 06:20:00 UTC\",2,2,\"주문가능수량이 잔고수량보다 큼\",\"잠정: 수량 대사 중 / 체결 추정 없음\""),
+                "appended columns preserve original zero holdings, positive orderable and directionless pending quantities without shifting existing values");
+            Check(text.Contains("\"총 매입금액\",0")&&text.Contains("\"총 평가금액\",0")
+                &&text.Contains("\"'5522\",\"미확인\",\"'005930\",\"Buy\",2,0,0,10000,\"Working\"")
+                &&!text.Contains("\"Filled\""),
+                "provisional zero valuation is not inflated from orderable shares and accepted broker identity remains working without an invented fill");
+            Check(holding.Quantity==0&&balance.SellableQuantities[holding.Code]==2
+                &&accepted.Status==LiveOrderStatus.Working&&accepted.FilledQuantity==0,
+                "reporting disagreement preserves source quantities and durable order evidence");
+            holding.Quantity=2;balance.UnfilledQuantities[holding.Code]=0;
+            balance.RequestStartedUtc=utc.AddSeconds(1);balance.ReceivedUtc=utc.AddSeconds(2);
+            SessionReport.Write(root,day,utc.AddSeconds(2),new[]{holding},balance.ReceivedUtc,null,orders,
+                new[]{accepted},"실주문 운영 시작됨",null,balance);
+            text=File.ReadAllText(path);
+            Check(text.Contains("\"잔고 수량 대조\",\"관측 수량 불일치 없음 / 주문 직전 별도 검증\"")
+                &&text.Contains("\"평가 확정상태\",\"응답 잔고수량 기준(비용 제외)\"")
+                &&!text.Contains("잠정: 수량 대사 중"),
+                "a fresh consistent holdings snapshot clears provisional quantity status through its actual values");
+            Check(text.Contains("\"'005930\",2,10000,10100,20000,20200,200,1,")
+                &&text.Contains(",2,0,\"관측 수량 불일치 없음\",\"응답 잔고수량 기준(비용 제외)\"")
+                &&accepted.FilledQuantity==0&&accepted.Status==LiveOrderStatus.Working,
+                "updated broker quantities change valuation while order fill confirmation still requires independent evidence");
+        }
         public static int Run() {
             checks=0;
             var directory=Path.Combine(Path.GetTempPath(),"ShinhanAccountReport-"+Guid.NewGuid().ToString("N"));
@@ -242,6 +284,7 @@ namespace ShinhanNativeTrader {
                 Reject(()=>SessionReport.Write(directory,day,utc,null,null,null,null,null,"",null,tradeHoldings),"realized-profit response timestamp requires UTC");
                 TestReportDiscovery(directory,utc);
                 TestWriteFailures(directory,day,utc);
+                TestQuantityRefresh(directory,day,utc);
             }finally{if(Directory.Exists(directory))Directory.Delete(directory,true);}
             return checks;
         }

@@ -187,7 +187,7 @@ namespace ShinhanNativeTrader {
             }
             foreach(var field in new[]{4,10,11}) {
                 f=new Fixture();f.Data.Invalidate(Now.AddMilliseconds(-500));bool rejected=false;
-                try{f.Data.ObserveTradeBalance(ParsedBalance("",true,io=>io.Fields[field]=field==4?"-1":field==10?"3":"malformed"));}
+                try{f.Data.ObserveTradeBalance(ParsedBalance("",true,io=>io.Fields[field]=field==4||field==10?"-1":"malformed"));}
                 catch(InvalidOperationException){rejected=true;}
                 Check(rejected&&!f.Evaluate().Ready&&!f.Evaluate(Sell()).Ready,
                     "malformed required position, possible or unfilled quantity never becomes accepted readiness evidence");
@@ -230,9 +230,63 @@ namespace ShinhanNativeTrader {
             Reject(()=>new BrokerReadiness("12345678901",Fingerprint),"readiness never uses plaintext account numbers as stored account keys");
             Reject(()=>f.Data.ObserveCash(new AccountCashSnapshot{ReceivedUtc=Now.AddSeconds(-1)},Now),"a response cannot precede its request");
             Reject(()=>f.Data.Invalidate(DateTime.SpecifyKind(Now,DateTimeKind.Local)),"local clock timestamps cannot masquerade as UTC evidence");
+            QuantityConflictChecks();
             TerminalCheckpointChecks();
             OrdinarySourceChecks();
             return checks;
+        }
+        static BrokerHoldingsSnapshot PostBuyBalance(decimal reportedHolding,DateTime at) {
+            var balance=Positions(at);balance.RequestBasisVerified=true;
+            balance.Holdings.Add(new Holding{Code="000880",Quantity=reportedHolding,AvgPrice=9950,Price=10000});
+            balance.SellableQuantities["000880"]=10;balance.UnfilledQuantities["000880"]=0;
+            balance.CashSourceValidated["000880"]=true;balance.BasisValidated["000880"]=true;return balance;
+        }
+        static void QuantityConflictChecks() {
+            foreach(var reportedHolding in new[]{0m,2m}) {
+                var f=new Fixture();var prior=f.Evaluate();var order=Working(10);
+                order.Status=LiveOrderStatus.Filled;order.RequestId=71;
+                var fields=new[]{"0","11","0","","0","synthetic accepted buy","0","0"};
+                order.ResponseEvidence=LiveOrderResponseParser.Read(71,index=>fields[index],new IndiDiagnosticSnapshot{ErrorState=0},OrderResponseLayout.Modern,new string[0]);
+                f.Journal.Orders.Add(order);f.Journal.LastBrokerChangeUtc=Now.AddSeconds(-6);
+                f.Journal.Executions.Add(new LiveExecutionRecord{OrderId=order.Id,BrokerOrderNumber="11",TradingDate="20261112",
+                    ExecutionId="actual-buy-fill",Quantity=10,Price=9950,ExecutedUtc=Now.AddSeconds(-6)});
+                var orders=new BrokerOrdersSnapshot{TradingDate="20261112",ReceivedUtc=Now.AddMilliseconds(-100)};
+                orders.Orders.Add(new BrokerOrderRow{OrderNumber="00011",Code="000880",SideCode="2",ProductCode="01",CreditCode="00",
+                    Quantity=10,FilledQuantity=10,OpenQuantity=0,LimitPrice=10000,AverageFillPrice=9950});
+                f.Data.ObserveOrders(orders,Now.AddMilliseconds(-200));
+                var balance=PostBuyBalance(reportedHolding,Now.AddMilliseconds(100));
+                Check(f.Data.ObserveTradeBalance(balance),"raw post-buy quantity disagreement remains observable without a global account failure");
+                var blocked=f.Evaluate();
+                var amounts="잔고 "+reportedHolding+"주, 주문가능 10주, 미체결 0주";
+                Check(!blocked.Ready&&blocked.Checks.AccountAuthorized&&blocked.Checks.OrdersReconciled
+                    &&blocked.Checks.FillsReconciled&&blocked.Checks.RecoveryVerified&&blocked.Checks.Cash100Orderable==1000000
+                    &&blocked.Checks.CapacityQuantity==100&&!blocked.Checks.OrderableAmountVerified,
+                    "exact accepted buy and full-fill evidence plus ample cash cannot authorize new exposure while raw holding quantities conflict");
+                Check(blocked.Status.Contains("000880")&&blocked.Status.Contains(amounts)&&blocked.Status.Contains("추가 매수 대기"),
+                    "buy wait explains the affected symbol and unchanged raw holding orderable and pending quantities");
+                bool rejected=false;
+                try{LiveOrderSafety.ValidatePreflight(Buy(),blocked.Checks,Now,f.Journal.LastBrokerChangeUtc);}
+                catch(InvalidOperationException){rejected=true;}
+                Check(rejected,"the final buy preflight guard also rejects conflicting exposure even if a caller ignores readiness reasons");
+                var affected=new LiveOrderIntent{Kind=LiveOrderKind.Sell,Code="000880",Quantity=1,LimitPrice=10000,ClientKey="sell-filled-buy"};
+                var sale=f.Evaluate(affected);
+                Check(!sale.Ready&&!sale.Checks.SellableQuantityVerified&&sale.Status.Contains(amounts)&&sale.Status.Contains("해당 종목 매도 대기"),
+                    "an affected sell remains blocked without clamping the larger raw orderable quantity");
+                Check(f.Evaluate(Sell(2)).Ready&&!prior.EvidenceStillCurrent(),
+                    "a separate consistent holding remains sellable while the new snapshot invalidates all older order proofs");
+                balance.Holdings.Single(position=>position.Code=="000880").Quantity=1000;
+                balance.SellableQuantities["000880"]=0;balance.UnfilledQuantities["000880"]=999;
+                Check(!f.Evaluate().Ready&&f.Evaluate().Status.Contains(amounts)&&!f.Evaluate(affected).Ready&&f.Evaluate(Sell(2)).Ready,
+                    "caller edits cannot hide a privately copied quantity conflict or contaminate an unrelated valid sale");
+                var consistent=PostBuyBalance(10,Now.AddSeconds(3));
+                Check(f.Data.ObserveTradeBalance(consistent)&&f.Evaluate().Ready&&f.Evaluate(affected).Ready&&f.Evaluate(Sell(2)).Ready,
+                    "a newly received consistent raw snapshot restores ordinary buy and sell preflight without reauthorization or invented quantities");
+                consistent.Holdings.Single(position=>position.Code=="000880").Quantity=0;
+                Check(f.Evaluate().Ready&&f.Evaluate(affected).Ready,
+                    "later caller mutation cannot introduce a conflict into already accepted private evidence");
+                Check(!f.Data.ObserveTradeBalance(balance)&&f.Evaluate().Ready,
+                    "an older conflicting response cannot replace the newer consistent quantity evidence");
+            }
         }
         static void TerminalCheckpointChecks() {
             var f=new Fixture();string key;
