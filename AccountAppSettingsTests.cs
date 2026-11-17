@@ -13,9 +13,14 @@ namespace ShinhanNativeTrader {
                 using(var store=new AccountAppSettingsStore(path)) {
                     Check(store.Snapshot.BudgetLimit==0,"new account has no assumed spendable cash or operating budget");
                     Check(store.Snapshot.Strategy.BuyOrderTimeoutSeconds==120,"new account uses a two-minute buy timeout");
-                    var strategy=store.Snapshot.Strategy;strategy.StopLossPercent=4.5m;strategy.BuyOrderTimeoutSeconds=300;store.Update(strategy,2500000m);
+                    Check(store.Snapshot.Strategy.MaxBreakoutExtensionPercent==2m&&store.Snapshot.Strategy.BreakoutConfirmationSeconds==60,
+                        "new account starts with the two-percent chase ceiling and sixty-second breakout observation");
+                    var strategy=store.Snapshot.Strategy;strategy.StopLossPercent=4.5m;strategy.BuyOrderTimeoutSeconds=300;
+                    strategy.MaxBreakoutExtensionPercent=1.5m;strategy.BreakoutConfirmationSeconds=90;store.Update(strategy,2500000m);
                     Check(store.Snapshot.BudgetLimit==2500000m&&store.Snapshot.Strategy.StopLossPercent==4.5m,"strategy and independent operating limit persist");
                     Check(store.Snapshot.Strategy.BuyOrderTimeoutSeconds==300,"a configured buy timeout is stored with the account strategy");
+                    Check(store.Snapshot.Strategy.MaxBreakoutExtensionPercent==1.5m&&store.Snapshot.Strategy.BreakoutConfirmationSeconds==90,
+                        "entry confirmation settings persist alongside existing financial limits");
                     var held=new Holding{Code="005930",Quantity=2,AvgPrice=70000,Price=71000};
                     var quote=new IndiReply{Code="005930",Price=75000,Clock="091530",HasTradeClock=false};
                     Check(!store.ObserveHigh(accountKey,held,quote,utc)&&store.High(accountKey,"005930",70000)==70000,"display-only snapshot cannot change a trailing high");
@@ -28,6 +33,8 @@ namespace ShinhanNativeTrader {
                 }
                 using(var restored=new AccountAppSettingsStore(path)) {
                     Check(restored.Snapshot.Strategy.BuyOrderTimeoutSeconds==300,"the configured buy timeout survives an application restart");
+                    Check(restored.Snapshot.Strategy.MaxBreakoutExtensionPercent==1.5m&&restored.Snapshot.Strategy.BreakoutConfirmationSeconds==90,
+                        "the configured chase ceiling and confirmation duration survive an application restart");
                     Check(restored.High(accountKey,"005930",70000)==75000,"risk high survives application restart");
                     restored.RefreshPositions(accountKey,new[]{new Holding{Code="005930",Quantity=2,AvgPrice=72000}});
                     Check(restored.High(accountKey,"005930",72000)==72000,"changed broker average resets incompatible high");
@@ -44,6 +51,19 @@ namespace ShinhanNativeTrader {
                 using(var legacy=new AccountAppSettingsStore(path)) {
                     Check(legacy.Snapshot.Strategy.BuyOrderTimeoutSeconds==120&&legacy.Snapshot.BudgetLimit==2500000m,
                         "old account XML without the timeout retains the initializer and all existing financial settings");
+                    Check(legacy.Snapshot.Strategy.MaxBreakoutExtensionPercent==1.5m&&legacy.Snapshot.Strategy.BreakoutConfirmationSeconds==90,
+                        "timeout compatibility preserves explicitly configured entry settings");
+                }
+                var previousEntryXml=xml.Replace("<MaxBreakoutExtensionPercent>1.5</MaxBreakoutExtensionPercent>","")
+                    .Replace("<BreakoutConfirmationSeconds>90</BreakoutConfirmationSeconds>","");
+                Check(previousEntryXml!=xml&&!previousEntryXml.Contains("<MaxBreakoutExtensionPercent>")&&!previousEntryXml.Contains("<BreakoutConfirmationSeconds>"),
+                    "the release-upgrade fixture removes only the two new entry-strategy elements");
+                File.WriteAllText(path,previousEntryXml);
+                using(var legacy=new AccountAppSettingsStore(path)) {
+                    Check(legacy.Snapshot.Strategy.MaxBreakoutExtensionPercent==2m&&legacy.Snapshot.Strategy.BreakoutConfirmationSeconds==60
+                        &&legacy.Snapshot.Strategy.BuyOrderTimeoutSeconds==300&&legacy.Snapshot.Strategy.StopLossPercent==4.5m
+                        &&legacy.Snapshot.BudgetLimit==2500000m,
+                        "existing account XML inherits new entry defaults while preserving its exit settings budget and unfilled timeout");
                 }
                 File.WriteAllText(path,"<invalid>");bool corrupt=false;try{using(var unused=new AccountAppSettingsStore(path)){} }catch(InvalidOperationException){corrupt=true;}
                 Check(corrupt&&File.ReadAllText(path)=="<invalid>","corrupt settings are preserved and rejected");

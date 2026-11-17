@@ -87,6 +87,32 @@ namespace ShinhanNativeTrader {
             Check(signal.Score==0.91m&&signal.Reason.Contains("20261112")
                 &&signal.Reason.Contains("당일 누적거래량"),"live score and reason state historical baseline plus actual current-day volume");
             Check(PremarketResearch.EvaluateLive(reference,Quote(price:12500),settings,Now)==null,"touching the previous high is not a breakout");
+            var tenThousandBars=Bars(Target);
+            foreach(var bar in tenThousandBars){bar.Open*=0.8m;bar.High*=0.8m;bar.Low*=0.8m;bar.Close*=0.8m;}
+            var tenThousandReference=PremarketResearch.Create(stock,tenThousandBars,settings,Target);
+            Check(tenThousandReference!=null&&tenThousandReference.PriorHigh==10000m,
+                "the chase regression uses an independently prepared ten-thousand-won completed high");
+            Check(PremarketResearch.EvaluateLive(tenThousandReference,Quote(price:11000),settings,Now)==null
+                &&PremarketResearch.LiveStatus(tenThousandReference,Quote(price:11000),settings,Now)=="돌파선 대비 10% / 추격 상한 2% 초과",
+                "a ten-percent initial jump is rejected even with sufficient actual daily volume instead of defining its expensive price as a new baseline");
+            Check(PremarketResearch.EvaluateLive(tenThousandReference,Quote(price:10200),settings,Now)!=null
+                &&PremarketResearch.EvaluateLive(tenThousandReference,Quote(price:10200.01m),settings,Now)==null,
+                "the configured extension ceiling accepts its exact boundary and rejects the first amount above it");
+            var tighter=settings.Copy();tighter.MaxBreakoutExtensionPercent=1m;
+            var tighterReference=PremarketResearch.Create(stock,tenThousandBars,tighter,Target);
+            Check(PremarketResearch.EvaluateLive(tighterReference,Quote(price:10100),tighter,Now)!=null
+                &&PremarketResearch.EvaluateLive(tighterReference,Quote(price:10100.01m),tighter,Now)==null,
+                "a configured one-percent ceiling is applied against the original completed high");
+            var cappedSignal=PremarketResearch.EvaluateLive(tenThousandReference,Quote(price:10100),settings,Now);
+            Check(cappedSignal!=null&&cappedSignal.Reason.Contains("돌파선 대비 1%")&&cappedSignal.Reason.Contains("추격 상한 2%"),
+                "a passing signal explains its distance from the completed high and the configured chase ceiling");
+            var legacyBars=tenThousandBars.ToList();
+            var researchBar=new Bar{Date="20261113",Open=10000,High=11100,Low=9900,Close=11000,Volume=130};legacyBars.Add(researchBar);
+            Check(Rules.Entry(stock.Code,stock.Name,legacyBars,settings)==null,
+                "the legacy research signal cannot bypass the same completed-high chase ceiling");
+            researchBar.Close=10200;researchBar.High=10200;
+            Check(Rules.Entry(stock.Code,stock.Name,legacyBars,settings)!=null,
+                "the legacy research signal retains an otherwise qualified breakout at the exact extension ceiling");
             Check(PremarketResearch.EvaluateLive(reference,Quote(volume:129),settings,Now)==null
                 &&PremarketResearch.EvaluateLive(reference,Quote(volume:130),settings,Now)!=null,"actual cumulative volume must reach the completed-average multiplier including its exact boundary");
             Check(PremarketResearch.LiveStatus(reference,Quote(price:12500),settings,Now)=="현재가 12500 / 돌파기준 12500 미돌파",
@@ -132,6 +158,13 @@ namespace ShinhanNativeTrader {
                 "status reports an old target day without implying that current live prices can revive its reference");
             edited=settings.Copy();edited.FastPeriod=4;
             Check(PremarketResearch.EvaluateLive(reference,Quote(),edited,Now)==null,"moving-average period edits cannot silently reuse old statistics");
+            edited=settings.Copy();edited.MaxBreakoutExtensionPercent=1m;
+            Check(PremarketResearch.EvaluateLive(reference,Quote(),edited,Now)==null
+                &&PremarketResearch.LiveStatus(reference,Quote(),edited,Now).Contains("전략 변경"),
+                "a changed chase ceiling cannot silently reuse a reference captured under another entry policy");
+            edited=settings.Copy();edited.BreakoutConfirmationSeconds=120;
+            Check(PremarketResearch.EvaluateLive(reference,Quote(),edited,Now)==null,
+                "a changed confirmation duration invalidates previously captured entry settings");
             edited=settings.Copy();edited.StopLossPercent=5;
             Check(PremarketResearch.EvaluateLive(reference,Quote(),edited,Now)!=null,"an exit-only setting does not alter completed entry statistics");
             stock.Code="000660";stock.Name="Changed";bars[0].Close=1;settings.FastPeriod=4;
@@ -152,6 +185,23 @@ namespace ShinhanNativeTrader {
             var alternate=new StrategySettings();alternate.VolumeMultiplier=2;
             Reject(()=>PremarketResearch.Rank(new[]{reference,Reference(alternate,code:"000660")}),"mixed entry strategies cannot form one prepared watchlist");
             Reject(()=>PremarketResearch.Rank(new[]{reference,reference}),"duplicate symbols cannot consume multiple watchlist positions");
+            foreach(decimal cap in new[]{0m,-1m,0.001m,10.01m}) {
+                var invalidCap=new StrategySettings{MaxBreakoutExtensionPercent=cap};
+                Reject(()=>invalidCap.Validate(),"a chase ceiling outside the UI's 0.01-to-ten-percent range is rejected");
+            }
+            foreach(int seconds in new[]{0,29,301}) {
+                var invalidDuration=new StrategySettings{BreakoutConfirmationSeconds=seconds};
+                Reject(()=>invalidDuration.Validate(),"confirmation duration is restricted to thirty through three-hundred seconds");
+            }
+            var boundarySettings=new StrategySettings{MaxBreakoutExtensionPercent=10m,BreakoutConfirmationSeconds=300};boundarySettings.Validate();
+            boundarySettings.MaxBreakoutExtensionPercent=0.01m;boundarySettings.BreakoutConfirmationSeconds=30;boundarySettings.Validate();
+            Check(boundarySettings.MaxBreakoutExtensionPercent==0.01m&&boundarySettings.BreakoutConfirmationSeconds==30,
+                "the documented positive fractional chase ceiling and duration boundaries remain configurable");
+            var risk=new PositionRiskState{Entry=10000,High=10000,Qty=1};
+            Check(Rules.Exit(risk,9400,new StrategySettings())==Rules.Exit(risk,9400,boundarySettings)
+                &&Rules.OrderQuantity(100000,10000,new StrategySettings().AllocationFraction,new StrategySettings().FeeRate)
+                    ==Rules.OrderQuantity(100000,10000,boundarySettings.AllocationFraction,boundarySettings.FeeRate),
+                "entry strategy settings do not change an existing holding's stop-loss or position sizing");
             return checks;
         }
     }

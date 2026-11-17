@@ -25,7 +25,9 @@ namespace ShinhanNativeTrader {
     public sealed class StrategySettings {
         public int FastPeriod = 5, SlowPeriod = 20, BreakoutPeriod = 20, MaxPositions = 3;
         public int BuyOrderTimeoutSeconds = 120;
+        public int BreakoutConfirmationSeconds = 60;
         public decimal VolumeMultiplier = 1.3m, MinPrice = 2000m, MaxPrice = 400000m;
+        public decimal MaxBreakoutExtensionPercent = 2m;
         public decimal StopLossPercent = 6m, TakeProfitPercent = 12m;
         public decimal TrailingActivationPercent = 4m, TrailingDrawdownPercent = 7m;
         public decimal AllocationFraction = 0.2m, FeeRate = 0.003m;
@@ -37,6 +39,10 @@ namespace ShinhanNativeTrader {
                 throw new ArgumentException("최대 보유종목은 1~100, 거래량 배수는 0 초과 100 이하여야 합니다.");
             if(BuyOrderTimeoutSeconds < 30 || BuyOrderTimeoutSeconds > 1800)
                 throw new ArgumentException("매수 미체결 대기시간은 30~1800초이어야 합니다.");
+            if(BreakoutConfirmationSeconds < 30 || BreakoutConfirmationSeconds > 300)
+                throw new ArgumentException("돌파 유지 확인시간은 30~300초이어야 합니다.");
+            if(MaxBreakoutExtensionPercent < 0.01m || MaxBreakoutExtensionPercent > 10)
+                throw new ArgumentException("돌파선 대비 추격 상한은 0.01~10%이어야 합니다.");
             if(MinPrice <= 0 || MaxPrice < MinPrice || AllocationFraction <= 0 || AllocationFraction > 1 || FeeRate < 0 || FeeRate > 0.1m)
                 throw new ArgumentException("가격범위, 배분비율 또는 모의 비용률이 올바르지 않습니다.");
             if(StopLossPercent <= 0 || StopLossPercent >= 100 || TakeProfitPercent <= 0 || TakeProfitPercent > 1000 ||
@@ -106,7 +112,8 @@ namespace ShinhanNativeTrader {
             var slow = Avg(prior.Skip(prior.Length - settings.SlowPeriod).Select(x => x.Close));
             var high = prior.Skip(prior.Length - settings.BreakoutPeriod).Max(x => x.High);
             var volume = Avg(prior.Skip(prior.Length - settings.BreakoutPeriod).Select(x => x.Volume));
-            if(fast <= slow || last.Close <= high || volume <= 0 || last.Volume < volume * settings.VolumeMultiplier ||
+            if(fast <= slow || last.Close <= high || last.Close / high > 1m + settings.MaxBreakoutExtensionPercent / 100m ||
+                volume <= 0 || last.Volume < volume * settings.VolumeMultiplier ||
                 last.Close < settings.MinPrice || last.Close > settings.MaxPrice) return null;
             var score = (last.Close / high - 1m) * 100m + (last.Volume / volume - 1m) * 3m;
             return new Candidate { Code = Code(code), Name = name, Price = last.Close, SignalDate = last.Date, Score = decimal.Round(score, 2),

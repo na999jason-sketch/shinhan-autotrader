@@ -279,6 +279,7 @@ static class PremarketUiTests {
     static void CandidateStatus(MainForm form,PremarketReference reference) {
         var fields=new Dictionary<int,object>{{1,reference.Code},{2,"090000"},{3,reference.PriorHigh.ToString(CultureInfo.InvariantCulture)},{7,"100"},{17,"1"}};
         var processor=new RealtimeEventProcessor(index=>fields[index]);processor.Track(reference.Code);
+        processor.QuoteReceived+=(Action<RealtimeQuote>)Delegate.CreateDelegate(typeof(Action<RealtimeQuote>),form,typeof(MainForm).GetMethod("OnRealtimeQuote",Hidden));
         var realtime=(RealtimeIndi)FormatterServices.GetUninitializedObject(typeof(RealtimeIndi));
         Set(realtime,"processor",processor);Set(realtime,"watch",new HashSet<string>(StringComparer.Ordinal){reference.Code});
         Set(form,"realtime",realtime);Get<HashSet<string>>(form,"trackedQuotes").Add(reference.Code);
@@ -296,8 +297,18 @@ static class PremarketUiTests {
                 "candidate row distinguishes a sufficient breakout price from insufficient live cumulative volume");
             fields[2]="090003";fields[7]=(reference.AverageVolume*2).ToString(CultureInfo.InvariantCulture);processor.Process("SC",Opening.AddSeconds(3));
             Call(form,"EvaluatePreparedSignals",Opening.AddSeconds(3));
-            Check(Convert.ToString(row.Cells["주문상태"].Value,CultureInfo.InvariantCulture).Contains("매수 조건 충족"),
-                "candidate row identifies satisfied live price and volume conditions before account preflight");
+            Check(Convert.ToString(row.Cells["주문상태"].Value,CultureInfo.InvariantCulture).Contains("돌파")
+                &&!Convert.ToString(row.Cells["주문상태"].Value,CultureInfo.InvariantCulture).Contains("매수 조건 충족"),
+                "candidate row waits for observed breakout persistence after price and volume conditions first qualify");
+            int confirmation=Get<AccountAppSettings>(form,"configuration").Strategy.BreakoutConfirmationSeconds;
+            for(int offset=10;offset<=confirmation;offset+=10) {
+                var at=Opening.AddSeconds(3+offset);fields[2]=MarketTime.ToKorea(at).ToString("HHmmss",CultureInfo.InvariantCulture);
+                fields[7]=reference.AverageVolume*2+offset;processor.Process("SC",at);
+            }
+            var ready=Opening.AddSeconds(3+confirmation);
+            Call(form,"EvaluatePreparedSignals",ready);
+            Check(Convert.ToString(row.Cells["주문상태"].Value,CultureInfo.InvariantCulture).Contains("돌파 유지 확인 완료"),
+                "candidate row identifies a completely observed breakout hold before account preflight");
             Check(Get<Queue<Candidate>>(form,"buyQuotes").Count==0&&Get<LiveOrderGateway>(form,"gateway")==null&&Get<LiveOrderJournal>(form,"journal")==null
                 &&Get<object>(form,"entry")==null,"candidate status changes cannot queue or transmit an order without an order journal");
         }finally {Call(form,"DisposeRealtime");}
@@ -534,7 +545,7 @@ static class PremarketUiTests {
 
     static void Run(string data,string screenshot) {
         using(var form=NewForm()) {
-            Check(form.Text.Contains("2.2.16"),"premarket regression runs against version 2.2.16");
+            Check(form.Text.Contains("2.2.17"),"premarket regression runs against version 2.2.17");
             Check(!All(form).OfType<Button>().Any(button=>button.Text=="선택 거절 매도 재시도"),"ordinary automatic rejection handling requires no manual retry button");
             Check(All(form).OfType<Button>().Any(button=>button.Text=="조회 정의 내보내기"),"static query-definition export is available without invoking registry COM or provider queries");
             Check(!Get<LiveTradingSession>(form,"authorization").Active,"application startup never authorizes live orders");
@@ -583,7 +594,7 @@ static class PremarketUiTests {
             Set(form,"entry",pending);
             Call(form,"Reply",new IndiReply{Kind="TRADEHOLDINGS",TradeHoldings=source,RequestStartedUtc=source.RequestStartedUtc,ReceivedUtc=source.ReceivedUtc});
             Check(Get<List<PremarketReference>>(form,"watchedReferences").Any(x=>ReferenceEquals(x,reference)),"preflight holdings refresh retains the pending buy's original prepared reference");
-            Check((bool)Call(form,"ValidEntrySignal",signal,live,Opening.AddSeconds(1)),"a pending buy remains signal-valid after fresh other-symbol holdings are observed");
+            Check(!(bool)Call(form,"ValidEntrySignal",signal,live,Opening.AddSeconds(1)),"a fresh holdings reply cannot promote one base signal without observed breakout confirmation");
             Set(form,"entry",null);
             Check(Get<List<Holding>>(form,"holdings").Single().Code=="069500"&&!Prepared(form).ContainsKey("069500"),"existing holdings remain monitored outside the prepared discovery universe");
             var decision=(string)Call(form,"EvaluateHoldingSell",source.Holdings[0],new IndiReply{Code="069500",Price=70000,Clock="090001",HasTradeClock=true},Opening.AddSeconds(1));
@@ -658,6 +669,7 @@ static class PremarketUiTests {
         QuantityRefreshUiCases.Run(data,Check);
         PausedResearchUiCases.Run(data,Check);
         PendingBuyUiCases.Run(data,Check);
+        StrategyConfirmationUiCases.Run(data,Check);
         DeferredReadStatus(data);
     }
 
@@ -744,13 +756,15 @@ static class AcceptedRealtimeFaultCases {
         Get<List<PremarketReference>>(form,"watchedReferences").Add(reference);
         Get<DataGridView>(form,"candidatesGrid").Rows.Add(reference.Code,reference.Name,reference.PriorHigh,reference.RankScore,"completed bars","waiting");
         processor.Track(reference.Code);Get<HashSet<string>>(realtime,"watch").Add(reference.Code);Get<HashSet<string>>(form,"trackedQuotes").Add(reference.Code);
-        for(int index=3;index<=4;index++) {
+        processor.QuoteReceived+=Handler<Action<RealtimeQuote>>(form,"OnRealtimeQuote");
+        int confirmation=strategy.BreakoutConfirmationSeconds;
+        for(int index=3;index<=4+confirmation;index++) {
             var at=utc.AddSeconds(index);
             setFields(new Dictionary<int,object>{{1,reference.Code},{2,MarketTime.ToKorea(at).ToString("HHmmss",CultureInfo.InvariantCulture)},
                 {3,reference.PriorHigh+10},{7,reference.AverageVolume*(strategy.VolumeMultiplier+1)+index},{17,"1"}});
             processor.Process("SC",at);
         }
-        Call(form,"EvaluatePreparedSignals",utc.AddSeconds(4));
+        Call(form,"EvaluatePreparedSignals",utc.AddSeconds(4+confirmation));
         check(Get<Queue<Candidate>>(form,"buyQuotes").Any(value=>value.Code==reference.Code)
             &&Get<object>(form,"entry")==null&&wire.Sends==1&&!processor.Failed
             &&Get<LiveTradingSession>(form,"authorization").Active&&Get<bool>(form,"monitoring"),

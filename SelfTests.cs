@@ -18,7 +18,7 @@ namespace ShinhanNativeTrader {
                 rising.Add(new Bar{Date=date,Open=10000+i*120,High=10100+i*120,Low=9900+i*120,Close=10000+i*120,Volume=100000});
             }
             Check(Rules.Entry("005930","삼성",flat)==null,"flat series must not buy");
-            rising[34].Close=20000;rising[34].High=20100;rising[34].Volume=500000;
+            rising[34].Close=rising.Take(34).Max(bar=>bar.High)*1.01m;rising[34].High=rising[34].Close;rising[34].Volume=500000;
             Check(Rules.Entry("005930","삼성",rising)!=null,"real breakout entry");
             var p=new PositionRiskState{Entry=10000,High=10500,Qty=10};
             Check(Rules.Exit(p,9300).Contains("손절"),"stop loss");
@@ -32,7 +32,7 @@ namespace ShinhanNativeTrader {
                 + AccountAppSettingsTests.Run() + RealtimeIndiTests.Run() + RealtimeDiagnosticsTests.Run() + CashMarketRulesTests.Run()
                 + BrokerReadinessTests.Run() + BrokerAccountEventRouterTests.Run() + PremarketResearchTests.Run()
                 + LiveOrderResponseParserTests.Run() + IndiOrderSchemaTests.Run() + IndiAccountOrderSchemaTests.Run() + IndiHoldingsSchemaTests.Run() + IndiDefinitionExportTests.Run() + AutoOrderRetryTests.Run()
-                + PendingBuyPolicyTests.Run() + PendingOrderRecoveryTests.Run();
+                + PendingBuyPolicyTests.Run() + PendingOrderRecoveryTests.Run() + BreakoutConfirmationTests.Run();
         }
     }
 }

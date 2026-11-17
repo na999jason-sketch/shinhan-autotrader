@@ -57,6 +57,7 @@ static class AutomaticRetryUiCases {
         readonly Dictionary<int,object> quoteFields=new Dictionary<int,object>();
         readonly RealtimeEventProcessor processor;
         int volume=2000;
+        DateTime? lastQuoteUtc;
         public Fixture(string data,string name,LiveOrderKind side,DateTime rejectedAt,bool evidence=true,string existingPath=null,string code="000660",DateTime? opening=null) {
             Side=side;Symbol=code;Opening=opening??AutomaticRetryUiCases.Opening;Form=new MainForm();Get<Timer>(Form,"scheduler").Stop();
             Form.ShowInTaskbar=false;Form.Show();Application.DoEvents();Get<Timer>(Form,"scheduler").Stop();
@@ -97,6 +98,8 @@ static class AutomaticRetryUiCases {
                 Get<DataGridView>(Form,"candidatesGrid").Rows.Add(Symbol,stock.Name,Reference.PriorHigh,Reference.RankScore,"synthetic","");
             }
             processor=new RealtimeEventProcessor(index=>quoteFields[index]);processor.BindAccount(Account);processor.Track(Symbol);
+            processor.QuoteReceived+=(Action<RealtimeQuote>)Delegate.CreateDelegate(typeof(Action<RealtimeQuote>),Form,
+                typeof(MainForm).GetMethod("OnRealtimeQuote",Fields));
             var realtime=(RealtimeIndi)FormatterServices.GetUninitializedObject(typeof(RealtimeIndi));
             Set(realtime,"processor",processor);Set(realtime,"watch",new HashSet<string>(StringComparer.Ordinal){Symbol});
             Set(realtime,"native",new object());Set(realtime,"<AccountSubscribed>k__BackingField",true);Set(Form,"realtime",realtime);
@@ -127,9 +130,26 @@ static class AutomaticRetryUiCases {
             Set(Form,"tradeHoldings",source);var heldValues=Get<List<Holding>>(Form,"holdings");heldValues.Clear();heldValues.AddRange(source.Holdings);
             Set(Form,"brokerOrders",OrdersAt(at,Account,verified));
             Set(Form,"cash",new AccountCashSnapshot{DepositCash=1000000,Cash100Orderable=1000000,ReceivedUtc=at});
-            quoteFields[1]=Symbol;quoteFields[2]=MarketTime.ToKorea(at.AddSeconds(-1)).ToString("HHmmss",CultureInfo.InvariantCulture);
-            quoteFields[3]=price.ToString(CultureInfo.InvariantCulture);quoteFields[7]=volume++;quoteFields[17]="1";processor.Process("SC",at.AddSeconds(-1));
-            quoteFields[2]=MarketTime.ToKorea(at).ToString("HHmmss",CultureInfo.InvariantCulture);quoteFields[7]=volume++;processor.Process("SC",at);
+            if(Side==LiveOrderKind.Buy) {
+                // Existing rejection tests satisfy the new strategy through
+                // actual callback observations, rather than bypassing it.
+                if(lastQuoteUtc.HasValue&&MarketTime.ToKorea(lastQuoteUtc.Value).Date!=MarketTime.ToKorea(at).Date) {
+                    processor.Invalidate();lastQuoteUtc=null;
+                }
+                if(!lastQuoteUtc.HasValue) {
+                    int seconds=Get<AccountAppSettings>(Form,"configuration").Strategy.BreakoutConfirmationSeconds;
+                    Quote(at.AddSeconds(-seconds-1),price);Quote(at.AddSeconds(-seconds),price);
+                }
+                for(var next=lastQuoteUtc.Value.AddSeconds(10);next<at;next=next.AddSeconds(10))Quote(next,price);
+                Quote(at,price);
+            }else {
+                Quote(at.AddSeconds(-1),price);Quote(at,price);
+            }
+        }
+        void Quote(DateTime at,decimal price) {
+            quoteFields[1]=Symbol;quoteFields[2]=MarketTime.ToKorea(at).ToString("HHmmss",CultureInfo.InvariantCulture);
+            quoteFields[3]=price.ToString(CultureInfo.InvariantCulture);quoteFields[7]=volume++;quoteFields[17]="1";
+            processor.Process("SC",at);lastQuoteUtc=at;
         }
         public void Tick(DateTime at){Call(Form,"ScheduleAt",at);}
         public object Pending {get{return Get<object>(Form,"entry");}}

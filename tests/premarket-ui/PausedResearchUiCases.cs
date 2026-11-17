@@ -118,17 +118,29 @@ static class PausedResearchUiCases {
             RealtimeEventProcessor processor;
             if(realtime==null) {
                 processor=new RealtimeEventProcessor(index=>quoteFields[index]);processor.Track("000660");
+                processor.QuoteReceived+=(Action<RealtimeQuote>)Delegate.CreateDelegate(typeof(Action<RealtimeQuote>),Form,
+                    typeof(MainForm).GetMethod("OnRealtimeQuote",Fields));
                 realtime=(RealtimeIndi)FormatterServices.GetUninitializedObject(typeof(RealtimeIndi));
                 Set(realtime,"processor",processor);Set(realtime,"watch",new HashSet<string>(StringComparer.Ordinal){"000660"});
                 Set(Form,"realtime",realtime);Get<HashSet<string>>(Form,"trackedQuotes").Add("000660");
             }else processor=Get<RealtimeEventProcessor>(realtime,"processor");
-            quoteFields[1]="000660";quoteFields[3]=price.ToString(CultureInfo.InvariantCulture);quoteFields[17]="1";
-            quoteFields[2]=MarketTime.ToKorea(now.AddSeconds(-1)).ToString("HHmmss",CultureInfo.InvariantCulture);
-            quoteFields[7]=volume;processor.Process("SC",now.AddSeconds(-1));
-            quoteFields[2]=MarketTime.ToKorea(now).ToString("HHmmss",CultureInfo.InvariantCulture);
-            quoteFields[7]=volume+1;processor.Process("SC",now);
+            int nextVolume=Math.Max(volume,lastVolume+1);
+            if(!lastQuoteUtc.HasValue) {
+                int seconds=Get<AccountAppSettings>(Form,"configuration").Strategy.BreakoutConfirmationSeconds;
+                QuoteFrame(processor,now.AddSeconds(-seconds-1),price,nextVolume++);
+                QuoteFrame(processor,now.AddSeconds(-seconds),price,nextVolume++);
+            }
+            for(var next=lastQuoteUtc.Value.AddSeconds(10);next<now;next=next.AddSeconds(10))QuoteFrame(processor,next,price,nextVolume++);
+            QuoteFrame(processor,now,price,nextVolume);
         }
         readonly Dictionary<int,object> quoteFields=new Dictionary<int,object>();
+        DateTime? lastQuoteUtc;
+        int lastVolume;
+        void QuoteFrame(RealtimeEventProcessor processor,DateTime at,decimal price,int volume) {
+            quoteFields[1]="000660";quoteFields[3]=price.ToString(CultureInfo.InvariantCulture);quoteFields[17]="1";
+            quoteFields[2]=MarketTime.ToKorea(at).ToString("HHmmss",CultureInfo.InvariantCulture);quoteFields[7]=volume;
+            processor.Process("SC",at);lastQuoteUtc=at;lastVolume=volume;
+        }
         public string CandidateStatus {get{return Convert.ToString(Get<DataGridView>(Form,"candidatesGrid").Rows[0].Cells["주문상태"].Value,CultureInfo.InvariantCulture);}}
         public void Dispose(){Form.Close();Form.Dispose();Journal.Dispose();}
     }
@@ -161,12 +173,13 @@ static class PausedResearchUiCases {
                 &&Get<Queue<Stock>>(form,"scans").Count==1&&Get<DataGridView>(form,"candidatesGrid").Rows.Count==1,
                 "another recovery-blocked start preserves prepared references, rows and remaining analysis");
             int records=fixture.Journal.Snapshot.Orders.Count,requests=fixture.Reads.Requests;
-            fixture.Quote(now.AddSeconds(10),prepared.PriorHigh+10,100000);
-            Call(form,"EvaluatePreparedSignals",now.AddSeconds(10));
+            var confirmedAt=now.AddSeconds(Get<AccountAppSettings>(form,"configuration").Strategy.BreakoutConfirmationSeconds+10);
+            fixture.Quote(confirmedAt,prepared.PriorHigh+10,100000);
+            Call(form,"EvaluatePreparedSignals",confirmedAt);
             check(fixture.CandidateStatus=="매수 조건 충족 / 미확정 주문 대사 대기",
                 "a qualified readonly candidate explains the recovery gate instead of hiding its completed live analysis");
-            fixture.Quote(now.AddSeconds(12),prepared.PriorHigh,100010);
-            Call(form,"EvaluatePreparedSignals",now.AddSeconds(12));
+            fixture.Quote(confirmedAt.AddSeconds(2),prepared.PriorHigh,100010);
+            Call(form,"EvaluatePreparedSignals",confirmedAt.AddSeconds(2));
             check(fixture.CandidateStatus.Contains("미돌파"),"readonly candidates continue showing current nonqualifying breakout conditions");
             check(fixture.Journal.RecoveryRequired&&fixture.Journal.Snapshot.Orders.Count==records&&fixture.Reads.Requests==requests,
                 "readonly candidate evaluation neither changes prior order evidence nor requests an account/order operation");
@@ -176,8 +189,10 @@ static class PausedResearchUiCases {
     static void UnarmedResearch(string data,Action<bool,string> check) {
         using(var fixture=new Fixture(data,"unarmed",false)) {
             var now=new DateTime(2026,11,16,0,15,0,DateTimeKind.Utc);
-            fixture.PrepareOne(now);fixture.Quote(now.AddSeconds(10),fixture.Prepared["000660"].PriorHigh+10,100000);
-            Call(fixture.Form,"EvaluatePreparedSignals",now.AddSeconds(10));
+            fixture.PrepareOne(now);
+            var confirmedAt=now.AddSeconds(Get<AccountAppSettings>(fixture.Form,"configuration").Strategy.BreakoutConfirmationSeconds+10);
+            fixture.Quote(confirmedAt,fixture.Prepared["000660"].PriorHigh+10,100000);
+            Call(fixture.Form,"EvaluatePreparedSignals",confirmedAt);
             check(fixture.CandidateStatus=="매수 조건 충족 / 실주문 미시작",
                 "unarmed research displays a qualified live candidate and the explicit-start requirement");
             check(fixture.Journal.Snapshot.Orders.Count==0&&!fixture.Journal.RecoveryRequired,

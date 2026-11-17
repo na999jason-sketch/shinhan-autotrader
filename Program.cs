@@ -16,7 +16,7 @@ namespace ShinhanNativeTrader {
         public AccountUserActionException(string message):base(message){}
     }
     internal static class Program {
-        internal const string Version="2.2.16";
+        internal const string Version="2.2.17";
         [STAThread]
         static int Main(string[] args) {
             if(args.Contains("--selftest")) {
@@ -138,6 +138,7 @@ namespace ShinhanNativeTrader {
         readonly HashSet<string> trackedQuotes=new HashSet<string>(StringComparer.Ordinal);
         readonly HashSet<string> blockedSignals=new HashSet<string>(StringComparer.Ordinal);
         readonly Dictionary<string,PremarketReference> preparedReferences=new Dictionary<string,PremarketReference>(StringComparer.Ordinal);
+        readonly BreakoutConfirmationTracker entryConfirmation=new BreakoutConfirmationTracker();
         readonly List<PremarketReference> watchedReferences=new List<PremarketReference>();
         DateTime? researchDateKorea;
         bool researchComplete,openingAdopted,researchRequested;
@@ -212,6 +213,8 @@ namespace ShinhanNativeTrader {
             AddSetting(settings,"실계좌 운용한도 (원)",budget);
             Setting(settings,"FastPeriod","단기 이동평균 기간",1,199,5);Setting(settings,"SlowPeriod","장기 이동평균 기간",2,200,20);
             Setting(settings,"BreakoutPeriod","돌파 고점 기간",1,200,20);Setting(settings,"VolumeMultiplier","평균 거래량 배수",1,20,1.3m,2);
+            Setting(settings,"MaxBreakoutExtensionPercent","돌파선 대비 추격 상한 (%)",0.01m,10,2,2);
+            Setting(settings,"BreakoutConfirmationSeconds","실제 시세 돌파 유지 확인 (초)",30,300,60);
             Setting(settings,"MinPrice","최저 종목 가격",1,10000000,2000);Setting(settings,"MaxPrice","최고 종목 가격",1,10000000,400000);
             Setting(settings,"AllocationFraction","종목당 가용금액 비율 (%)",1,100,20,2);Setting(settings,"MaxPositions","최대 보유 종목 수",1,100,3);
             Setting(settings,"StopLossPercent","손절 (%)",0.1m,90,6,2);Setting(settings,"TakeProfitPercent","익절 (%)",0.1m,500,12,2);
@@ -219,6 +222,7 @@ namespace ShinhanNativeTrader {
             Setting(settings,"BuyOrderTimeoutSeconds","매수 미체결 잔량 취소 대기 (초)",30,1800,120);
             Setting(settings,"FeeRate","주문금액 비용 여유율 (%)",0,10,0.3m,3);AddButton(settings,"전략·운용한도 저장",SaveSettings);
             settings.Controls.Add(new Label{AutoSize=true,MaximumSize=new Size(1000,0),Text="자동 매수 미체결은 대기시간 경과 후 잔여 수량만 취소 검증합니다. 부분체결 수량은 보존합니다.\n취소 접수와 취소 완료는 별도이며, 완료 확인 전에는 재매수하지 않습니다. 전량 미체결 취소 후에도 현재 매수 조건을 다시 충족해야 하며 추가 진입은 1회로 제한합니다."});
+            settings.Controls.Add(new Label{AutoSize=true,MaximumSize=new Size(1000,0),Text="매수는 돌파선 대비 추격 상한 안에서 실제 SC 시세가 확인 시간 동안 유지될 때만 준비합니다.\n돌파 이탈·상한 초과·시세 간격 15초 초과 시 다시 확인합니다. 확인 기간에는 실제 누적거래량 증가도 필요합니다."});
             settings.Controls.Add(new Label{AutoSize=true,MaximumSize=new Size(1000,0),Text="운용한도는 실제 예수금이 아닙니다. 실제 잔고·현금100% 가능금액·매도가능수량을 주문마다 새로 조회합니다.\n실주문 운영 시작을 누른 계좌에서만 주문합니다. 앱을 다시 열거나 운영을 중단하면 실주문 시작 상태가 해제됩니다.\n대상 거래일 00시부터 완료 일봉으로 사전분석, 개장 후 준비 후보의 실제 SC 시세·거래량 확인. 동일 일봉을20분마다 다시 전수 조회하지 않습니다.\n평일 09:00~15:20 주문 운영. 장전 분석이 덜 끝났으면 완료 자료를 유지하고 잔여 분석을 이어갑니다.\n기존 보유와 새 보유는 같은 손절·익절·추적손절 조건으로 감시합니다. 개장 시 강제 매도하지 않습니다.\n평가손익은 비용 제외 계산이며 실현손익은 증권사 응답이 있을 때만 표시합니다. 휴장일 달력은 미연동입니다.\n계좌번호·암호는 설정에 저장하지 않습니다. 자동 조회용 암호는 운영 중단·종료 전까지 메모리에만 보관합니다."});
             logs.Multiline=true;logs.ReadOnly=true;logs.ScrollBars=ScrollBars.Vertical;logs.Dock=DockStyle.Fill;AddTab(tabs,"진단 로그",logs);
             var footer=new FlowLayoutPanel{Dock=DockStyle.Fill};footer.Controls.Add(new Label{AutoSize=true,Text="실제 잔고·주문 응답을 표시합니다. 주문 접수를 체결로 처리하지 않습니다. 연결·수신·저장 오류 시 자동 운영을 중단합니다.\n부재중 운영 중에는 PC 자동 절전을 억제합니다. PC 종료·수동 절전·Indi 로그인 만료 후에는 자동 재개하지 않습니다."});
@@ -277,7 +281,7 @@ namespace ShinhanNativeTrader {
                 previous.QuoteReceived-=OnRealtimeQuote;previous.OrderReceived-=OnRealtimeOrder;previous.BalanceReceived-=OnRealtimeBalance;
                 previous.Faulted-=OnRealtimeFailure;previous.Invalidated-=OnRealtimeFailure;previous.Dispose();
             }
-            trackedQuotes.Clear();balanceSignatures.Clear();
+            trackedQuotes.Clear();balanceSignatures.Clear();entryConfirmation.Clear();
             lastRealtimeDiagnosticUtc=null;
         }
         bool EnsureLiveQuote(string symbol) {
@@ -294,9 +298,12 @@ namespace ShinhanNativeTrader {
             foreach(var candidate in buyQuotes)keep.Add(candidate.Code);
             foreach(var prepared in watchedReferences)keep.Add(prepared.Code);
             if(journal!=null)foreach(var order in journal.Snapshot.Orders.Where(LiveOrderJournal.IsUnresolved))keep.Add(order.Code);
-            foreach(var symbol in trackedQuotes.Where(x=>!keep.Contains(x)).ToList()){realtime.RemoveQuote(symbol);trackedQuotes.Remove(symbol);}
+            foreach(var symbol in trackedQuotes.Where(x=>!keep.Contains(x)).ToList()){realtime.RemoveQuote(symbol);trackedQuotes.Remove(symbol);entryConfirmation.Remove(symbol);}
         }
         void OnRealtimeQuote(RealtimeQuote quote) {
+            PremarketReference prepared;
+            if(preparedReferences.TryGetValue(quote.Code,out prepared))
+                entryConfirmation.Observe(prepared,quote,configuration.Strategy,quote.ReceivedUtc);
             var held=holdings.SingleOrDefault(x=>x.Code==quote.Code);if(held==null)return;
             held.Price=quote.Price;priceReceivedUtc[held.Code]=quote.ReceivedUtc;displayDirty=true;
         }
@@ -420,6 +427,7 @@ namespace ShinhanNativeTrader {
             return day;
         }
         void InvalidateResearch() {
+            entryConfirmation.Clear();
             preparedReferences.Clear();watchedReferences.Clear();researchDateKorea=null;researchComplete=false;
             openingAdopted=false;researchRequested=false;researchTotal=0;
             researchStatus.Text="장전 분석: 미준비 / 새 분석이 필요합니다.";
@@ -432,7 +440,7 @@ namespace ShinhanNativeTrader {
         bool RestoreResearch(ResearchState saved,DateTime now) {
             if(saved==null||saved.Day!=AnalysisTarget(now)||saved.References.Any(x=>!x.Matches(configuration.Strategy)
                 ||!symbols.Any(s=>s.Code==x.Code&&s.Market==x.Market))||saved.Remaining.Any(x=>!symbols.Any(s=>s.Code==x.Code&&s.Market==x.Market)))return false;
-            preparedReferences.Clear();foreach(var prepared in saved.References)preparedReferences.Add(prepared.Code,prepared);
+            entryConfirmation.Clear();preparedReferences.Clear();foreach(var prepared in saved.References)preparedReferences.Add(prepared.Code,prepared);
             scans.Clear();foreach(var symbol in saved.Remaining)scans.Enqueue(symbol);
             researchDateKorea=saved.Day;scanned=saved.Progress;researchTotal=saved.Total;researchComplete=saved.Complete;
             researchRequested=saved.Requested;scanning=saved.Scanning;openingAdopted=false;candidatesGrid.Rows.Clear();
@@ -501,7 +509,7 @@ namespace ShinhanNativeTrader {
                 if(holdings.Any(x=>x.Code==prepared.Code&&x.Quantity>0)||buyQuotes.Any(x=>x.Code==prepared.Code)
                     ||entry!=null&&entry.Intent!=null&&entry.Intent.Code==prepared.Code)continue;
                 if(!realtime.TryGetQuote(prepared.Code,now,out quote)){SetCandidateStatus(prepared.Code,"실시간 연속 시세 확인 대기");continue;}
-                string status;var candidate=PremarketResearch.EvaluateLive(prepared,quote,configuration.Strategy,now,out status);
+                string status;var candidate=EvaluateEntrySignal(prepared,quote,now,out status);
                 if(candidate==null){SetCandidateStatus(prepared.Code,status);continue;}
                 SetCandidateStatus(prepared.Code,status);
                 if(tradeHoldings!=null&&!tradeHoldings.QuantityExposureVerified) {
@@ -895,10 +903,14 @@ namespace ShinhanNativeTrader {
                 &&!AccountQueries.IsOrdinaryCashSource(tradeHoldings,ordinaryHoldings,held.Code,utc))return "현물 잔고구분 확인 대기";
             return null;
         }
+        Candidate EvaluateEntrySignal(PremarketReference reference,RealtimeQuote quote,DateTime now,out string status) {
+            return entryConfirmation.Evaluate(reference,quote,configuration.Strategy,now,out status);
+        }
         bool ValidEntrySignal(Candidate candidate,RealtimeQuote quote,DateTime now) {
             PremarketReference prepared;
+            string status;
             return candidate!=null&&quote!=null&&preparedReferences.TryGetValue(candidate.Code,out prepared)
-                &&PremarketResearch.EvaluateLive(prepared,quote,configuration.Strategy,now)!=null
+                &&EvaluateEntrySignal(prepared,quote,now,out status)!=null
                 &&watchedReferences.Any(x=>x.Code==candidate.Code&&x.TargetDateKorea==MarketTime.ToKorea(now).Date)&&candidate.Code==quote.Code&&candidate.SignalDate==MarketTime.ToKorea(now).ToString("yyyyMMdd",CultureInfo.InvariantCulture)
                 &&quote.Price>=configuration.Strategy.MinPrice&&quote.Price<=configuration.Strategy.MaxPrice&&quote.Price>=candidate.Price*0.97m&&quote.Price<=candidate.Price*1.03m
                 &&!holdings.Any(x=>x.Code==candidate.Code&&x.Quantity>0)&&ProjectedPositionCount()<configuration.Strategy.MaxPositions;
@@ -1010,13 +1022,17 @@ namespace ShinhanNativeTrader {
                 if(open<0||open>int.MaxValue||open!=decimal.Truncate(open)){RestartPreflight(now,true);return;}
                 pending.Intent.Quantity=Math.Min(pending.Intent.Quantity,checked((int)open));
             }
-            RealtimeQuote quote=pending.Quote;
+            RealtimeQuote quote=pending.Quote,entryQuote=null;
             if(pending.Intent.Kind!=LiveOrderKind.Cancel) {
                 RealtimeQuote latest;
                 if(!EnsureLiveQuote(pending.Intent.Code)||!realtime.TryGetQuote(pending.Intent.Code,now,out latest)){RestartPreflight(now,true);return;}
                 if(pending.AutoSize) {
-                    PremarketReference reference;
-                    if(!preparedReferences.TryGetValue(pending.Intent.Code,out reference)||PremarketResearch.EvaluateLive(reference,latest,configuration.Strategy,now)==null){SetCandidateStatus(pending.Intent.Code,"장중 돌파·거래량 조건 해제");entry=null;return;}
+                    PremarketReference reference;string status="사전분석 자료 확인 대기";
+                    if(!preparedReferences.TryGetValue(pending.Intent.Code,out reference)||EvaluateEntrySignal(reference,latest,now,out status)==null
+                        ||pending.Intent.LimitPrice<=reference.PriorHigh||pending.Intent.LimitPrice>reference.PriorHigh*(1+configuration.Strategy.MaxBreakoutExtensionPercent/100m)) {
+                        SetCandidateStatus(pending.Intent.Code,status);entry=null;ReleaseUnusedQuotes();return;
+                    }
+                    entryQuote=latest;
                 }
                 if(pending.Intent.Kind==LiveOrderKind.Sell){quote=latest;pending.Quote=latest;pending.Intent.LimitPrice=latest.Price;}
                 if(quote==null||!MarketTime.CanUseQuote(quote.ToReply(),now)) {
@@ -1025,7 +1041,7 @@ namespace ShinhanNativeTrader {
                 }
             }
             if(pending.AutoSize) {
-                if(!ValidEntrySignal(pending.Candidate,quote,now)||cash==null||pending.Capacity==null){entry=null;ReleaseUnusedQuotes();return;}
+                if(!ValidEntrySignal(pending.Candidate,entryQuote,now)||cash==null||pending.Capacity==null){entry=null;ReleaseUnusedQuotes();return;}
                 var totals=AccountValuation.From(holdings);if(!totals.CostBasis.HasValue){RestartPreflight(now,true);return;}
                 decimal remaining=Math.Max(0m,configuration.BudgetLimit-totals.CostBasis.Value-journal.ReservedBuyAmount);
                 int quantity=Rules.OrderQuantity(Math.Min(cash.NonNegativeCash100,Math.Min(remaining,pending.Capacity.Amount)),pending.Intent.LimitPrice,configuration.Strategy.AllocationFraction,configuration.Strategy.FeeRate);

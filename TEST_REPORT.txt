@@ -575,3 +575,13 @@ GUIrealformsyntheticcallback:raw0/current18/cost146880/value141660,ordinarycanon
 최종Linux x86target warnaserror컴파일0warning/error. App2389 / 실제폼GUI406 / 보고서GUI30 / Python17 PASS. I386/PE32/CLR32BITREQUIRED PASS. Linuxpointer8은Windows실행증거아님. 동일커밋Windows .NET4.8 x86/COM/UIPI/GUI/EXE는PR Actions결과참조.
 기존15:20종료/로그아웃/수동중단이후취소를새로보내지않으며, 종료직전주문의대기시간이종료를넘는경우타이머취소를보장하지않음. AA05누락/불명주문은조회행누락이나미확인취소enum으로확정하지않으며자동재전송없음. 실제Indi취소/부분체결/재시작종단검증은미실행, 도구의실제금융API호출0회.
 상세: docs/PENDING_BUY_TIMEOUT_20261116.md
+
+
+2.2.17 — 매수 진입 전략의 추격 상한·실제 체결 돌파 유지 확인 (2026-11-17)
+2.2.16의 미체결 취소/손절/주문/잔고 로직은 유지하고 매수 진입에만 기본 돌파선+2% 상한·60초 SC 확인을 추가했다. 상한은 돌파선 기준이며 기존 후보가격±3% 검사와 별도다. 기존 일평균 대비 당일 누적거래량 조건을 유지하며 실제 체결의 거래량 증가가 관측기간 안에 필요하다.
+관측은 SC콜백 전용, 증권사시각·수신UTC 양쪽 경과>=60초, 실제거래 관측간격/최신성15초 이내. 캐시·스케줄러·같은시각/누적량 재수신은 성숙시키지 않는다. 이탈/과열/비정규장/미확인/역행/공백/다른일자·종목·연구자료·설정은 재확인. 주문전 최신확인·실제주문상한 재검사.
+설정 새필드 기본2%·60초, 범위0.01~10%·30~300초. 기존XML 손절/운용한도/미체결대기 보존. 새값 저장·복원/원본복사/경계/불일치검증. 구버전 양성fixture는 과도한41%돌파 대신 상한내 신호와 실제SC유지 관측으로 갱신했으며 필터를 끄지 않았다.
+Linux x86대상 warnaserror compile0warning/error, 앱2457/실제폼장전·미체결·전략GUI424/보고서GUI30/Python17 PASS. I386/PE32/CLR32BITREQUIRED 확인. Linuxpointer8은 실제Windows x86실행과구분한다. 정확한커밋 Windows Actions의빌드/GUI/COM/UIPI/EXE결과는 PR에기록한다.
+LiveOrders/BrokerReadiness/PendingBuyPolicy/AutoOrderRetry/BrokerAccountEventRouter/RealtimeIndi/AccountQueries/IndiCom/CashMarketRules는2.2.16과diff없음을확인했다. StopLoss/TakeProfit/Trailing/OrderQuantity는변경하지않았다.
+기능회귀와합성시세검증이며 실데이터수익률·거래비용포함손익/최대낙폭백테스트는미실행이다. 초기2%·60초는수익최적화값이아니다. 실제Indi금융API호출/실제주문0회이며실제계좌새진입경로는미검증이다.
+상세: docs/ENTRY_CONFIRMATION_20261117.md

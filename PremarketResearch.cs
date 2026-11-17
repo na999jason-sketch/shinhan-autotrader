@@ -29,7 +29,9 @@ namespace ShinhanNativeTrader {
         internal bool Matches(StrategySettings other) {
             return other!=null&&settings.FastPeriod==other.FastPeriod&&settings.SlowPeriod==other.SlowPeriod
                 &&settings.BreakoutPeriod==other.BreakoutPeriod&&settings.VolumeMultiplier==other.VolumeMultiplier
-                &&settings.MinPrice==other.MinPrice&&settings.MaxPrice==other.MaxPrice;
+                &&settings.MinPrice==other.MinPrice&&settings.MaxPrice==other.MaxPrice
+                &&settings.MaxBreakoutExtensionPercent==other.MaxBreakoutExtensionPercent
+                &&settings.BreakoutConfirmationSeconds==other.BreakoutConfirmationSeconds;
         }
         internal bool SameEntrySettings(PremarketReference other){return other!=null&&Matches(other.settings);}
     }
@@ -120,6 +122,10 @@ namespace ShinhanNativeTrader {
                 status="누적거래량 확인 대기";return null;
             }
             try {
+                decimal extensionPercent=(quote.Price/reference.PriorHigh-1m)*100m;
+                if(extensionPercent>strategy.MaxBreakoutExtensionPercent) {
+                    status="돌파선 대비 "+Number(extensionPercent)+"% / 추격 상한 "+Number(strategy.MaxBreakoutExtensionPercent)+"% 초과";return null;
+                }
                 decimal requiredVolume=reference.AverageVolume*strategy.VolumeMultiplier;
                 if(quote.CumulativeVolume<requiredVolume) {
                     status="누적거래량 "+Number(quote.CumulativeVolume)+" / 기준 "+Number(requiredVolume)+" 미달";return null;
@@ -131,7 +137,8 @@ namespace ShinhanNativeTrader {
                     SignalDate=korea.ToString("yyyyMMdd",CultureInfo.InvariantCulture),
                     Reason="완료봉 기준 "+reference.LastCompletedBarDate+" / "+strategy.FastPeriod+"일선>"+strategy.SlowPeriod
                         +"일선 + 직전"+strategy.BreakoutPeriod+"봉 고점 "+reference.PriorHigh.ToString("0.####",CultureInfo.InvariantCulture)
-                        +" 돌파 + 당일 누적거래량 "+ratio.ToString("0.##",CultureInfo.InvariantCulture)+"배"};
+                        +" 돌파 + 당일 누적거래량 "+ratio.ToString("0.##",CultureInfo.InvariantCulture)+"배"
+                        +" / 돌파선 대비 "+Number(extensionPercent)+"% (추격 상한 "+Number(strategy.MaxBreakoutExtensionPercent)+"%)"};
             }catch(OverflowException){status="전략 계산 범위 확인 필요";return null;}
         }
     }
