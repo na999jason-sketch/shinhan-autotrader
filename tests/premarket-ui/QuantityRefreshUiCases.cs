@@ -1,0 +1,273 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.Serialization;
+using System.Windows.Forms;
+using ShinhanNativeTrader;
+
+// Actual read coordinator and form callbacks, with isolated account responses.
+// No native control, login, registration, or real order API is invoked.
+static class QuantityRefreshUiCases {
+    const string Account="12345678901",Symbol="005930";
+    static readonly BindingFlags Fields=BindingFlags.Instance|BindingFlags.Public|BindingFlags.NonPublic;
+    static readonly DateTime Opening=new DateTime(2026,11,16,0,3,0,DateTimeKind.Utc);
+    static T Get<T>(object owner,string name){return (T)owner.GetType().GetField(name,Fields).GetValue(owner);}
+    static void Set(object owner,string name,object value){owner.GetType().GetField(name,Fields).SetValue(owner,value);}
+    static object Call(object owner,string name,params object[] values) {
+        try{return owner.GetType().GetMethod(name,Fields).Invoke(owner,values);}
+        catch(TargetInvocationException error){throw error.InnerException??error;}
+    }
+    sealed class HoldingsWire : IIndiTransport,IIndiDiagnostics {
+        public int Quantity,Orderable=2,Requests,Setters;
+        public decimal AveragePrice=10000,CurrentPrice=10000;
+        public decimal? BrokerReturn;
+        public decimal? EvaluationQuantity,MarketValue,UnrealizedProfit;
+        public int TodayBought,Settlement;
+        public string CashKind="보통";
+        public bool ReturnGetterUnavailable;
+        public readonly List<string> Queries=new List<string>();
+        public event Action<int> ReceiveData;
+        public event Action<int> ReceiveSysMsg {add{} remove{}}
+        public event Action<string> Error {add{} remove{}}
+        readonly Dictionary<int,string> inputs=new Dictionary<int,string>();
+        string query;int pending;
+        public IndiDiagnosticSnapshot ReadDiagnostics(){return new IndiDiagnosticSnapshot{ErrorState=0,CommState=0};}
+        public object Invoke(string method,params object[] values) {
+            if(method=="SetQueryName"){query=(string)values[0];inputs.Clear();return true;}
+            if(method=="GetQueryName")return query;
+            if(method=="SetSingleData"){Setters++;inputs[(int)values[0]]=(string)values[1];return true;}
+            if(method=="RequestData") {
+                if(query!="SABA609Q1")throw new InvalidOperationException("Unexpected synthetic non-holdings read.");
+                Queries.Add(query);pending=++Requests;return (short)pending;
+            }
+            if(method=="GetMultiRowCount")return 1;
+            if(method=="GetSingleData") {
+                int field=(int)values[0];
+                return field==0?MarketTime.ToKorea(DateTime.UtcNow).ToString("yyyyMMdd",CultureInfo.InvariantCulture):field==16||field==19?"0":"";
+            }
+            if(method=="GetMultiData") {
+                if((int)values[0]!=0)throw new InvalidOperationException("Unexpected synthetic holdings row.");
+                if((int)values[1]==20&&ReturnGetterUnavailable)throw new InvalidOperationException("Synthetic optional return getter unavailable.");
+                switch((int)values[1]) {
+                    case 0:return "A"+Symbol;case 1:return "SYNTHETIC QUANTITY UPDATE";case 2:return inputs[3];case 3:return CashKind;
+                    case 4:return Quantity.ToString(CultureInfo.InvariantCulture);case 10:return Orderable.ToString(CultureInfo.InvariantCulture);
+                    case 8:return TodayBought.ToString(CultureInfo.InvariantCulture);case 9:return Settlement.ToString(CultureInfo.InvariantCulture);
+                    case 11:case 22:return "0";
+                    case 12:return AveragePrice.ToString(CultureInfo.InvariantCulture);case 13:return CurrentPrice.ToString(CultureInfo.InvariantCulture);
+                    case 18:return MarketValue.HasValue?MarketValue.Value.ToString(CultureInfo.InvariantCulture):"";
+                    case 19:return UnrealizedProfit.HasValue?UnrealizedProfit.Value.ToString(CultureInfo.InvariantCulture):"";
+                    case 20:return BrokerReturn.HasValue?BrokerReturn.Value.ToString(CultureInfo.InvariantCulture):"";
+                    case 32:return EvaluationQuantity.HasValue?EvaluationQuantity.Value.ToString(CultureInfo.InvariantCulture):"";
+                    default:return "0";
+                }
+            }
+            throw new InvalidOperationException("Unexpected synthetic provider method: "+method);
+        }
+        public void Complete(){int id=pending;if(id<=0)throw new InvalidOperationException("No synthetic read is pending.");pending=0;ReceiveData(id);}
+        public void Dispose(){}
+    }
+    sealed class NoOrderWire : ILiveOrderWire,ILiveOrderChannelPreparation {
+        public int Sends,Preparations;
+        public event Action<LiveOrderAcknowledgement> Acknowledged {add{} remove{}}
+        public void PrepareChannel(){Preparations++;}
+        public int Send(LiveOrderIntent intent,LiveAccountCredentials credentials,LiveOrderPreflight checks,DateTime utc) {
+            Sends++;throw new InvalidOperationException("A holdings callback must never submit an order.");
+        }
+        public void Dispose(){}
+    }
+    sealed class Fixture : IDisposable {
+        public readonly MainForm Form;
+        public readonly LiveOrderJournal Journal;
+        public readonly NoOrderWire Orders=new NoOrderWire();
+        public readonly HoldingsWire Reads=new HoldingsWire();
+        public readonly IndiRequestCoordinator Requests;
+        public readonly RealtimeEventProcessor Processor;
+        public readonly string Key,OrderId;
+        public int Fatals;
+        readonly object credentials;
+        readonly Dictionary<int,object> quoteFields=new Dictionary<int,object>();
+        int quoteVolume=1000;
+        public Fixture(string data,string scenario="legacy",bool recognized=false,int quantity=2,decimal entryPrice=10000,bool filled=false) {
+            Form=new MainForm();Get<Timer>(Form,"scheduler").Stop();Form.ShowInTaskbar=false;Form.Show();Application.DoEvents();Get<Timer>(Form,"scheduler").Stop();
+            Get<NumericUpDown>(Form,"budget").Value=1000000;Call(Form,"SaveSettings");
+            var type=typeof(MainForm).Assembly.GetType("ShinhanNativeTrader.AccountCredentialSession",true);
+            credentials=Activator.CreateInstance(type,new object[]{Account,"1111"});Key=(string)type.GetProperty("Key").GetValue(credentials,null);
+            Set(Form,"credentials",credentials);Set(Form,"boundKey",Key);Set(Form,"lastReportKey",Key);Set(Form,"monitoring",true);
+            Set(Form,"nextAccountReadUtc",DateTime.SpecifyKind(DateTime.MaxValue,DateTimeKind.Utc));
+            Set(Form,"nextReportUtc",DateTime.SpecifyKind(DateTime.MaxValue,DateTimeKind.Utc));
+            Get<LiveTradingSession>(Form,"authorization").Authorize(Account,Opening);Get<UnattendedSession>(Form,"session").Arm(Opening);
+            Journal=new LiveOrderJournal(Path.Combine(data,"quantity-refresh-"+scenario+".xml"));Journal.BindAccount(Account);
+            var now=DateTime.UtcNow.AddSeconds(-1);
+            var order=Journal.Prepare(new LiveOrderIntent{Kind=LiveOrderKind.Buy,Code=Symbol,Quantity=quantity,LimitPrice=entryPrice,ClientKey="synthetic-accepted-buy"},now);
+            Journal.MarkDispatching(order.Id,now);Journal.MarkRequestAccepted(order.Id,77,now);
+            var values=new[]{"0","009021","0","","0","synthetic acceptance","0","0"};
+            var proof=LiveOrderResponseParser.Read(77,index=>values[index],new IndiDiagnosticSnapshot{ErrorState=0},OrderResponseLayout.Modern,new[]{Account,"1111"});
+            Journal.RecordAcknowledgement(order.Id,77,proof.BrokerOrderNumber,false,now,proof);OrderId=order.Id;
+            if(filled)Journal.RecordExecution(proof.BrokerOrderNumber,"synthetic-known-execution",quantity,entryPrice,now.AddMilliseconds(1));
+            Set(Form,"journal",Journal);Set(Form,"gateway",new LiveOrderGateway(Journal,Orders));Set(Form,"readiness",new BrokerReadiness(Key,Journal.Snapshot.AccountFingerprint));
+            Get<AccountAppSettingsStore>(Form,"settingsStore").RefreshPositions(Key,new Holding[0]);
+            var highHolding=new Holding{Code=Symbol,Quantity=quantity,AvgPrice=entryPrice,Price=entryPrice+1000};
+            if(!Get<AccountAppSettingsStore>(Form,"settingsStore").ObserveHigh(Key,highHolding,
+                new IndiReply{Code=Symbol,Price=entryPrice+1000,Clock="090300",HasTradeClock=true},Opening))throw new InvalidOperationException("Synthetic risk high was not seeded.");
+            Get<List<Stock>>(Form,"symbols").Add(new Stock{Code=Symbol,Name="SYNTHETIC",Market="0"});
+            var api=new IndiApi(Get<Panel>(Form,"nativeArea"));
+            var schema=recognized?SyntheticSchema():null;
+            Requests=new IndiRequestCoordinator(Reads,null,recognized?(Func<IndiHoldingsSchemaInfo>)(()=>schema):null);
+            Requests.Fatal+=message=>{Fatals++;Call(Form,"Halt");};
+            Requests.Done+=reply=>{Get<Timer>(api,"timeout").Stop();Call(Form,"Safe",(Action)(()=>Call(Form,"Reply",reply)));};
+            Set(api,"requests",Requests);Set(api,"hasReceivedData",true);Set(Form,"api",api);
+            Processor=new RealtimeEventProcessor(index=>quoteFields[index]);Processor.BindAccount(Account);Processor.Track(Symbol);
+            Processor.QuoteReceived+=(Action<RealtimeQuote>)Delegate.CreateDelegate(typeof(Action<RealtimeQuote>),Form,typeof(MainForm).GetMethod("OnRealtimeQuote",Fields));
+            var realtime=(RealtimeIndi)FormatterServices.GetUninitializedObject(typeof(RealtimeIndi));
+            Set(realtime,"processor",Processor);Set(realtime,"watch",new HashSet<string>(StringComparer.Ordinal){Symbol});
+            Set(realtime,"ownerThread",System.Threading.Thread.CurrentThread.ManagedThreadId);Set(realtime,"native",new object());
+            Set(realtime,"<AccountSubscribed>k__BackingField",true);Set(Form,"realtime",realtime);
+        }
+        public void Read(int quantity,int orderable,bool ordinary=false) {
+            Reads.Quantity=quantity;Reads.Orderable=orderable;
+            if(!Requests.Begin(ordinary?"ORDINARYHOLDINGS":"TRADEHOLDINGS","SABA609Q1",
+                ordinary?AccountQueries.OrdinaryHoldingsInputs(Account,"1111"):AccountQueries.HoldingsInputs(Account,"1111"),null))throw new InvalidOperationException("Synthetic holdings read did not start.");
+            Reads.Complete();
+        }
+        public void Quote(decimal price,DateTime? observedUtc=null) {
+            var now=observedUtc??DateTime.UtcNow;
+            quoteFields[1]=Symbol;quoteFields[3]=price.ToString(CultureInfo.InvariantCulture);quoteFields[17]="1";
+            quoteFields[2]=MarketTime.ToKorea(now.AddSeconds(-1)).ToString("HHmmss",CultureInfo.InvariantCulture);quoteFields[7]=quoteVolume++;Processor.Process("SC",now.AddSeconds(-1));
+            quoteFields[2]=MarketTime.ToKorea(now).ToString("HHmmss",CultureInfo.InvariantCulture);quoteFields[7]=quoteVolume++;Processor.Process("SC",now);
+            Call(Form,"RefreshAccount");
+        }
+        public bool SessionRetained {get{return ReferenceEquals(Get<object>(Form,"credentials"),credentials)&&Get<bool>(Form,"monitoring")
+            &&Get<LiveTradingSession>(Form,"authorization").Active&&Get<UnattendedSession>(Form,"session").Armed;}}
+        public LiveOrderRecord Order {get{return Journal.Snapshot.Orders.Single(value=>value.Id==OrderId);}}
+        public DataGridViewRow Row {get{return Get<DataGridView>(Form,"holdingsGrid").Rows[0];}}
+        public void Dispose(){Form.Close();Form.Dispose();Journal.Dispose();}
+    }
+    static IndiHoldingsSchemaInfo SyntheticSchema() {
+        var fixtures=typeof(MainForm).Assembly.GetType("ShinhanNativeTrader.IndiHoldingsSchemaTests",true);
+        var bytes=(byte[])fixtures.GetMethod("ModernDefinition",BindingFlags.Static|BindingFlags.Public|BindingFlags.NonPublic).Invoke(null,null);
+        var info=IndiHoldingsSchema.Inspect(bytes);
+        if(!info.Recognized)throw new InvalidOperationException("Synthetic expanded holdings definition was not recognized.");
+        return info;
+    }
+    static void VerifiedCurrentQuantity(string data,Action<bool,string> check) {
+        using(var fixture=new Fixture(data,"verified-evaluation",true,18,8160,true)) {
+            fixture.Reads.AveragePrice=8160;fixture.Reads.CurrentPrice=7870;fixture.Reads.EvaluationQuantity=18;
+            fixture.Reads.TodayBought=18;fixture.Reads.Settlement=18;fixture.Reads.MarketValue=141660;fixture.Reads.UnrealizedProfit=-5220;
+            fixture.Reads.CashKind="0";fixture.Read(0,18);
+            var trade=Get<BrokerHoldingsSnapshot>(fixture.Form,"tradeHoldings");
+            check(fixture.Fatals==0&&fixture.SessionRetained&&trade.Holdings.Single().Quantity==18
+                &&trade.ReportedQuantities[Symbol]==0&&trade.QuantityExposureVerified&&trade.IsCurrentQuantityVerified(Symbol),
+                "recognized normal holdings callback verifies the direct evaluation quantity18 while preserving reported quantity0");
+            check(Convert.ToDecimal(fixture.Row.Cells[2].Value,CultureInfo.InvariantCulture)==18
+                &&Convert.ToDecimal(fixture.Row.Cells[5].Value,CultureInfo.InvariantCulture)==146880
+                &&Convert.ToDecimal(fixture.Row.Cells[6].Value,CultureInfo.InvariantCulture)==141660,
+                "verified current quantity restores eighteen shares, actual entry cost146880 and broker valuation141660 in the holdings grid");
+            check(Get<Label>(fixture.Form,"portfolio").Text.Contains("146,880")&&Get<Label>(fixture.Form,"portfolio").Text.Contains("141,660")
+                &&!Get<Label>(fixture.Form,"portfolio").Text.Contains("잠정값")&&!Convert.ToString(fixture.Row.Cells[13].Value,CultureInfo.InvariantCulture).Contains("대기"),
+                "corroborated direct quantity clears provisional portfolio totals while retaining the original reported-quantity explanation");
+            check(fixture.Order.Status==LiveOrderStatus.Filled&&fixture.Order.FilledQuantity==18&&fixture.Journal.Snapshot.Executions.Count==1
+                &&fixture.Journal.Snapshot.Executions.Single().ExecutionId=="synthetic-known-execution"&&fixture.Orders.Sends==0&&fixture.Orders.Preparations==0,
+                "reading current quantity preserves the existing genuine fill and never replays the already filled buy");
+            fixture.Read(0,18,true);var ordinary=Get<BrokerHoldingsSnapshot>(fixture.Form,"ordinaryHoldings");
+            check(ordinary.Holdings.Single().Quantity==18&&ordinary.ReportedQuantities[Symbol]==0&&ordinary.RequestOrdinaryOnlyVerified
+                &&!ordinary.BasisVerified&&ordinary.IsCurrentQuantityVerified(Symbol),
+                "ordinary-only callback verifies its own current quantity without promoting SI3=5 into trade-basis authorization");
+
+            // The real coordinator supplied all quantity/source evidence above.
+            // Replay only synthetic receipt timestamps for deterministic regular-
+            // session strategy checks, independent of the CI runner's wall clock.
+            var riskUtc=Opening.AddMinutes(12);
+            trade.RequestStartedUtc=riskUtc.AddSeconds(-5);trade.ReceivedUtc=riskUtc.AddSeconds(-4);
+            ordinary.RequestStartedUtc=riskUtc.AddSeconds(-3);ordinary.ReceivedUtc=riskUtc.AddSeconds(-2);
+            fixture.Quote(7600,riskUtc);var held=Get<List<Holding>>(fixture.Form,"holdings").Single();
+            var riskQuote=new IndiReply{Code=Symbol,Price=7600,Clock=MarketTime.ToKorea(riskUtc).ToString("HHmmss",CultureInfo.InvariantCulture),HasTradeClock=true};
+            string reason=(string)Call(fixture.Form,"EvaluateHoldingSell",held,riskQuote,riskUtc);Call(fixture.Form,"RefreshAccountAt",riskUtc);
+            check(trade.IsCurrentQuantityVerified(Symbol)&&held.Quantity==18&&held.Price==7600&&trade.Details[Symbol].CurrentPrice==7870,
+                "new advancing SC prices do not invalidate quantity proof bound to the original broker valuation snapshot");
+            check(reason!=null&&reason.Contains("손절")&&Convert.ToString(fixture.Row.Cells[10].Value,CultureInfo.InvariantCulture).Contains("손절")
+                &&!Convert.ToString(fixture.Row.Cells[10].Value,CultureInfo.InvariantCulture).Contains("수량"),
+                "confirmed canonical holdings and ordinary cash-source proof reach the actual stop-loss strategy after a live price decline");
+
+            foreach(bool missing in new[]{false,true}) {
+                fixture.Reads.EvaluationQuantity=missing?(decimal?)null:18;fixture.Reads.MarketValue=missing?141660:141659;
+                fixture.Read(0,18);trade=Get<BrokerHoldingsSnapshot>(fixture.Form,"tradeHoldings");
+                check(fixture.Fatals==0&&fixture.SessionRetained&&trade.Holdings.Single().Quantity==0&&trade.ReportedQuantities[Symbol]==0
+                    &&!trade.QuantityExposureVerified&&!trade.IsCurrentQuantityVerified(Symbol),
+                    (missing?"missing evaluation quantity":"mismatched valuation amount")+" keeps the response readable but cannot reuse a previously verified eighteen-share quantity");
+                check(fixture.Order.Status==LiveOrderStatus.Filled&&fixture.Order.FilledQuantity==18&&fixture.Journal.Snapshot.Executions.Count==1
+                    &&fixture.Orders.Sends==0&&fixture.Orders.Preparations==0,
+                    (missing?"missing evaluation quantity":"mismatched valuation amount")+" neither erases the broker execution nor turns a refresh into another buy or sell");
+            }
+        }
+    }
+    public static void Run(string data,Action<bool,string> check) {
+        using(var fixture=new Fixture(data)) {
+            fixture.Reads.CurrentPrice=10200;
+            fixture.Read(0,2);
+            check(fixture.Fatals==0&&fixture.SessionRetained,"normal holdings callback with orderable above balance keeps armed account monitoring and credentials alive");
+            var balance=Get<BrokerHoldingsSnapshot>(fixture.Form,"tradeHoldings");
+            check(balance.Holdings.Single().Quantity==0&&balance.SellableQuantities[Symbol]==2&&!balance.QuantityExposureVerified,
+                "mismatched raw balance0 and broker orderable2 remain separate without manufacturing a two-share position or valid exposure proof");
+            check(fixture.Row.Cells.Count>=14&&Convert.ToDecimal(fixture.Row.Cells[2].Value,CultureInfo.InvariantCulture)==0
+                &&Convert.ToDecimal(fixture.Row.Cells[12].Value,CultureInfo.InvariantCulture)==2,
+                "actual holdings grid retains the raw zero position and separately displays positive broker orderable quantity");
+            string pending=Convert.ToString(fixture.Row.Cells[13].Value,CultureInfo.InvariantCulture);
+            check(pending.Contains("잔고수량 0")&&pending.Contains("주문가능수량 2")&&pending.Contains("대기"),
+                "quantity wait explains the numeric discrepancy instead of reporting a transport failure");
+            check(Get<Label>(fixture.Form,"portfolio").Text.Contains("수량 대사 중")&&Get<Label>(fixture.Form,"portfolio").Text.Contains("잠정값"),
+                "portfolio amounts are visibly provisional while quantity exposure is unverified");
+            check(Convert.ToString(fixture.Row.Cells[8].Value,CultureInfo.InvariantCulture).Contains("2.00")
+                &&fixture.Row.Cells[8].ToolTipText.Contains("단가 기준"),
+                "zero reported quantity still shows the concrete 10000-to-10200 price return with its unit-price basis rather than hiding it as unknown");
+            check(Get<HashSet<string>>(fixture.Form,"trackedQuotes").Contains(Symbol),
+                "a positive-orderable row remains tracked for quotes even before its raw balance quantity catches up");
+            check(Get<AccountAppSettingsStore>(fixture.Form,"settingsStore").High(fixture.Key,Symbol,10000)==11000,
+                "a transient zero-balance response does not delete the established trailing-stop high");
+            check(fixture.Order.Status==LiveOrderStatus.Working&&fixture.Order.BrokerOrderNumber=="009021"&&fixture.Journal.Snapshot.Orders.Count==1
+                &&fixture.Journal.Snapshot.Executions.Count==0&&fixture.Orders.Sends==0&&fixture.Orders.Preparations==0,
+                "normal read preserves accepted buy identity and acknowledgement without inferring a fill or replaying it");
+            fixture.Read(2,2);balance=Get<BrokerHoldingsSnapshot>(fixture.Form,"tradeHoldings");
+            check(fixture.Fatals==0&&fixture.SessionRetained&&balance.QuantityExposureVerified
+                &&balance.Holdings.Single().Quantity==2&&balance.SellableQuantities[Symbol]==2,
+                "a later consistent normal callback clears the quantity-exposure barrier without requiring reconnection");
+            check(!Convert.ToString(fixture.Row.Cells[13].Value,CultureInfo.InvariantCulture).Contains(" 대기")
+                &&!Get<Label>(fixture.Form,"portfolio").Text.Contains("수량 대사 중"),
+                "confirmed quantity refresh removes provisional quantity presentation through the real callback path");
+            check(Get<AccountAppSettingsStore>(fixture.Form,"settingsStore").High(fixture.Key,Symbol,10000)==11000
+                &&fixture.Order.Status==LiveOrderStatus.Working&&fixture.Order.BrokerOrderNumber=="009021"
+                &&fixture.Reads.Requests==2&&fixture.Reads.Setters==16&&fixture.Orders.Sends==0&&fixture.Orders.Preparations==0,
+                "consistent refresh preserves the risk high and original accepted order while using only two bound read requests");
+
+            fixture.Reads.AveragePrice=8160;fixture.Reads.CurrentPrice=8100;fixture.Reads.BrokerReturn=-2.25m;fixture.Read(0,18);
+            balance=Get<BrokerHoldingsSnapshot>(fixture.Form,"tradeHoldings");
+            string brokerTooltip=fixture.Row.Cells[8].ToolTipText;
+            check(Convert.ToString(fixture.Row.Cells[8].Value,CultureInfo.InvariantCulture).Contains("-2.25")
+                &&brokerTooltip.Contains("증권사")&&brokerTooltip.Contains("UTC")
+                &&brokerTooltip.Contains(balance.ReceivedUtc.ToString("yyyy-MM-dd HH:mm:ss",CultureInfo.InvariantCulture)),
+                "explicit broker return takes priority over the different current-price return and identifies the actual broker snapshot receipt time");
+            fixture.Quote(8500);
+            check(Convert.ToString(fixture.Row.Cells[8].Value,CultureInfo.InvariantCulture).Contains("-2.25")
+                &&Convert.ToDecimal(Get<List<Holding>>(fixture.Form,"holdings").Single().Price,CultureInfo.InvariantCulture)==8500
+                &&fixture.Row.Cells[8].ToolTipText==brokerTooltip,
+                "a newer real SC callback updates current price while keeping the supplied broker percentage tied to its own snapshot");
+            check(Get<List<Holding>>(fixture.Form,"holdings").Single().Quantity==0&&balance.SellableQuantities[Symbol]==18
+                &&!balance.QuantityExposureVerified&&fixture.SessionRetained&&fixture.Orders.Sends==0&&fixture.Orders.Preparations==0,
+                "displaying a broker percentage never turns orderable18 into owned shares or clears the quantity-exposure restriction");
+            foreach(bool unavailable in new[]{false,true}) {
+                fixture.Reads.BrokerReturn=null;fixture.Reads.ReturnGetterUnavailable=unavailable;fixture.Read(0,18);
+                balance=Get<BrokerHoldingsSnapshot>(fixture.Form,"tradeHoldings");
+                check(Convert.ToString(fixture.Row.Cells[8].Value,CultureInfo.InvariantCulture).Contains("-0.74")
+                    &&fixture.Row.Cells[8].ToolTipText.Contains("단가 기준"),
+                    (unavailable?"unavailable":"blank")+" optional broker return falls back to the observable 8160-to-8100 unit-price change");
+                check(fixture.Fatals==0&&fixture.SessionRetained&&balance.Holdings.Single().Quantity==0&&balance.SellableQuantities[Symbol]==18
+                    &&!balance.QuantityExposureVerified&&fixture.Journal.Snapshot.Orders.Count==1&&fixture.Order.Status==LiveOrderStatus.Working
+                    &&fixture.Journal.Snapshot.Executions.Count==0&&fixture.Orders.Sends==0&&fixture.Orders.Preparations==0,
+                    (unavailable?"unavailable":"blank")+" optional return data preserves original quantities, accepted order and monitoring without synthesizing a fill or sending another order");
+            }
+        }
+        VerifiedCurrentQuantity(data,check);
+    }
+}
