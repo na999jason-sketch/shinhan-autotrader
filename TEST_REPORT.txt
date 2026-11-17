@@ -585,3 +585,12 @@ Linux x86대상 warnaserror compile0warning/error, 앱2457/실제폼장전·미�
 LiveOrders/BrokerReadiness/PendingBuyPolicy/AutoOrderRetry/BrokerAccountEventRouter/RealtimeIndi/AccountQueries/IndiCom/CashMarketRules는2.2.16과diff없음을확인했다. StopLoss/TakeProfit/Trailing/OrderQuantity는변경하지않았다.
 기능회귀와합성시세검증이며 실데이터수익률·거래비용포함손익/최대낙폭백테스트는미실행이다. 초기2%·60초는수익최적화값이아니다. 실제Indi금융API호출/실제주문0회이며실제계좌새진입경로는미검증이다.
 상세: docs/ENTRY_CONFIRMATION_20261117.md
+
+
+2.2.18 — 종목당 배분을 전체 운용한도에 고정 (2026-11-17)
+기존 min(현금100/남은운용한도/종목가능액)*배분비율로 주문이 점점 줄던 수량계산을 수정했다. 목표=전체설정운용한도*비율, 허용=min(목표,현금100,전체한도-보유원가-미체결예약금,종목가능액) 후 비용·정수수량·증권사가능수량/기존100000주상한을 적용한다. 실제자동매수5인자경로를대조했고 기존단일금액호출은호환을유지했다.
+계산47개PASS: 예산100만원20% 목표20만원, 가용100/80/20만원모두19주(주가1만원/비용0.3%),5만원상한4주. 순차매수·비율변경·0/음수·비용경계·내림·최대수량·극단입력도확인했다.
+실제폼SubmitPending 신규21개PASS: 실제60초SC유지상태에서 초기/보유원가20만원/80만원모두19주(주가10460/비용0.3%),현금/잔여한도/종목가능액5만원은4주,가능수량2주상한,0가용은미전송. 예약금15만원이남으면4주,취소접수후도4주,AA05확인후에만19주로복원. 실제금융API호출없음.
+Linux x86target warnaserror컴파일0warning/error, 앱2504/실제폼GUI445/보고서GUI30/Python17PASS. I386/PE32/CLR32BITREQUIRED 확인. Linuxpointer8은Windows x86실행과구분한다. 정확한커밋의Windows빌드/COM/UIPI/GUI/EXE는PR Actions검증기록참조.
+설정표시를종목당전체운용한도배분으로변경했고필드/저장값은유지했다. 주문/체결/잔고/미체결/진입필터코드와손절/익절/추적손절은2.2.17과동일하다. 최대보유수를늘리거나현금·가능수량검증을완화하지않았다. 실제계좌새수량경로·수익성검증은미실행,도구금융API/주문0회.
+상세: docs/FIXED_ALLOCATION_20261117.md

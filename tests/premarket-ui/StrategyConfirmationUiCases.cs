@@ -119,6 +119,23 @@ static class StrategyConfirmationUiCases {
             var arguments=new object[]{Reference,Latest,at,null};
             return (Candidate)typeof(MainForm).GetMethod("EvaluateEntrySignal",Fields).Invoke(Form,arguments);
         }
+        public void SizingInputs(DateTime at,decimal heldCost,decimal cashAmount,decimal capacityAmount,int capacityQuantity=100) {
+            var positions=Get<List<Holding>>(Form,"holdings");positions.Clear();
+            if(heldCost>0)positions.Add(new Holding{Code="005930",Name="ISOLATED SIZING HOLDING",Quantity=heldCost/10000m,
+                AvgPrice=10000m,Price=10000m});
+            Set(Form,"cash",new AccountCashSnapshot{DepositCash=cashAmount,Cash100Orderable=cashAmount,ReceivedUtc=at});
+            if(Pending==null)throw new InvalidOperationException("Sizing fixture requires a confirmed unsent buy.");
+            Set(Pending,"Capacity",new AccountOrderCapacity{Code=Symbol,LimitPrice=Price,Ratio=100,
+                Quantity=capacityQuantity,MaximumQuantity=capacityQuantity,Amount=capacityAmount,MaximumAmount=capacityAmount,ReceivedUtc=at});
+        }
+        public LiveOrderRecord Accepted(LiveOrderIntent intent,int requestId,string brokerNumber,DateTime at) {
+            var order=Journal.Prepare(intent,at);Journal.MarkDispatching(order.Id,at);Journal.MarkRequestAccepted(order.Id,requestId,at);
+            var response=new[]{"0",brokerNumber,"0","","1","isolated accepted","",""};
+            var evidence=LiveOrderResponseParser.Read(requestId,index=>response[index],new IndiDiagnosticSnapshot{ErrorState=0},
+                OrderResponseLayout.Modern,new[]{Account,"1111"});
+            Journal.RecordAcknowledgement(order.Id,requestId,brokerNumber,false,at,evidence);
+            return Journal.Snapshot.Orders.Single(value=>value.Id==order.Id);
+        }
         public void Dispose(){Form.Close();Form.Dispose();Journal.Dispose();}
     }
     static void RejectChaseAndTransient(string data,Action<bool,string> check) {
@@ -199,7 +216,64 @@ static class StrategyConfirmationUiCases {
                 "entry strategy settings save preserves existing exit thresholds and pending-buy timeout");
         }
     }
+    static void FixedAllocationAmounts(string data,Action<bool,string> check) {
+        // The same full-budget target must survive sequential consumption of
+        // available funds. None of these cases bypasses live SC confirmation.
+        var cases=new[]{
+            new {Name="initial",Held=0m,Cash=1000000m,Capacity=1000000m,Quantity=100,Expected=19},
+            new {Name="after-first",Held=200000m,Cash=800000m,Capacity=800000m,Quantity=100,Expected=19},
+            new {Name="last-target",Held=800000m,Cash=200000m,Capacity=200000m,Quantity=100,Expected=19},
+            new {Name="cash-cap",Held=0m,Cash=50000m,Capacity=1000000m,Quantity=100,Expected=4},
+            new {Name="budget-cap",Held=950000m,Cash=1000000m,Capacity=1000000m,Quantity=100,Expected=4},
+            new {Name="symbol-amount-cap",Held=0m,Cash=1000000m,Capacity=50000m,Quantity=100,Expected=4},
+            new {Name="symbol-share-cap",Held=0m,Cash=1000000m,Capacity=1000000m,Quantity=2,Expected=2}
+        };
+        foreach(var sample in cases)using(var fixture=new Fixture(data,"fixed-allocation-"+sample.Name)) {
+            var ready=fixture.Hold(Start);fixture.RefreshAccount(ready);fixture.Tick(ready);
+            fixture.SizingInputs(ready,sample.Held,sample.Cash,sample.Capacity,sample.Quantity);
+            var intent=fixture.Intent;Call(fixture.Form,"SubmitPending",ready);
+            check(fixture.Pending!=null&&intent.Quantity==sample.Expected,
+                "fixed allocation "+sample.Name+": actual form sizes from the one-million operating budget before applying availability caps");
+            decimal spend=intent.Quantity*fixture.Price*1.003m;
+            check(spend<=200000m&&spend<=sample.Cash&&spend<=1000000m-sample.Held&&spend<=sample.Capacity
+                &&intent.Quantity<=sample.Quantity&&fixture.Orders.Sends==0&&fixture.Journal.Snapshot.Orders.Count==0,
+                "fixed allocation "+sample.Name+": fees, all amount/share limits and the independent financial preflight remain enforced");
+        }
+        foreach(string empty in new[]{"cash","budget","capacity"})using(var fixture=new Fixture(data,"fixed-allocation-empty-"+empty)) {
+            var ready=fixture.Hold(Start);fixture.RefreshAccount(ready);fixture.Tick(ready);
+            fixture.SizingInputs(ready,empty=="budget"?1000000m:0m,empty=="cash"?0m:1000000m,empty=="capacity"?0m:1000000m);
+            Call(fixture.Form,"SubmitPending",ready);
+            check(fixture.Pending==null&&fixture.Status.Contains("부족")&&fixture.Orders.Sends==0&&fixture.Journal.Snapshot.Orders.Count==0,
+                "fixed allocation empty "+empty+": a fixed target never authorizes spending when an actual remaining limit is zero");
+        }
+    }
+    static void FixedAllocationReservations(string data,Action<bool,string> check) {
+        using(var fixture=new Fixture(data,"fixed-allocation-reservation")) {
+            var ready=fixture.Hold(Start);fixture.RefreshAccount(ready);fixture.Tick(ready);
+            var original=fixture.Accepted(new LiveOrderIntent{Kind=LiveOrderKind.Buy,Code="005490",Quantity=15,LimitPrice=10000,
+                ClientKey="entry-20261117-005490"},901,"123",ready);
+            check(fixture.Journal.ReservedBuyAmount==150000m,"fixed allocation retains the original accepted buy's unfilled amount as a separate reservation");
+            fixture.SizingInputs(ready,800000m,1000000m,1000000m);Call(fixture.Form,"SubmitPending",ready);
+            check(fixture.Pending!=null&&fixture.Intent.Quantity==4&&fixture.Journal.ReservedBuyAmount==150000m&&fixture.Orders.Sends==0,
+                "fixed allocation subtracts existing unfilled reservations from the remaining operating limit before clipping the full target");
+            var cancelAt=ready.AddSeconds(1);fixture.Quote(cancelAt,fixture.Price);
+            var cancellation=fixture.Accepted(new LiveOrderIntent{Kind=LiveOrderKind.Cancel,Code=original.Code,Quantity=15,LimitPrice=10000,
+                OriginalBrokerOrderNumber=original.BrokerOrderNumber,ClientKey="isolated-sizing-cancel"},902,"124",cancelAt);
+            fixture.SizingInputs(cancelAt,800000m,1000000m,1000000m);Call(fixture.Form,"SubmitPending",cancelAt);
+            check(fixture.Pending!=null&&fixture.Intent.Quantity==4&&fixture.Journal.ReservedBuyAmount==150000m
+                &&fixture.Journal.Snapshot.Orders.Single(value=>value.Id==cancellation.Id).Status==LiveOrderStatus.AwaitingConfirmation
+                &&fixture.Orders.Sends==0,
+                "a cancellation ACK cannot enlarge a new fixed-target buy by prematurely releasing its original reservation");
+            var confirmedAt=ready.AddSeconds(2);fixture.Quote(confirmedAt,fixture.Price);
+            fixture.Journal.ConfirmCancellation(original.BrokerOrderNumber,cancellation.BrokerOrderNumber,"AA05",15,confirmedAt);
+            fixture.SizingInputs(confirmedAt,800000m,1000000m,1000000m);Call(fixture.Form,"SubmitPending",confirmedAt);
+            check(fixture.Pending!=null&&fixture.Intent.Quantity==19&&fixture.Journal.ReservedBuyAmount==0&&fixture.Orders.Sends==0
+                &&fixture.Journal.Snapshot.Orders.Count==2,
+                "only confirmed cancellation restores enough remaining budget for the original full allocation target, without transmitting a replacement");
+        }
+    }
     public static void Run(string data,Action<bool,string> check) {
         RejectChaseAndTransient(data,check);SustainedEntryAndDip(data,check);FinalRecheckAndSettings(data,check);
+        FixedAllocationAmounts(data,check);FixedAllocationReservations(data,check);
     }
 }

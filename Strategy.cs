@@ -138,8 +138,21 @@ namespace ShinhanNativeTrader {
             return OrderQuantity(cash, price, fraction, 0.003m);
         }
         public static int OrderQuantity(decimal cash, decimal price, decimal fraction, decimal feeRate) {
-            if(cash <= 0 || price <= 0 || fraction <= 0 || fraction > 1 || feeRate < 0 || feeRate > 0.1m) return 0;
-            return (int)Math.Min(100000, Math.Floor(cash * fraction / (price * (1 + feeRate))));
+            return OrderQuantity(cash, cash, price, fraction, feeRate);
+        }
+        // Allocation is anchored to the configured total operating budget.
+        // Current cash, unused budget and broker capacity constrain the amount
+        // that can be spent; they are never multiplied by the fraction again.
+        public static int OrderQuantity(decimal operatingBudget, decimal availableAmount, decimal price, decimal fraction, decimal feeRate) {
+            if(operatingBudget <= 0 || availableAmount <= 0 || price <= 0 || fraction <= 0 || fraction > 1 || feeRate < 0 || feeRate > 0.1m) return 0;
+            decimal spend = Math.Min(operatingBudget * fraction, availableAmount), unitCost;
+            try { unitCost = price * (1 + feeRate); }
+            catch(OverflowException) { return 0; }
+            if(spend < unitCost) return 0;
+            // Bound before division so even unusually small supported values
+            // cannot overflow while applying the existing share-count ceiling.
+            if(unitCost <= spend / 100000m) return 100000;
+            return (int)Math.Floor(spend / unitCost);
         }
         public static bool ValidTime(DateTime koreaTime) {
             // Weekday/time guard only. It is not a Korean exchange holiday calendar.

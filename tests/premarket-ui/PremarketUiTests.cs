@@ -545,7 +545,7 @@ static class PremarketUiTests {
 
     static void Run(string data,string screenshot) {
         using(var form=NewForm()) {
-            Check(form.Text.Contains("2.2.17"),"premarket regression runs against version 2.2.17");
+            Check(form.Text.Contains("2.2.18"),"premarket regression runs against version 2.2.18");
             Check(!All(form).OfType<Button>().Any(button=>button.Text=="선택 거절 매도 재시도"),"ordinary automatic rejection handling requires no manual retry button");
             Check(All(form).OfType<Button>().Any(button=>button.Text=="조회 정의 내보내기"),"static query-definition export is available without invoking registry COM or provider queries");
             Check(!Get<LiveTradingSession>(form,"authorization").Active,"application startup never authorizes live orders");
